@@ -3195,8 +3195,9 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
 
             if flag == "LineOrderError":
                 description_hint = (
-                    "The line commands are out of sequence. Correct the Fixed description for each affected point; "
-                    "commands are checked within their own multicode group, and edits stay staged until Apply or Save."
+                    "Only these same-code pairs are flagged: Start Curve before Start Line, End Line before End Curve, "
+                    "and Close before End Curve. Use Auto Fix when available or edit Fixed; different code sections "
+                    "are never compared, and edits stay staged until Apply or Save."
                 )
             else:
                 description_hint = (
@@ -3246,10 +3247,23 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
                 # A saved draft wins so navigating away and back preserves user edits.
                 description_draft = finding.get("description_drafts", {}).get(p.id)
                 is_unknown, autofix_guess = self._autofix_guess_for_description(p.desc)
+                is_line_order_fix = False
+                if flag == "LineOrderError" and not is_unknown:
+                    try:
+                        from ..fieldwork.config import get_command_map
+                        commands = get_command_map(
+                            self.fieldbook_path or None, (pr.settings or {}).get("f2f_commands"))
+                        order_guess = PLC.fix_line_command_order(p.desc or "", commands=commands)
+                        if order_guess.strip() != str(p.desc or "").strip():
+                            autofix_guess = order_guess
+                            is_line_order_fix = True
+                    except Exception:
+                        pass
                 initial_desc = p.desc if description_draft is None else description_draft
                 ed = QLineEdit(str(initial_desc or ""))
-                if is_unknown:
-                    suggestion_text = (f"Proposed autofix: {autofix_guess}" if autofix_guess else
+                if is_unknown or is_line_order_fix:
+                    suggestion_kind = "Proposed autofix" if is_unknown else "Proposed order correction"
+                    suggestion_text = (f"{suggestion_kind}: {autofix_guess}" if autofix_guess else
                                        "Proposed autofix: No safe suggestion; enter the corrected code manually.")
                     lbl_suggestion = QLabel(suggestion_text)
                     lbl_suggestion.setObjectName("autofixSuggestion")
@@ -3262,17 +3276,16 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
                     self.autofix_suggestions[p.id] = lbl_suggestion
                     lay_p.addWidget(lbl_suggestion)
                     if autofix_guess:
-                        ed.setToolTip(f"Proposed autofix: {autofix_guess}")
+                        ed.setToolTip(f"{suggestion_kind}: {autofix_guess}")
 
                 row_ed = QHBoxLayout()
                 row_ed.addWidget(QLabel("<b>Fixed:</b>"))
                 row_ed.addWidget(ed, 1)
-                if is_unknown:
+                if is_unknown or is_line_order_fix:
                     btn_autofix = QPushButton("Auto Fix")
                     btn_autofix.setEnabled(autofix_guess is not None)
                     btn_autofix.setToolTip(
-                        "Stage the safe Field Book suggestion in this point's description. "
-                        "Apply or Save commits it."
+                        "Stage the proposed correction in this point's description. Apply or Save commits it."
                         if autofix_guess else
                         "No safe Field Book suggestion is available; correct the description manually."
                     )

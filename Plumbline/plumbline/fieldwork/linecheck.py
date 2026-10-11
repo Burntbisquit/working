@@ -5,13 +5,10 @@ carry a valid description while the line has no semantic End Line/Close, or a cu
 an End Curve. The two ends of one mistake usually sit on **two different points**, which is why the
 tool that fixes them has to be allowed to clear a second flag it was not aimed at.
 
-The Field Book's meanings define the valid order::
-
-    Start Line → Start Curve → End Curve → End Line / Close
-
-A fix that appends a command to the end of the description can therefore still be wrong - which is
-exactly why every fix here is **proposed, then validated**: the proposal is offered, and after it is
-applied the line is read again, because the only honest answer to "did that help?" is to look.
+The Field Book's meanings define the three line-order pairs this module flags:
+Start Curve before Start Line, End Line before End Curve, and Close before End Curve. Singleton
+commands and unrelated sequence-state issues are not reported as line-order errors. A fix is
+**proposed, then validated**: after it is applied, the line is read again to verify the result.
 
 This module is Qt-free on purpose: the field window's Line Repair tab and the drawing window's
 Check Fieldwork dock both use it, and neither should be able to disagree with the other about
@@ -20,6 +17,7 @@ where a line ends.
 from __future__ import annotations
 
 from . import config as C
+from ..core.fieldbook_syntax import first_line_order_pair_violation
 from .utils_sort import natural_key
 
 
@@ -104,38 +102,51 @@ def detect_line_errors(working_rows, fieldbook_path=None, f2f_set=None, command_
         oid_list.append((oid, raw, working_row))
     oid_list.sort(key=lambda row: _sequence_sort_key(row[2]))
 
-    segments_by_line: dict[str, list] = {}
-    raw_by_line: dict[str, str] = {}
+    # Keep each code-token occurrence independent, including repeated code names in one
+    # multicode description. The second key component links corresponding occurrences across
+    # points without merging two separate sections on the same point.
+    segments_by_line: dict[tuple[str, int], list] = {}
     for oid, raw, _working_row in oid_list:
         parsed = parse_desc_field(raw, f2f, fieldbook_path=fieldbook_path,
                                   command_set=cs, rules=rules, commands=semantic_tokens)
         classified = parsed.get("code_classified", [])
-        commands_by_code: dict[str, list] = {}
+        commands_by_code_index: dict[int, list] = {}
+        line_key_by_code_index: dict[int, tuple[str, int]] = {}
+        code_raw_by_index: dict[int, str] = {}
+        occurrence_counts: dict[str, int] = {}
+
+        for code_index, item in enumerate(classified):
+            if item["type"] != "code" or item["status"] not in ("exact", "line_instance"):
+                continue
+            line_id = item["raw"].strip().casefold()
+            occurrence = occurrence_counts.get(line_id, 0)
+            occurrence_counts[line_id] = occurrence + 1
+            commands_by_code_index[code_index] = []
+            line_key_by_code_index[code_index] = (line_id, occurrence)
+            code_raw_by_index[code_index] = item["raw"]
+
         for item in classified:
-            if item["type"] == "command" and item.get("status") == "valid" and "attached_to" in item:
-                meaning = item.get("meaning") or token_meanings.get(item.get("norm", "").casefold(), "")
-                if meaning not in line_meanings:
-                    continue
-                code_index = item["attached_to"]
-                code_item = classified[code_index] if 0 <= code_index < len(classified) else None
-                if code_item and code_item["type"] == "code":
-                    line_id = code_item["raw"].strip().casefold()
-                    commands_by_code.setdefault(line_id, []).append(meaning)
-                    raw_by_line[line_id] = code_item["raw"]
-            elif item["type"] == "code" and item["status"] in ("exact", "line_instance"):
-                line_id = item["raw"].strip().casefold()
-                commands_by_code.setdefault(line_id, [])
-                raw_by_line.setdefault(line_id, item["raw"])
-        for line_id, line_commands in commands_by_code.items():
-            segments_by_line.setdefault(line_id, []).append(
-                (oid, line_commands, raw, raw_by_line.get(line_id, line_id)))
+            if item["type"] != "command" or item.get("status") != "valid" or "attached_to" not in item:
+                continue
+            meaning = item.get("meaning") or token_meanings.get(item.get("norm", "").casefold(), "")
+            if meaning not in line_meanings:
+                continue
+            code_index = item["attached_to"]
+            if code_index in commands_by_code_index:
+                commands_by_code_index[code_index].append(meaning)
+
+        for code_index, line_commands in commands_by_code_index.items():
+            line_key = line_key_by_code_index[code_index]
+            segments_by_line.setdefault(line_key, []).append(
+                (oid, line_commands, raw, code_raw_by_index[code_index]))
 
     errors: list[dict] = []
 
     def raw_of(oid):
         return next((raw for current_oid, raw, _row in oid_list if current_oid == str(oid)), "")
 
-    def issues_for(line_id, points):
+    def issues_for(line_key, points):
+        line_id = line_key[0]
         out = []
         segments = []
         current_segment = []
@@ -158,10 +169,6 @@ def detect_line_errors(working_rows, fieldbook_path=None, f2f_set=None, command_
                         f"Line {code_raw} segment is missing End Line/Close before a new Start Line "
                         f"at OID {oid} ({raw}); previous segment started at OID {current_segment[0][0]}",
                         f"Add End Line to OID {current_segment[-1][0]}")
-                    add("Line Order", oid,
-                        f"Line {code_raw} starts a new segment at OID {oid} ({raw}) before the "
-                        f"previous segment from OID {current_segment[0][0]} ended.",
-                        "End or close the current segment before the next Start Line.")
                     segments.append(current_segment)
                     current_segment = []
                 in_line = True
@@ -189,65 +196,43 @@ def detect_line_errors(working_rows, fieldbook_path=None, f2f_set=None, command_
                 f"Add End Line to OID {current_segment[-1][0]}")
             segments.append(current_segment)
 
-        for segment in segments:
-            # Validate the full semantic sequence, not only PC/PT pairing. A rank-only
-            # sort would reject valid repeated curves, so carry explicit line/curve state
-            # across points while preserving command order within each description.
-            events = [(meaning, oid, raw) for oid, line_commands, raw in segment
-                      for meaning in line_commands if meaning in RANK]
-            line_started = False
-            line_ended = False
-            curve_open = False
-            curve_open_oid = None
-            saw_event = False
-            order_error = None
-            for meaning, oid, raw in events:
-                if meaning == "start_line":
-                    if saw_event or line_started:
-                        order_error = (oid, raw, "Start Line appears after another command in this segment")
-                        break
-                    line_started = True
-                elif not line_started:
-                    label = meaning.replace("_", " ").title()
-                    order_error = (oid, raw, f"{label} appears before Start Line")
-                    break
-                elif line_ended:
-                    label = meaning.replace("_", " ").title()
-                    order_error = (oid, raw, f"{label} appears after End Line/Close")
-                    break
-                elif meaning == "start_curve":
-                    if curve_open:
-                        order_error = (oid, raw, "Start Curve appears before the preceding curve's End Curve")
-                        break
-                    curve_open = True
-                    curve_open_oid = oid
-                elif meaning == "end_curve":
-                    if not curve_open:
-                        order_error = (oid, raw, "End Curve appears before a matching Start Curve")
-                        break
-                    curve_open = False
-                    curve_open_oid = None
-                elif meaning in ("end_line", "close"):
-                    if curve_open:
-                        order_error = (oid, raw, "End Line/Close appears before the open curve's End Curve")
-                        break
-                    line_ended = True
-                saw_event = True
-            if order_error:
-                bad_oid, bad_raw, why = order_error
-                observed = " → ".join(f"{meaning.replace('_', ' ').title()} (OID {oid})"
-                                      for meaning, oid, _raw in events)
-                add("Line Order", bad_oid,
-                    f"Line {code_raw} has commands out of order across its point sequence: {why}. "
-                    f"Observed {observed}; start with Start Line, pair each Start Curve with "
-                    "its End Curve, and finish with End Line/Close.",
-                    "Review the full point sequence: Start Line → Start Curve → End Curve → End Line/Close.")
+        sequence_events = [(meaning, oid, raw) for oid, line_commands, raw, _code in points
+                           for meaning in line_commands if meaning in RANK]
+        order_violation = first_line_order_pair_violation(
+            [meaning for meaning, _oid, _raw in sequence_events])
+        if order_violation is not None:
+            bad_index, counterpart_index, reason = order_violation
+            _bad_meaning, bad_oid, _bad_raw = sequence_events[bad_index]
+            first_index, second_index = sorted((bad_index, counterpart_index))
+            first_meaning, first_oid, first_raw = sequence_events[first_index]
+            second_meaning, second_oid, second_raw = sequence_events[second_index]
+            first_label = first_meaning.replace("_", " ").title()
+            second_label = second_meaning.replace("_", " ").title()
+            if reason == "Start Curve appears before Start Line":
+                suggestion = "Place Start Line before Start Curve in this code section."
+            elif reason == "End Line appears before End Curve":
+                suggestion = "Place End Curve before End Line in this code section."
+            else:
+                suggestion = "Place End Curve before Close in this code section."
+            add("Line Order", bad_oid,
+                f"Line {code_raw} has {reason} in its same-code point sequence: "
+                f"{first_label} at OID {first_oid} ({first_raw}) precedes "
+                f"{second_label} at OID {second_oid} ({second_raw}).",
+                suggestion)
 
+        for segment in segments:
+            curve_open_oid = None
+            for oid, line_commands, _raw in segment:
+                for meaning in line_commands:
+                    if meaning == "start_curve":
+                        curve_open_oid = oid
+                    elif meaning == "end_curve":
+                        curve_open_oid = None
             curve_starts = [oid for oid, line_commands, _raw in segment
                             if "start_curve" in line_commands]
             curve_ends = [oid for oid, line_commands, _raw in segment
                           if "end_curve" in line_commands]
-            if curve_open and curve_open_oid is not None and order_error is None:
+            if curve_open_oid is not None:
                 add("Missing PT", curve_open_oid,
                     f"Line {code_raw} has Start Curve at OID {curve_open_oid} without a matching End Curve",
                     f"Add End Curve to OID {curve_open_oid} (after Start Curve, before End Line/Close)")
@@ -257,12 +242,12 @@ def detect_line_errors(working_rows, fieldbook_path=None, f2f_set=None, command_
                     f"Add Start Curve to OID {curve_ends[0]} (before End Curve)")
         return out
 
-    for line_id, points in segments_by_line.items():
+    for line_key, points in segments_by_line.items():
         has_line_command = any(any(command in line_meanings for command in line_commands)
                                for _oid, line_commands, _raw, _code in points)
         if not has_line_command:
             continue
-        for issue in issues_for(line_id, points):
+        for issue in issues_for(line_key, points):
             issue["gid"] = str(len(errors) + 1)
             errors.append(issue)
     return errors

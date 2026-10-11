@@ -7,6 +7,7 @@ from ..core.fieldbook_syntax import (
     COMMAND_MEANINGS,
     command_meanings,
     find_separator,
+    first_line_order_pair_violation,
     separator_pattern,
     separator_spacing_is_valid,
     split_at_separator,
@@ -421,72 +422,18 @@ def common_conversion_rule_warning(common_error: str, fix: str, f2f_set,
 
 
 def _first_line_command_order_violation(meanings, settings=None):
-    """Return the first invalid transition in a code section's ordered line commands.
+    """Return the first supported pair inversion within one code section.
 
-    A point description may contain only part of a line's command sequence because the rest can
-    live on other points. Treat an unmatched leading End Curve as a continuation, but enforce
-    order whenever the relevant commands occur together. Curve pairs may repeat:
-    ``PC PT PC PT`` is valid, while ``PC PC PT`` and ``PC END`` are not.
+    ``settings`` remains accepted for compatibility with existing callers, but the check is now
+    deliberately limited to the three requested semantic pairs: Start Curve before Start Line,
+    End Line before End Curve, and Close before End Curve. A lone command, a repeated start, or an
+    unrelated line-state issue is not a LineOrderError.
     """
-    settings = settings or {}
-    protect_st_pc = settings.get("protect_st_pc", True)
-    protect_pt_end = settings.get("protect_pt_end", True)
-    protect_pt_x = settings.get("protect_pt_x", True)
-    protect_st_after_end = settings.get("protect_st_after_end", False)
-
-    line_started = False
-    line_ended = False
-    curve_open = False
-    saw_command_before_start = False
-
-    for index, meaning in enumerate(meanings):
-        label = meaning.replace("_", " ").title()
-
-        if meaning == "start_line":
-            if line_ended:
-                if protect_st_after_end:
-                    return index, "Start Line appears after End Line/Close"
-                # Some Field Books permit another line segment under the same code section.
-                line_started = True
-                line_ended = False
-                curve_open = False
-                saw_command_before_start = False
-                continue
-            if saw_command_before_start:
-                return index, "Start Line appears after a curve command in this code section"
-            if line_started:
-                return index, "Start Line repeats before End Line/Close in this code section"
-            line_started = True
-            continue
-
-        if line_ended:
-            return index, f"{label} appears after End Line/Close"
-
-        if meaning == "start_curve":
-            if curve_open:
-                return index, "Start Curve appears before the preceding curve's End Curve"
-            curve_open = True
-        elif meaning == "end_curve":
-            if curve_open:
-                curve_open = False
-            elif line_started and protect_st_pc:
-                return index, "End Curve appears without a preceding Start Curve in this code section"
-            # With no Start Line in this description, PT may close a curve begun on an earlier point.
-        elif meaning == "end_line":
-            if curve_open and protect_pt_end:
-                return index, "End Line appears before the open curve's End Curve"
-            line_ended = True
-            curve_open = False
-        elif meaning == "close":
-            if curve_open and protect_pt_x:
-                return index, "Close appears before the open curve's End Curve"
-            line_ended = True
-            curve_open = False
-
-        if not line_started:
-            saw_command_before_start = True
-
-    return None
+    violation = first_line_order_pair_violation(meanings)
+    if violation is None:
+        return None
+    bad_index, _counterpart_index, reason = violation
+    return bad_index, reason
 
 
 def _validate_line_command_order(working_rows, f2f_set, settings=None, fieldbook_path=None,

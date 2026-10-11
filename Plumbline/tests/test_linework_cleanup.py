@@ -62,25 +62,33 @@ def test_a_code_that_is_never_a_line_is_left_to_the_description_check():
     assert LC.detect_line_errors(rows("GS", "GS", "TOC ST", "TOC END"), f2f_set=F2F) == []
 
 
-def test_multicode_groups_keep_commands_with_their_code_on_one_row_and_across_points():
+def test_multicode_groups_keep_commands_with_their_code_and_ignore_singletons():
     active_codes = {"eg", "ec"}
 
-    # Both groups are checked independently in a single description; EG is a valid line code.
-    same_row = LC.detect_line_errors(rows("EG PT ST - EC1 END"), f2f_set=active_codes)
+    # The valid pair EG PC -> ST is reported; the separate EC1 END singleton is not.
+    same_row = LC.detect_line_errors(rows("EG PC ST - EC1 END"), f2f_set=active_codes)
     same_row_order = [issue for issue in same_row if issue["issue_type"] == "Line Order"]
-    assert {issue["line_id"] for issue in same_row_order} == {"eg", "ec1"}
-    assert any(issue["line_id"] == "eg" and "End Curve appears before Start Line" in issue["detail"]
-               for issue in same_row_order)
-    assert any(issue["line_id"] == "ec1" and "End Line appears before Start Line" in issue["detail"]
-               for issue in same_row_order)
+    assert [(issue["line_id"], issue["oid"]) for issue in same_row_order] == [("eg", "1")]
+    assert "Start Curve appears before Start Line" in same_row_order[0]["detail"]
 
-    # Across points, EG follows ST -> PC -> PT -> END, while EC1 has PT before PC.
-    # Only EC1 should be reported: commands must not leak between the two code groups.
-    continued = LC.detect_line_errors(
-        rows("EG ST - EC1 ST", "EG PC - EC1 PT", "EG PT - EC1 PC", "EG END - EC1 END"),
-        f2f_set=active_codes)
+    # These descriptions each have only one command in each code section. They must not be
+    # compared across EG/EC1 or EC/EG1, and repeated code names in separate sections stay apart.
+    for description in (
+        "EG ST - EC1 END",
+        "EG PC - EC1 ST",
+        "EG PC - EG ST",
+    ):
+        issues = LC.detect_line_errors(rows(description), f2f_set=active_codes)
+        assert not any(issue["issue_type"] == "Line Order" for issue in issues), description
+
+    # The same line code may continue across points; only the specified pair inversions are
+    # surfaced, and a different line code's commands never complete that pair.
+    continued = LC.detect_line_errors(rows("EG PC", "EG ST"), f2f_set=active_codes)
     continued_order = [issue for issue in continued if issue["issue_type"] == "Line Order"]
-    assert [(issue["line_id"], issue["oid"]) for issue in continued_order] == [("ec1", "2")]
+    assert [(issue["line_id"], issue["oid"]) for issue in continued_order] == [("eg", "2")]
+
+    cross_code = LC.detect_line_errors(rows("EG PC - EC1 ST"), f2f_set=active_codes)
+    assert not any(issue["issue_type"] == "Line Order" for issue in cross_code)
 
 
 def test_custom_fieldbook_meanings_and_alphanumeric_separators_are_used():
@@ -110,11 +118,10 @@ def test_custom_fieldbook_meanings_and_alphanumeric_separators_are_used():
     assert parsed["free_desc"] == "noteworthy"
 
 
-def test_a_second_segment_starting_before_the_first_one_ends_is_a_missing_end():
+def test_a_second_segment_starting_before_the_first_one_ends_is_a_missing_end_not_line_order():
     issues = LC.detect_line_errors(rows("TOC ST", "TOC ST", "TOC END"), f2f_set=F2F)
     assert "Missing END" in kinds(issues)
-    assert "Line Order" in kinds(issues)
-    assert "before a new Start Line" in " ".join(e["detail"] for e in issues)
+    assert "Line Order" not in kinds(issues)
     assert any(e["oid"] == "1" for e in issues), "the fix belongs on the point that should have ended"
 
 
@@ -125,50 +132,55 @@ def test_two_lines_are_judged_one_at_a_time():
     assert issues == []
 
 
-def test_curve_command_order_is_checked_across_points_and_repeated_curves_are_valid():
-    out_of_order = LC.detect_line_errors(
-        rows("TOC ST", "TOC PT", "TOC PC", "TOC END"), f2f_set=F2F)
-    order_issues = [issue for issue in out_of_order if issue["issue_type"] == "Line Order"]
-    assert len(order_issues) == 1
-    assert order_issues[0]["oid"] == "2"
-    assert "across its point sequence" in order_issues[0]["detail"]
+def test_only_the_three_requested_pair_orders_are_checked_across_points():
+    # Start Curve before Start Line, including when the same line code continues across points.
+    start_before_line = LC.detect_line_errors(rows("TOC PC", "TOC ST"), f2f_set=F2F)
+    start_orders = [issue for issue in start_before_line if issue["issue_type"] == "Line Order"]
+    assert [(issue["oid"], "Start Curve appears before Start Line" in issue["detail"])
+            for issue in start_orders] == [("2", True)]
 
-    nested = LC.detect_line_errors(
-        rows("TOC ST", "TOC PC", "TOC PC", "TOC PT", "TOC END"), f2f_set=F2F)
-    assert any(issue["issue_type"] == "Line Order" and issue["oid"] == "3"
-               for issue in nested), "a second Start Curve must follow the first End Curve"
-
-    # End Curve must come before either End Line or Close; a terminator during an
-    # open curve is an order error, even when the later End Curve is on another point.
-    for terminator in ("END", "X"):
+    # End Line/Close before End Curve remain errors even when commands are on separate points.
+    for terminator, expected_reason in (
+        ("END", "End Line appears before End Curve"),
+        ("X", "Close appears before End Curve"),
+    ):
         ended_before_curve = LC.detect_line_errors(
             rows("TOC ST", "TOC PC", f"TOC {terminator}", "TOC PT"), f2f_set=F2F)
-        assert any(issue["issue_type"] == "Line Order" and issue["oid"] == "3"
-                   for issue in ended_before_curve), terminator
+        order_issues = [issue for issue in ended_before_curve if issue["issue_type"] == "Line Order"]
+        assert len(order_issues) == 1, terminator
+        assert order_issues[0]["oid"] == "3", terminator
+        assert expected_reason in order_issues[0]["detail"]
 
-    # Detect invalid order within one description, plus a curve command that appears
-    # after a prior point already ended the line.
-    same_point = LC.detect_line_errors(
-        rows("TOC PC ST", "TOC PT END"), f2f_set=F2F)
+    # The point-level pair is also caught without using a hard-coded token spelling.
+    same_point = LC.detect_line_errors(rows("TOC PC ST"), f2f_set=F2F)
     assert any(issue["issue_type"] == "Line Order" and issue["oid"] == "1"
                for issue in same_point)
-    after_end = LC.detect_line_errors(
-        rows("TOC ST", "TOC END", "TOC PC", "TOC PT"), f2f_set=F2F)
-    assert any(issue["issue_type"] == "Line Order" and issue["oid"] == "3"
-               for issue in after_end)
 
-    # A line may carry several properly paired curves; the state machine must allow PC/PT to repeat.
+    # End Curve before Start Line, repeated starts, and an unmatched singleton are outside the
+    # three pair checks; completeness remains covered by the Missing-* findings.
+    for descriptions in (
+        ("TOC PT ST",),
+        ("TOC ST", "TOC ST", "TOC END"),
+        ("TOC PC",),
+        ("TOC END",),
+        ("TOC ST", "TOC PT", "TOC PC", "TOC END"),
+        ("TOC ST", "TOC PC", "TOC PC", "TOC PT", "TOC END"),
+    ):
+        issues = LC.detect_line_errors(rows(*descriptions), f2f_set=F2F)
+        assert not any(issue["issue_type"] == "Line Order" for issue in issues), descriptions
+
+    # A line may carry several properly paired curves; the narrower check leaves them alone.
     assert LC.detect_line_errors(
         rows("TOC ST", "TOC PC", "TOC PT", "TOC PC", "TOC PT", "TOC END"),
         f2f_set=F2F) == []
 
 
 def test_line_order_fix_validation_checks_the_whole_sequence_after_a_fix_moves_the_error():
-    working = rows("TOC ST", "TOC PT", "TOC PC", "TOC END")
-    result = LC.validate_fix(working, "2", "TOC PC", f2f_set=F2F)
-    assert not result["ok"]
-    assert result["still"] and result["still"][0]["issue_type"] == "Line Order"
-    assert result["still"][0]["oid"] == "3"
+    working = rows("TOC ST", "TOC PC", "TOC END PT")
+    result = LC.validate_fix(working, "3", "TOC PT END", f2f_set=F2F)
+    assert result["ok"], result["note"]
+    assert any(issue["issue_type"] == "Line Order" and issue["oid"] == "3"
+               for issue in result["cleared"])
 
 
 # ------------------------------------------------------------------ the proposal
@@ -324,8 +336,8 @@ def test_line_order_findings_are_errors_not_warnings():
         repeated_curve_project.add_point(i, 0, 0, number=str(i + 1), desc=desc)
     repeated_report = check_project(repeated_curve_project, f2f=F2F)
     repeated_order = [finding for finding in repeated_report["findings"]
-                      if finding.get("check") == "line: line order"]
-    assert repeated_order and all(finding["level"] == "error" for finding in repeated_order)
+                      if finding.get("flag") == "LineOrderError"]
+    assert not repeated_order, "a repeated Start Curve is outside the three supported pair checks"
 
 
 def test_orphan_commands_are_errors_not_warnings():
@@ -345,7 +357,7 @@ def test_orphan_commands_are_errors_not_warnings():
                for finding in orphan_findings for i in finding.get("rows", []))
 
 
-def test_real_world_sample_pc_before_st_reaches_the_project_report():
+def test_real_world_sample_single_curve_command_is_not_a_line_order_error():
     from pathlib import Path
 
     from plumbline.core.project import Project
@@ -358,22 +370,16 @@ def test_real_world_sample_pc_before_st_reaches_the_project_report():
     rows = FB.read_working_file(working_file)
     row = next(row for row in rows if str(row[FB.OID]).strip() == "33")
     northing, easting, elevation = FB.row_xyz(row)
-    project = Project("Real World sample line order")
-    point = project.add_point(easting, northing, elevation, number=row[FB.PTNUM], desc=row[FB.DESC],
-                              attrs={"fieldwork_oid": row[FB.OID]})
+    project = Project("Real World singleton line command")
+    project.add_point(easting, northing, elevation, number=row[FB.PTNUM], desc=row[FB.DESC],
+                      attrs={"fieldwork_oid": row[FB.OID]})
 
     code_set = build_f2f_set_from_fieldbook(book)
     assert "eg" in code_set, "the real sample Field Book defines EG"
     report = FB.check_project(project, f2f=code_set, fieldbook_path=str(book))
-    order_findings = [finding for finding in report["findings"]
-                      if finding.get("flag") == "LineOrderError"]
 
-    assert any(finding.get("check") == "line: line order"
-               and finding["level"] == "error" for finding in order_findings)
-    assert any(finding.get("check") == "Line command out of order"
-               and finding["level"] == "error" for finding in order_findings)
-    assert all(report["ids"][i] == point.id for finding in order_findings
-               for i in finding.get("rows", []))
+    assert not any(finding.get("flag") == "LineOrderError" for finding in report["findings"])
+    assert not any(issue.get("issue_type") == "Line Order" for issue in report["line_issues"])
 
 
 def test_project_check_keeps_line_order_visible_for_a_code_unknown_to_the_active_book(tmp_path):
@@ -420,41 +426,75 @@ def test_curve_start_before_line_start_is_flagged_when_feature_code_is_unknown()
     assert "LineOrderError" not in line_order_flags("ZZ ST PC").get("17", [])
 
 
-def test_point_order_checks_combined_line_commands_per_code_and_allows_repeated_curves():
+def test_point_order_checks_only_three_pairs_per_code_occurrence():
     from plumbline.core.fieldbook_syntax import command_map
     from plumbline.fieldwork.parse import _validate_line_command_order
 
-    def has_order_error(description, codes=F2F):
+    def has_order_error(description, codes=F2F, commands=None):
         row = ["17", "17", "0", "0", "0", description, "", "crew.csv"]
-        flags = _validate_line_command_order([row], codes, commands=command_map())
+        flags = _validate_line_command_order(
+            [row], codes, commands=commands or command_map())
         return "LineOrderError" in flags.get("17", [])
 
-    # The code text is only used to associate commands with their own section; validate
-    # the semantic command sequence, including both start and termination relationships.
+    # The three semantic pairs are checked within a single code-token occurrence.
     for description in (
-        "TOC PC ST",             # Start Curve before Start Line
-        "TOC PT ST",             # End Curve before Start Line
-        "TOC ST PC END",         # End Line while a curve is open
-        "TOC ST PC X PT",        # Close before End Curve
-        "TOC END PT",            # End Curve after End Line
-        "TOC X PT",              # End Curve after Close
-        "TOC ST PC PC PT END",   # repeated Start Curve before End Curve
-        "TOC ST PC ZZ PC ST",    # known and unknown code sections in one description
-        "TOC ST END PT",         # End Curve after the line has ended
+        "TOC PC ST",                       # Start Curve before Start Line
+        "TOC END PT",                      # End Line before End Curve
+        "TOC X PT",                        # Close before End Curve
+        "TOC ST PC END PT",                # End Line before End Curve in a longer section
+        "TOC ST PC X PT",                  # Close before End Curve in a longer section
+        "TOC PC ST - EC1 END",             # do not let the EC1 singleton create a second error
+        "TOC ST PC - ZZ PC ST",            # unknown-code sections are still checked independently
     ):
         assert has_order_error(description), description
 
-    # Curves can be paired repeatedly, and a point may carry a continuation from the
-    # preceding point. Repeated code names in separate multicode groups stay independent.
+    # Singleton commands, different code sections, repeated same-code sections, and unrelated
+    # sequence mistakes are outside these three checks.
     for description in (
-        "TOC ST PC PT PC PT END",
-        "TOC PC PT PC PT END",
-        "TOC PT PC PT END",
-        "TOC ST PC PT PC PT END - EC ST PC PT END",
-        "TOC ST PC PT PC PT END - TOC ST PC PT END",
-        "ZZ PC PT PC PT END",
+        "TOC PC",
+        "TOC END",
+        "TOC ST PC",
+        "TOC PT ST",                       # not one of the three requested pairs
+        "TOC ST PC PT END",
+        "TOC ST PC PC PT END",             # repeated Start Curve is not an order-pair check
+        "TOC ST PC PT END ST PC PT END",   # two valid line segments
+        "TOC PC - EC1 ST",                # one command on each distinct code
+        "TOC ST - EC1 END",               # one command on each distinct code
+        "TOC PC - TOC ST",                # same code spelling, distinct sections
+        "ZZ PC",                           # singleton unknown-code command
     ):
         assert not has_order_error(description), description
+
+    custom_commands = {
+        "start_line": "BEGINLN", "start_curve": "BC", "end_curve": "EC",
+        "end_line": "FINISH", "close": "CLOSEFIG", "multicode": "PLUS",
+        "description": "NOTE",
+    }
+    assert has_order_error("EA BC BEGINLN", codes={"ea"}, commands=custom_commands)
+    assert has_order_error("EA BEGINLN FINISH EC", codes={"ea"}, commands=custom_commands)
+    assert has_order_error("EA BEGINLN CLOSEFIG EC", codes={"ea"}, commands=custom_commands)
+
+
+def test_line_order_autofix_reorders_only_the_supported_pairs_in_each_code_section():
+    from plumbline.core.point_linework_coder import fix_line_command_order
+
+    assert fix_line_command_order("TOC PC ST - EC1 END / curb note") == \
+        "TOC ST PC - EC1 END / curb note"
+    assert fix_line_command_order("TOC ST PC END PT") == "TOC ST PC PT END"
+    assert fix_line_command_order("TOC ST PC X PT") == "TOC ST PC PT X"
+    assert fix_line_command_order("TOC PT ST") == "TOC PT ST"
+    assert fix_line_command_order("TOC ST PC PC PT END") == "TOC ST PC PC PT END"
+    assert fix_line_command_order("TOC ST PC PT END ST PC PT END") == \
+        "TOC ST PC PT END ST PC PT END"
+
+    custom_commands = {
+        "start_line": "BEGINLN", "start_curve": "BC", "end_curve": "EC",
+        "end_line": "FINISH", "close": "CLOSEFIG", "multicode": "PLUS",
+        "description": "NOTE",
+    }
+    assert fix_line_command_order("EA BC BEGINLN", commands=custom_commands) == "EA BEGINLN BC"
+    assert fix_line_command_order("EA BEGINLN FINISH EC", commands=custom_commands) == \
+        "EA BEGINLN EC FINISH"
 
 
 def test_the_dock_reports_the_line_issues_and_they_select_the_points(win, app):
@@ -536,7 +576,7 @@ def test_fix_linework_keeps_lineorder_findings_in_fix_points(win, app, tmp_path)
          ["EC", "Edge of concrete", "", "ROAD", "Line", "Road"]],
     )
     win._job_root_choice = job_root
-    project.add_point(100, 200, 5, number="9002", desc="EG PT ST - EC1 END")
+    project.add_point(100, 200, 5, number="9002", desc="EG PC ST - EC1 END")
 
     dialog = FixLineworkDialog(win.state, win)
     try:
@@ -548,6 +588,44 @@ def test_fix_linework_keeps_lineorder_findings_in_fix_points(win, app, tmp_path)
         assert "Line Order" not in {row["check_key"] for row in dialog._report_check_rows()}
         # Other sequence-completeness checks remain in Fix Linework.
         assert any(item.get("check") == "line: missing st" for item in dialog.active_findings)
+    finally:
+        dialog.close()
+
+
+def test_fix_points_does_not_pull_singleton_or_cross_code_order_findings(win, app, tmp_path):
+    from plumbline.fieldwork.io_carlson import write_fwb_file
+    from plumbline.fieldwork.bridge import check_project
+    from plumbline.ui.qa_workspace import FixPointErrorsDialog
+
+    project = win.state.project
+    for point in list(project.points.values()):
+        del project.points[point.id]
+    project.settings.pop("fieldbook_file", None)
+    project.settings.pop("f2f_path", None)
+    job_root = tmp_path / "singleton-order-job"
+    book = job_root / "Field Book" / "Singletons.fwb"
+    book.parent.mkdir(parents=True)
+    assert write_fwb_file(
+        book,
+        ["Code", "Description", "Symbol", "Layer", "Entity Type", "Category"],
+        [["EG", "Edge of gravel", "", "ROAD", "Line", "Road"],
+         ["EC", "Edge of concrete", "", "ROAD", "Line", "Road"]],
+    )
+    win._job_root_choice = job_root
+    project.add_point(100, 200, 5, number="9101", desc="EG PC - EC1 ST")
+    project.add_point(101, 201, 5, number="9102", desc="EC ST - EG1 END")
+
+    report = check_project(project, f2f={"eg", "ec"}, fieldbook_path=str(book))
+    assert not any(finding.get("flag") == "LineOrderError" for finding in report["findings"])
+    assert not any(issue.get("issue_type") == "Line Order" for issue in report["line_issues"])
+
+    dialog = FixPointErrorsDialog(win.state, win)
+    try:
+        assert not any(item.get("flag") == "LineOrderError" and not item.get("zero_check")
+                       for item in dialog.active_findings)
+        order_check = next(row for row in dialog._report_check_rows()
+                           if row["check_key"] == "LineOrderError")
+        assert order_check["status"] == "CLEAR"
     finally:
         dialog.close()
 
@@ -572,7 +650,7 @@ def test_fix_points_owns_valid_multicode_lineorder_findings(win, app, tmp_path):
     )
     win._job_root_choice = job_root
     multicode_order = project.add_point(100, 200, 5, number="9003",
-                                        desc="EG PT ST - EC1 END")
+                                        desc="EG PC ST - EC1 END")
     curve_before_line = project.add_point(101, 201, 5, number="9004", desc="EG PC ST")
     valid_curves = project.add_point(102, 202, 5, number="9005",
                                      desc="EC ST PC PT PC PT END")
@@ -590,7 +668,8 @@ def test_fix_points_owns_valid_multicode_lineorder_findings(win, app, tmp_path):
         assert point_finding["flag"] == sequence_finding["flag"] == "LineOrderError"
         assert point_finding["level"] == sequence_finding["level"] == "error"
         expected_order_points = [multicode_order.id, curve_before_line.id]
-        assert point_finding["pids"] == sequence_finding["pids"] == expected_order_points
+        assert point_finding["pids"] == expected_order_points
+        assert sequence_finding["pids"] == [multicode_order.id]
         assert valid_curves.id not in point_finding["pids"]
         assert dialog._filter_finding(point_finding)
         assert dialog._filter_finding(sequence_finding)

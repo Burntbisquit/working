@@ -16,6 +16,7 @@ from .fieldbook_syntax import (
     command_map,
     command_meanings,
     find_separator,
+    first_line_order_pair_violation,
     separator_text,
     split_at_separator,
 )
@@ -450,11 +451,10 @@ def swap_parallel_line_codes(points: Sequence[SurveyPoint], code_prefix1: str, c
 
 
 def fix_line_command_order(desc: str, commands=None) -> str:
-    """Order line-control meanings consistently without hard-coding their Field Book tokens."""
+    """Correct only the three supported semantic pair inversions in each code section."""
     if not desc:
         return ""
     semantic_tokens = command_map(commands)
-    rank = {"start_line": 0, "start_curve": 1, "end_curve": 2, "end_line": 3, "close": 3}
     description_token = semantic_tokens.get("description", "")
     description_index = find_separator(desc, description_token)
     if description_index >= 0:
@@ -462,24 +462,39 @@ def fix_line_command_order(desc: str, commands=None) -> str:
         note = desc[description_index + len(description_token):].strip()
     else:
         code_text, note = desc.strip(), ""
+
     fixed_groups = []
+    any_changed = False
     for part in _split_multicode(code_text, semantic_tokens):
         tokens = part.split()
         if len(tokens) <= 1:
             fixed_groups.append(part)
             continue
-        code = tokens[0]
-        commands_seen = []
-        other = []
-        for token in tokens[1:]:
-            meaning = _meaning(token, semantic_tokens)
-            if meaning in rank:
-                commands_seen.append((rank[meaning], len(commands_seen), token))
-            else:
-                other.append(token)
-        commands_seen.sort(key=lambda item: item[0])
-        ordered = [code, *[item[2] for item in commands_seen], *other]
-        fixed_groups.append(_format_tokens(ordered, semantic_tokens))
+
+        code, command_tokens = tokens[0], tokens[1:]
+        meanings = [_meaning(token, semantic_tokens) for token in command_tokens]
+        part_changed = False
+        # Each swap removes the first forbidden pair while leaving every other token and code
+        # section in place. The cap is defensive; ordinary inputs converge after one swap per pair.
+        for _ in range(max(1, len(command_tokens) ** 2)):
+            violation = first_line_order_pair_violation(meanings)
+            if violation is None:
+                break
+            first_index, second_index, _reason = violation
+            if first_index == second_index:
+                break
+            command_tokens[first_index], command_tokens[second_index] = (
+                command_tokens[second_index], command_tokens[first_index])
+            meanings[first_index], meanings[second_index] = meanings[second_index], meanings[first_index]
+            part_changed = True
+        if part_changed:
+            fixed_groups.append(_format_tokens([code, *command_tokens], semantic_tokens))
+            any_changed = True
+        else:
+            fixed_groups.append(part)
+
+    if not any_changed:
+        return desc
     fixed = _join_multicode(fixed_groups, semantic_tokens)
     if note:
         return _format_part(fixed, note, True, semantic_tokens)
