@@ -105,6 +105,19 @@ def _display_item(text, *, data=None, background=None) -> QTableWidgetItem:
     return item
 
 
+def _is_line_order_finding(finding: dict) -> bool:
+    """Recognize line-command order findings by stable flag or either public check label.
+
+    The flag is the normal discriminator. The labels are deliberate fallbacks so a finding still
+    lands in Fix Point Errors if it arrives through a report/compatibility path that omitted the
+    flag field.
+    """
+    flag = str(finding.get("flag", "")).strip().casefold()
+    check = str(finding.get("check", "")).strip().casefold()
+    return (flag == "lineordererror"
+            or check in {"line command out of order", "line: line order"})
+
+
 class _DownTabComboBox(QComboBox):
     """Tab through embedded combos in one column, skipping blank rows and avoiding wraparound."""
 
@@ -1316,7 +1329,9 @@ class BaseQAWorkbenchWindow(QMainWindow):
                           if flag != "ControlMismatch")
             checks.append(("Control point comparison", "ControlMismatch", "control"))
             return checks
-        return [(issue, issue, "linework") for issue in LC.ISSUE_TYPES]
+        # Command-order checks are point-level and live in Fix Point Errors; keep this
+        # workbench's catalogue focused on whole-line completeness/geometry checks.
+        return [(issue, issue, "linework") for issue in LC.ISSUE_TYPES if issue != "Line Order"]
 
     def _report_check_rows(self) -> list[dict]:
         """Return current result counts for every check, including clear and skipped checks."""
@@ -1336,7 +1351,8 @@ class BaseQAWorkbenchWindow(QMainWindow):
         for label, check_key, category in self._report_check_catalog():
             if category == "descriptions":
                 matches = [item for item in findings
-                           if str(item.get("flag", "")) == check_key]
+                           if str(item.get("flag", "")) == check_key
+                           or (check_key == "LineOrderError" and _is_line_order_finding(item))]
                 did_run = code_checks_ran and have_points
             elif category == "linework":
                 matches = [item for item in findings
@@ -1410,9 +1426,11 @@ class BaseQAWorkbenchWindow(QMainWindow):
             line_flag = ISSUE_FLAGS.get(row["check_key"])
             if line_flag:
                 aliases.add(line_flag.casefold())
-            if any(str(item.get("check", "")).casefold() in aliases
-                   or str(item.get("flag", "")).casefold() in aliases
-                   for item in existing_findings):
+            if (any(str(item.get("check", "")).casefold() in aliases
+                    or str(item.get("flag", "")).casefold() in aliases
+                    for item in existing_findings)
+                    or (row["check_key"] == "LineOrderError"
+                        and any(_is_line_order_finding(item) for item in existing_findings))):
                 continue
             status = "clear" if row["status"] == "CLEAR" else "not_run"
             entries.append({
@@ -2886,9 +2904,12 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
                 self._open_inline_editor(match, start_session=False)
 
     def _filter_finding(self, finding: dict) -> bool:
-        chk = finding.get("check", "").lower()
+        chk = str(finding.get("check", "")).casefold()
         flag = str(finding.get("flag", ""))
-        # Filter out line issues (they belong in Fix Linework)
+        # Command-order errors are description-level point findings: keep them here even though
+        # their check title contains "line". Fix Linework remains focused on other line sequences.
+        if _is_line_order_finding(finding):
+            return True
         if "line:" in chk or flag.startswith("Missing") or any(w in chk for w in ("line", "curve", "string", "closed")):
             return False
         return True
@@ -3172,10 +3193,17 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
             lay_keyin = QVBoxLayout(grp_keyin)
             lay_keyin.setSpacing(6)
 
-            lay_keyin.addWidget(Hint(
-                "Key in corrected descriptions. Unrecognized codes are underlined in red. "
-                "All entered codes are checked against the Field Book in real time."
-            ))
+            if flag == "LineOrderError":
+                description_hint = (
+                    "The line commands are out of sequence. Correct the Fixed description for each affected point; "
+                    "commands are checked within their own multicode group, and edits stay staged until Apply or Save."
+                )
+            else:
+                description_hint = (
+                    "Key in corrected descriptions. Unrecognized codes are underlined in red. "
+                    "All entered codes are checked against the Field Book in real time."
+                )
+            lay_keyin.addWidget(Hint(description_hint))
 
             scroll_pts = QScrollArea()
             scroll_pts.setWidgetResizable(True)
@@ -4233,9 +4261,11 @@ class FixLineworkDialog(BaseQAWorkbenchWindow):
     workbench_title = "Fix Linework"
 
     def _filter_finding(self, finding: dict) -> bool:
-        chk = finding.get("check", "").lower()
+        chk = str(finding.get("check", "")).casefold()
         flag = str(finding.get("flag", ""))
-        # Only linework issues
+        # LineOrderError is a description-level finding and is reviewed in Fix Point Errors.
+        if _is_line_order_finding(finding):
+            return False
         if "line:" in chk or flag.startswith("Missing") or any(w in chk for w in ("line", "curve", "string", "closed")):
             return True
         return False

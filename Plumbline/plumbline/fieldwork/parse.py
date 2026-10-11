@@ -420,9 +420,83 @@ def common_conversion_rule_warning(common_error: str, fix: str, f2f_set,
     return None
 
 
+def _first_line_command_order_violation(meanings, settings=None):
+    """Return the first invalid transition in a code section's ordered line commands.
+
+    A point description may contain only part of a line's command sequence because the rest can
+    live on other points. Treat an unmatched leading End Curve as a continuation, but enforce
+    order whenever the relevant commands occur together. Curve pairs may repeat:
+    ``PC PT PC PT`` is valid, while ``PC PC PT`` and ``PC END`` are not.
+    """
+    settings = settings or {}
+    protect_st_pc = settings.get("protect_st_pc", True)
+    protect_pt_end = settings.get("protect_pt_end", True)
+    protect_pt_x = settings.get("protect_pt_x", True)
+    protect_st_after_end = settings.get("protect_st_after_end", False)
+
+    line_started = False
+    line_ended = False
+    curve_open = False
+    saw_command_before_start = False
+
+    for index, meaning in enumerate(meanings):
+        label = meaning.replace("_", " ").title()
+
+        if meaning == "start_line":
+            if line_ended:
+                if protect_st_after_end:
+                    return index, "Start Line appears after End Line/Close"
+                # Some Field Books permit another line segment under the same code section.
+                line_started = True
+                line_ended = False
+                curve_open = False
+                saw_command_before_start = False
+                continue
+            if saw_command_before_start:
+                return index, "Start Line appears after a curve command in this code section"
+            if line_started:
+                return index, "Start Line repeats before End Line/Close in this code section"
+            line_started = True
+            continue
+
+        if line_ended:
+            return index, f"{label} appears after End Line/Close"
+
+        if meaning == "start_curve":
+            if curve_open:
+                return index, "Start Curve appears before the preceding curve's End Curve"
+            curve_open = True
+        elif meaning == "end_curve":
+            if curve_open:
+                curve_open = False
+            elif line_started and protect_st_pc:
+                return index, "End Curve appears without a preceding Start Curve in this code section"
+            # With no Start Line in this description, PT may close a curve begun on an earlier point.
+        elif meaning == "end_line":
+            if curve_open and protect_pt_end:
+                return index, "End Line appears before the open curve's End Curve"
+            line_ended = True
+            curve_open = False
+        elif meaning == "close":
+            if curve_open and protect_pt_x:
+                return index, "Close appears before the open curve's End Curve"
+            line_ended = True
+            curve_open = False
+
+        if not line_started:
+            saw_command_before_start = True
+
+    return None
+
+
 def _validate_line_command_order(working_rows, f2f_set, settings=None, fieldbook_path=None,
                                  command_set=None, rules=None, commands=None):
-    """Check line-command order using the active Field Book's semantic command meanings."""
+    """Check ordered line commands per code occurrence, using Field Book command meanings.
+
+    Code validity is not an ordering prerequisite. Known code occurrences attach commands
+    normally; unknown-code sections are checked separately so their command sequence is still
+    reviewed without mixing it with adjacent multicode groups.
+    """
     if settings is None:
         settings = {}
     if rules is None and fieldbook_path:
@@ -439,22 +513,12 @@ def _validate_line_command_order(working_rows, f2f_set, settings=None, fieldbook
         semantic_tokens = command_map(commands)
     meanings = command_meanings(semantic_tokens)
 
-    protect_st_pc = settings.get("protect_st_pc", True)
-    protect_pt_end = settings.get("protect_pt_end", True)
-    protect_pt_x = settings.get("protect_pt_x", True)
-    protect_pc_after_end = settings.get("protect_pc_after_end", True)
-    protect_st_after_end = settings.get("protect_st_after_end", False)
-
     from collections import defaultdict
-    from ..core.fieldbook_syntax import command_joiner
 
     oid_flags = defaultdict(list)
     oid_details = defaultdict(list)
     _validate_line_command_order.details = oid_details
-    rank = {"start_line": 0, "start_curve": 1, "end_curve": 2,
-            "end_line": 3, "close": 3}
-    line_meanings = set(rank)
-    spacing = command_joiner()
+    line_meanings = {"start_line", "start_curve", "end_curve", "end_line", "close"}
 
     for idx, working_row in enumerate(working_rows):
         oid = working_row[0] if len(working_row) > 0 else str(idx)
@@ -463,10 +527,9 @@ def _validate_line_command_order(working_rows, f2f_set, settings=None, fieldbook
             raw_desc, f2f_set, fieldbook_path=fieldbook_path, command_set=command_set,
             rules=rules, commands=semantic_tokens)
         classified = parsed["code_classified"]
-        code_to_commands = defaultdict(list)
-        code_to_command_indices = defaultdict(list)
-        code_raw = {}
-        for item_index, item in enumerate(classified):
+        commands_by_code_index = defaultdict(list)
+        code_raw_by_index = {}
+        for item in classified:
             if item["type"] != "command" or item.get("status") != "valid":
                 continue
             meaning = item.get("meaning") or meanings.get(item.get("norm", "").casefold(), "")
@@ -475,70 +538,29 @@ def _validate_line_command_order(working_rows, f2f_set, settings=None, fieldbook
             code_index = item["attached_to"]
             code_item = classified[code_index] if 0 <= code_index < len(classified) else None
             if code_item and code_item["type"] == "code":
-                line_id = code_item["raw"].strip().casefold()
-                code_to_commands[line_id].append(meaning)
-                code_to_command_indices[line_id].append(item_index)
-                code_raw[line_id] = code_item["raw"]
+                # Keep each code occurrence separate, even when the same code appears in
+                # multiple multicode sections. Commands are checked only against their owner.
+                commands_by_code_index[code_index].append((meaning, item["raw"]))
+                code_raw_by_index[code_index] = code_item["raw"]
 
-        for line_id, meanings_on_code in code_to_commands.items():
-            if not meanings_on_code:
+        for code_index, events in commands_by_code_index.items():
+            violation = _first_line_command_order_violation(
+                [meaning for meaning, _token in events], settings)
+            if violation is None:
                 continue
-            if (protect_st_pc and "start_line" in meanings_on_code and
-                    "end_curve" in meanings_on_code and "start_curve" not in meanings_on_code):
-                oid_flags[oid].append("LineOrderError")
-                oid_details[oid].append(
-                    f"line without curve start (line start/end must be outside curve) — '{raw_desc}'")
+            bad_index, reason = violation
+            code_label = code_raw_by_index[code_index]
+            observed = " ".join(token for _meaning, token in events)
+            bad_token = events[bad_index][1]
+            oid_flags[oid].append("LineOrderError")
+            oid_details[oid].append(
+                f"{reason} at '{bad_token}' in code section '{code_label}' "
+                f"(commands: {observed}) — '{raw_desc}'")
 
-            ranks = [rank.get(meaning, 99) for meaning in meanings_on_code]
-            if ranks != sorted(ranks):
-                sorted_meanings = [meaning for meaning, _ in sorted(
-                    zip(meanings_on_code, ranks), key=lambda pair: pair[1])]
-                original_command_tokens = [classified[i]["raw"]
-                                           for i in code_to_command_indices[line_id]]
-                original_parts = [code_raw[line_id], *original_command_tokens]
-                pattern = (r"(?<![A-Za-z0-9_])" +
-                           r"\s*".join(re.escape(part) for part in original_parts) +
-                           r"(?![A-Za-z0-9_])")
-                corrected_tokens = [semantic_tokens.get(meaning, "") for meaning in sorted_meanings]
-                corrected_parts = [code_raw[line_id], *[t for t in corrected_tokens if t]]
-                corrected_group = spacing.join(corrected_parts)
-                corrected = re.sub(pattern, corrected_group, raw_desc, count=1, flags=re.IGNORECASE)
-                oid_flags[oid].append("LineOrderError")
-                oid_details[oid].append(
-                    f"commands out of semantic order {meanings_on_code} → {sorted_meanings} "
-                    f"(Start Line → Start Curve → End Curve → End Line/Close) — "
-                    f"'{raw_desc}' → '{corrected}'")
-                continue
-
-            end_meanings = {"end_line", "close"}
-            end_indices = [i for i, meaning in enumerate(meanings_on_code) if meaning in end_meanings]
-            if end_indices:
-                first_end = min(end_indices)
-                after_end = meanings_on_code[first_end + 1:]
-                if protect_pc_after_end and "start_curve" in after_end:
-                    oid_flags[oid].append("LineOrderError")
-                    oid_details[oid].append(
-                        f"curve start after line end (line command order) — '{raw_desc}'")
-                if protect_st_after_end and "start_line" in after_end:
-                    oid_flags[oid].append("LineOrderError")
-                    oid_details[oid].append(
-                        f"line start after line end (line command order) — '{raw_desc}'")
-                if (protect_pt_end and "end_line" in meanings_on_code and
-                        "end_curve" not in meanings_on_code and "start_curve" in meanings_on_code):
-                    oid_flags[oid].append("LineOrderError")
-                    oid_details[oid].append(
-                        f"line end without curve end (End Curve must precede End Line) — '{raw_desc}'")
-                if (protect_pt_x and "close" in meanings_on_code and
-                        "end_curve" not in meanings_on_code and "start_curve" in meanings_on_code):
-                    oid_flags[oid].append("LineOrderError")
-                    oid_details[oid].append(
-                        f"close without curve end (End Curve must precede Close) — '{raw_desc}'")
-
-        # The normal path above needs a Field Book code so each command can be attached to its
-        # string.  Still catch command order when that code is missing from the active book:
-        # e.g. EG PC ST must be reported as Start Curve before Start Line, not skipped because
-        # PC and ST were classified as orphan commands.  Limit this fallback to the code portion
-        # (and each multi-code segment) so ordinary note text is never searched.
+        # Known codes are handled above. Also validate each unknown-code section independently:
+        # its commands are classified as orphans, but that must not hide an ordering error such
+        # as ZZ PC ST. Keep the fallback inside the code portion and split multicode groups first,
+        # so note text and neighboring code sections cannot supply the missing commands.
         code_part = parsed.get("code_part", "")
         multicode = semantic_tokens.get("multicode", "")
         code_segments = split_at_separator(code_part, multicode, maxsplit=0) if multicode else [code_part]
@@ -549,23 +571,31 @@ def _validate_line_command_order(working_rows, f2f_set, settings=None, fieldbook
             segment_classified = _classify_tokens_sequential(
                 segment_tokens, f2f_set, command_set=command_set, rules=rules,
                 commands=semantic_tokens)
-            has_known_code = any(
-                item.get("type") == "code" and item.get("status") in ("exact", "line_instance")
-                for item in segment_classified)
-            if has_known_code:
-                continue
-            order = [meanings.get(token.strip().casefold(), "") for token in segment_tokens]
-            order = [meaning for meaning in order if meaning in line_meanings]
-            ranks = [rank[meaning] for meaning in order]
-            if len(order) < 2 or ranks == sorted(ranks):
-                continue
-            sorted_meanings = [meaning for meaning, _ in sorted(
-                zip(order, ranks), key=lambda pair: pair[1])]
-            oid_flags[oid].append("LineOrderError")
-            oid_details[oid].append(
-                f"commands out of semantic order {order} → {sorted_meanings} "
-                f"(Start Line → Start Curve → End Curve → End Line/Close) in a segment with no "
-                f"recognized Field Book code — '{raw_desc}'")
+            unknown_commands = defaultdict(list)
+            unknown_code_raw = {}
+            active_unknown_code = None
+            for item_index, item in enumerate(segment_classified):
+                if item.get("type") == "code":
+                    active_unknown_code = (item_index if item.get("status") == "unknown" else None)
+                    if active_unknown_code is not None:
+                        unknown_code_raw[active_unknown_code] = item.get("raw", "")
+                    continue
+                if item.get("type") != "command" or active_unknown_code is None:
+                    continue
+                meaning = item.get("meaning") or meanings.get(item.get("norm", "").casefold(), "")
+                if meaning in line_meanings:
+                    unknown_commands[active_unknown_code].append((meaning, item.get("raw", "")))
+
+            for code_index, events in unknown_commands.items():
+                violation = _first_line_command_order_violation(
+                    [meaning for meaning, _token in events], settings)
+                if violation is None:
+                    continue
+                bad_index, reason = violation
+                oid_flags[oid].append("LineOrderError")
+                oid_details[oid].append(
+                    f"{reason} at '{events[bad_index][1]}' in unrecognized code section "
+                    f"'{unknown_code_raw[code_index]}' — '{raw_desc}'")
 
     return dict(oid_flags)
 

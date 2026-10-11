@@ -62,6 +62,27 @@ def test_a_code_that_is_never_a_line_is_left_to_the_description_check():
     assert LC.detect_line_errors(rows("GS", "GS", "TOC ST", "TOC END"), f2f_set=F2F) == []
 
 
+def test_multicode_groups_keep_commands_with_their_code_on_one_row_and_across_points():
+    active_codes = {"eg", "ec"}
+
+    # Both groups are checked independently in a single description; EG is a valid line code.
+    same_row = LC.detect_line_errors(rows("EG PT ST - EC1 END"), f2f_set=active_codes)
+    same_row_order = [issue for issue in same_row if issue["issue_type"] == "Line Order"]
+    assert {issue["line_id"] for issue in same_row_order} == {"eg", "ec1"}
+    assert any(issue["line_id"] == "eg" and "End Curve appears before Start Line" in issue["detail"]
+               for issue in same_row_order)
+    assert any(issue["line_id"] == "ec1" and "End Line appears before Start Line" in issue["detail"]
+               for issue in same_row_order)
+
+    # Across points, EG follows ST -> PC -> PT -> END, while EC1 has PT before PC.
+    # Only EC1 should be reported: commands must not leak between the two code groups.
+    continued = LC.detect_line_errors(
+        rows("EG ST - EC1 ST", "EG PC - EC1 PT", "EG PT - EC1 PC", "EG END - EC1 END"),
+        f2f_set=active_codes)
+    continued_order = [issue for issue in continued if issue["issue_type"] == "Line Order"]
+    assert [(issue["line_id"], issue["oid"]) for issue in continued_order] == [("ec1", "2")]
+
+
 def test_custom_fieldbook_meanings_and_alphanumeric_separators_are_used():
     commands = {
         "start_line": "BEGINLN",
@@ -307,6 +328,23 @@ def test_line_order_findings_are_errors_not_warnings():
     assert repeated_order and all(finding["level"] == "error" for finding in repeated_order)
 
 
+def test_orphan_commands_are_errors_not_warnings():
+    from plumbline.core.project import Project
+    from plumbline.fieldwork.bridge import check_project
+
+    project = Project("Orphan command severity")
+    point = project.add_point(0, 0, 0, number="1", desc="ST")
+
+    report = check_project(project, f2f=F2F)
+    orphan_findings = [finding for finding in report["findings"]
+                       if finding.get("flag") == "OrphanCommand"]
+
+    assert orphan_findings
+    assert all(finding["level"] == "error" for finding in orphan_findings)
+    assert all(report["ids"][i] == point.id
+               for finding in orphan_findings for i in finding.get("rows", []))
+
+
 def test_real_world_sample_pc_before_st_reaches_the_project_report():
     from pathlib import Path
 
@@ -324,8 +362,9 @@ def test_real_world_sample_pc_before_st_reaches_the_project_report():
     point = project.add_point(easting, northing, elevation, number=row[FB.PTNUM], desc=row[FB.DESC],
                               attrs={"fieldwork_oid": row[FB.OID]})
 
-    report = FB.check_project(project, f2f=build_f2f_set_from_fieldbook(book),
-                              fieldbook_path=str(book))
+    code_set = build_f2f_set_from_fieldbook(book)
+    assert "eg" in code_set, "the real sample Field Book defines EG"
+    report = FB.check_project(project, f2f=code_set, fieldbook_path=str(book))
     order_findings = [finding for finding in report["findings"]
                       if finding.get("flag") == "LineOrderError"]
 
@@ -348,7 +387,7 @@ def test_project_check_keeps_line_order_visible_for_a_code_unknown_to_the_active
         encoding="utf-8",
     )
     project = Project("Unknown line code")
-    point = project.add_point(0, 0, 0, number="17", desc="EG PC ST")
+    point = project.add_point(0, 0, 0, number="17", desc="ZZ PC ST")
 
     report = check_project(project, f2f={"toc"}, fieldbook_path=str(book))
     finding = next(finding for finding in report["findings"]
@@ -357,7 +396,7 @@ def test_project_check_keeps_line_order_visible_for_a_code_unknown_to_the_active
     assert finding["flag"] == "LineOrderError"
     assert finding["level"] == "error"
     assert [report["ids"][i] for i in finding["rows"]] == [point.id]
-    # The whole-line detector has no recognized EG string to group, so the row-level
+    # The whole-line detector has no recognized ZZ string to group, so the row-level
     # semantic order check is what carries this issue into the project review.
     assert report["line_issues"] == []
 
@@ -370,15 +409,52 @@ def test_curve_start_before_line_start_is_flagged_when_feature_code_is_unknown()
         row = ["17", "17", "0", "0", "0", description, "", "crew.csv"]
         return _validate_line_command_order([row], {"toc"}, commands=command_map())
 
-    # EG is intentionally absent from this active-book code set; PC before ST is still an error.
-    flags = line_order_flags("EG PC ST")
+    # ZZ is intentionally absent from this active-book code set; PC before ST is still an error.
+    flags = line_order_flags("ZZ PC ST")
     assert "LineOrderError" in flags["17"]
 
     # A trailing note is outside the code portion and must not suppress the finding, while
     # command-looking text after the description separator is not part of line ordering.
-    assert "LineOrderError" in line_order_flags("EG PC ST / note")["17"]
-    assert "LineOrderError" not in line_order_flags("EG / note PC ST").get("17", [])
-    assert "LineOrderError" not in line_order_flags("EG ST PC").get("17", [])
+    assert "LineOrderError" in line_order_flags("ZZ PC ST / note")["17"]
+    assert "LineOrderError" not in line_order_flags("ZZ / note PC ST").get("17", [])
+    assert "LineOrderError" not in line_order_flags("ZZ ST PC").get("17", [])
+
+
+def test_point_order_checks_combined_line_commands_per_code_and_allows_repeated_curves():
+    from plumbline.core.fieldbook_syntax import command_map
+    from plumbline.fieldwork.parse import _validate_line_command_order
+
+    def has_order_error(description, codes=F2F):
+        row = ["17", "17", "0", "0", "0", description, "", "crew.csv"]
+        flags = _validate_line_command_order([row], codes, commands=command_map())
+        return "LineOrderError" in flags.get("17", [])
+
+    # The code text is only used to associate commands with their own section; validate
+    # the semantic command sequence, including both start and termination relationships.
+    for description in (
+        "TOC PC ST",             # Start Curve before Start Line
+        "TOC PT ST",             # End Curve before Start Line
+        "TOC ST PC END",         # End Line while a curve is open
+        "TOC ST PC X PT",        # Close before End Curve
+        "TOC END PT",            # End Curve after End Line
+        "TOC X PT",              # End Curve after Close
+        "TOC ST PC PC PT END",   # repeated Start Curve before End Curve
+        "TOC ST PC ZZ PC ST",    # known and unknown code sections in one description
+        "TOC ST END PT",         # End Curve after the line has ended
+    ):
+        assert has_order_error(description), description
+
+    # Curves can be paired repeatedly, and a point may carry a continuation from the
+    # preceding point. Repeated code names in separate multicode groups stay independent.
+    for description in (
+        "TOC ST PC PT PC PT END",
+        "TOC PC PT PC PT END",
+        "TOC PT PC PT END",
+        "TOC ST PC PT PC PT END - EC ST PC PT END",
+        "TOC ST PC PT PC PT END - TOC ST PC PT END",
+        "ZZ PC PT PC PT END",
+    ):
+        assert not has_order_error(description), description
 
 
 def test_the_dock_reports_the_line_issues_and_they_select_the_points(win, app):
@@ -441,7 +517,7 @@ def test_fix_points_workbench_surfaces_blank_descriptions_with_job_book(win, app
         dialog.close()
 
 
-def test_fix_linework_discovers_job_book_and_shows_unknown_code_order(win, app, tmp_path):
+def test_fix_linework_keeps_lineorder_findings_in_fix_points(win, app, tmp_path):
     from plumbline.fieldwork.io_carlson import write_fwb_file
     from plumbline.ui.qa_workspace import FixLineworkDialog
 
@@ -456,21 +532,82 @@ def test_fix_linework_discovers_job_book_and_shows_unknown_code_order(win, app, 
     assert write_fwb_file(
         book,
         ["Code", "Description", "Symbol", "Layer", "Entity Type", "Category"],
-        [["TOC", "Top of curb", "", "ROAD", "Line", "Road"]],
+        [["EG", "Edge of gravel", "", "ROAD", "Line", "Road"],
+         ["EC", "Edge of concrete", "", "ROAD", "Line", "Road"]],
     )
     win._job_root_choice = job_root
-    point = project.add_point(100, 200, 5, number="9002", desc="EG PC ST")
+    project.add_point(100, 200, 5, number="9002", desc="EG PT ST - EC1 END")
 
     dialog = FixLineworkDialog(win.state, win)
     try:
-        assert dialog.code_set == {"toc"}
+        assert dialog.code_set == {"eg", "ec"}
         assert dialog.fieldbook_path == str(book)
-        finding = next(item for item in dialog.active_findings
-                       if item.get("check") == "Line command out of order")
-        assert finding["level"] == "error"
-        assert finding["pids"] == [point.id]
+        assert not any(item.get("flag") == "LineOrderError" for item in dialog.active_findings)
+        assert not dialog._filter_finding({"check": "Line command out of order"})
+        assert not dialog._filter_finding({"check": "line: line order"})
+        assert "Line Order" not in {row["check_key"] for row in dialog._report_check_rows()}
+        # Other sequence-completeness checks remain in Fix Linework.
+        assert any(item.get("check") == "line: missing st" for item in dialog.active_findings)
+    finally:
+        dialog.close()
+
+
+def test_fix_points_owns_valid_multicode_lineorder_findings(win, app, tmp_path):
+    from plumbline.fieldwork.io_carlson import write_fwb_file
+    from plumbline.ui.qa_workspace import FixPointErrorsDialog
+
+    project = win.state.project
+    for point in list(project.points.values()):
+        del project.points[point.id]
+    project.settings.pop("fieldbook_file", None)
+    project.settings.pop("f2f_path", None)
+    job_root = tmp_path / "order-job"
+    book = job_root / "Field Book" / "Order Job.fwb"
+    book.parent.mkdir(parents=True)
+    assert write_fwb_file(
+        book,
+        ["Code", "Description", "Symbol", "Layer", "Entity Type", "Category"],
+        [["EG", "Edge of gravel", "", "ROAD", "Line", "Road"],
+         ["EC", "Edge of concrete", "", "ROAD", "Line", "Road"]],
+    )
+    win._job_root_choice = job_root
+    multicode_order = project.add_point(100, 200, 5, number="9003",
+                                        desc="EG PT ST - EC1 END")
+    curve_before_line = project.add_point(101, 201, 5, number="9004", desc="EG PC ST")
+    valid_curves = project.add_point(102, 202, 5, number="9005",
+                                     desc="EC ST PC PT PC PT END")
+
+    dialog = FixPointErrorsDialog(win.state, win)
+    try:
+        assert dialog.code_set == {"eg", "ec"}
+        assert dialog.fieldbook_path == str(book)
+        assert not any(str(item.get("flag", "")).casefold().startswith("unknowncode")
+                       for item in dialog.active_findings)
+        point_finding = next(item for item in dialog.active_findings
+                             if item.get("check") == "Line command out of order")
+        sequence_finding = next(item for item in dialog.active_findings
+                                if item.get("check") == "line: line order")
+        assert point_finding["flag"] == sequence_finding["flag"] == "LineOrderError"
+        assert point_finding["level"] == sequence_finding["level"] == "error"
+        expected_order_points = [multicode_order.id, curve_before_line.id]
+        assert point_finding["pids"] == sequence_finding["pids"] == expected_order_points
+        assert valid_curves.id not in point_finding["pids"]
+        assert dialog._filter_finding(point_finding)
+        assert dialog._filter_finding(sequence_finding)
+        # The stable flag is preferred, but report-compatibility findings without it must
+        # still be routed here instead of being dropped by the generic "line" filter.
+        flagless_order = {"check": "Line command out of order", "level": "error", "rows": [0]}
+        assert dialog._filter_finding(flagless_order)
+        assert dialog._filter_finding({"check": "line: line order"})
+        original_result = dialog.result
+        dialog.result = {**original_result, "findings": [flagless_order]}
+        fallback_check = next(row for row in dialog._report_check_rows()
+                              if row["check_key"] == "LineOrderError")
+        assert fallback_check["status"] == "FINDINGS"
+        assert fallback_check["pids"] == [multicode_order.id]
+        dialog.result = original_result
         check = next(row for row in dialog._report_check_rows()
-                     if row["check_key"] == "Line Order")
+                     if row["check_key"] == "LineOrderError")
         assert check["status"] == "FINDINGS"
     finally:
         dialog.close()

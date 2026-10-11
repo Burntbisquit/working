@@ -979,9 +979,9 @@ def check_project(project, f2f=None, fieldbook_path=None, ne_tol: float | None =
     # Blank descriptions are checked even without a code table; describe_flags deliberately
     # leaves non-empty text alone when no vocabulary is available.
     flags = describe_flags(rows, f2f, fieldbook_path=fieldbook_path)
-    # Keep the single-point command-order check in the project-side report as well as the
-    # Fieldwork Manager. The sequence detector below cannot attach PC/ST to a code the active
-    # Field Book does not recognize, but the semantic command tokens still make EG PC ST an error.
+    # Keep single-point command-order findings in the project-side report as well as the
+    # Fieldwork Manager's cross-point sequence findings. The row-level pass checks each code's
+    # command group in a multicode description independently, without mixing groups together.
     if f2f or fieldbook_path:
         try:
             order_flags = P._validate_line_command_order(rows, f2f, fieldbook_path=fieldbook_path)
@@ -1053,7 +1053,7 @@ def check_project(project, f2f=None, fieldbook_path=None, ne_tol: float | None =
         for name, rec in flag_rows:
             title = FLAG_TITLES.get(name, name)
             lvl = "error" if name in {
-                "UnknownCode", "SeparatorSpacingError", "LineOrderError"
+                "UnknownCode", "OrphanCommand", "SeparatorSpacingError", "LineOrderError"
             } else "warn"
             out["findings"].append({
                 "level": lvl, "check": title, "flag": name, "rows": sorted(rec["rows"]),
