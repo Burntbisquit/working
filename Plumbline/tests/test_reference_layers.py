@@ -369,7 +369,7 @@ def test_reference_folder_dialog_lists_and_filters_csvs(tmp_path, qapp):
 
 
 
-def test_field_data_import_is_staged_and_same_size_files_are_greyed(tmp_path, qapp):
+def test_field_data_import_is_staged_and_same_folder_file_point_count_is_greyed(tmp_path, qapp):
     from PySide6.QtCore import Qt
     from plumbline.ui.app_state import AppState
     from plumbline.ui.import_export import Importer, ReferenceFolderDialog
@@ -394,9 +394,17 @@ def test_field_data_import_is_staged_and_same_size_files_are_greyed(tmp_path, qa
     stored = job_root / "Field Data" / source.name
     assert tally["points"] == 1 and stored.is_file()
     assert state.project.settings["data_folder"] == str(job_root / "Field Data")
-    assert state.project.settings["field_data_imports"][0]["size"] == source.stat().st_size
+    manifest = state.project.settings["field_data_imports"][0]
+    assert manifest["source_folder"] == "crew 1"
+    assert manifest["source_file"] == "crew1.csv"
+    assert manifest["point_count"] == 1
+    assert "size" not in manifest
 
     dlg = ReferenceFolderDialog(state, source_root, None, field_data_only=True)
+    assert [dlg.chk_table.horizontalHeaderItem(i).text() for i in range(4)] == [
+        "", "File", "Subfolder / Path", "Points",
+    ]
+    assert dlg._file_point_counts == [1]
     assert dlg._imported_flags == [True]
     assert dlg._checkboxes[0].isEnabled() is False
     assert dlg.chk_table.cellWidget(0, 0).isEnabled() is False
@@ -413,8 +421,14 @@ def test_field_data_import_is_staged_and_same_size_files_are_greyed(tmp_path, qa
         state, job_root / "Field Data", None, field_data_only=True)
     assert stored_dlg._imported_flags == [True]
 
-    source.write_bytes(source.read_bytes() + b"\n")
+    # Same path, but the recheck now parses two points instead of the one originally imported.
+    source.write_text(
+        "PT,NORTHING,EASTING,ELEVATION,DESCRIPTION\n"
+        f"7,{BASE_N + 7},{BASE_E + 7},507.0,EP\n"
+        f"8,{BASE_N + 8},{BASE_E + 8},508.0,EP\n",
+        encoding="utf-8")
     dlg._refresh_files()
+    assert dlg._file_point_counts == [2]
     assert dlg._imported_flags == [False]
     assert dlg._checkboxes[0].isEnabled() is True
     assert dlg.selected_files() == [source]
@@ -423,6 +437,74 @@ def test_field_data_import_is_staged_and_same_size_files_are_greyed(tmp_path, qa
     assert state.undo().startswith("Import points")
     assert not state.project.points
     assert state.project.settings.get("field_data_imports", []) == []
+
+
+def test_legacy_field_data_manifest_rechecks_the_stored_file_point_count(tmp_path, qapp):
+    from plumbline.ui.app_state import AppState
+    from plumbline.ui.import_export import ReferenceFolderDialog
+
+    source_root = tmp_path / "Downloads" / "Crew 1"
+    source_root.mkdir(parents=True)
+    source = _csv(source_root / "crew1.csv", [(7, BASE_N + 7, BASE_E + 7, 507.0, "EP")])
+    job_root = tmp_path / "Job"
+    stored_root = job_root / "Field Data"
+    stored_root.mkdir(parents=True)
+    stored = _csv(stored_root / source.name, [(7, BASE_N + 7, BASE_E + 7, 507.0, "EP")])
+
+    state = AppState(_project())
+    state.project.path = str(job_root / "Job.plb")
+    state.project.settings["data_folder"] = str(stored_root)
+    state.project.settings["field_data_imports"] = [{
+        "source_relative": "crew 1/crew1.csv",
+        "stored_relative": "field data/crew1.csv",
+        "size": source.stat().st_size,
+    }]
+
+    dlg = ReferenceFolderDialog(state, source_root, None, field_data_only=True)
+    assert dlg._file_point_counts == [1]
+    assert dlg._imported_flags == [True]
+
+    source.write_text(
+        "PT,NORTHING,EASTING,ELEVATION,DESCRIPTION\n"
+        f"7,{BASE_N + 7},{BASE_E + 7},507.0,EP\n"
+        f"8,{BASE_N + 8},{BASE_E + 8},508.0,EP\n",
+        encoding="utf-8")
+    dlg._refresh_files()
+    assert dlg._file_point_counts == [2]
+    assert dlg._imported_flags == [False]
+
+
+def test_field_data_recheck_does_not_guess_parsed_count_from_point_provenance(tmp_path, qapp):
+    from plumbline.ui.app_state import AppState
+    from plumbline.ui.import_export import ReferenceFolderDialog
+
+    source_root = tmp_path / "Downloads" / "Crew 2"
+    source_root.mkdir(parents=True)
+    source = _csv(source_root / "legacy.csv", [(11, BASE_N + 11, BASE_E + 11, 511.0, "EP")])
+    state = AppState(_project())
+    point = state.project.add_point(BASE_E + 11, BASE_N + 11, 511.0,
+                                    number="11", desc="EP")
+    point.attrs["import"] = {
+        "file": source.name,
+        "folder": str(source_root),
+        "set": "points",
+        "when": "2026-10-10T12:00:00",
+    }
+
+    # Provenance identifies the source path, but cannot prove the original parsed count once
+    # there is no manifest/staged copy. Do not grey a file by guessing from points still present.
+    dlg = ReferenceFolderDialog(state, source_root, None, field_data_only=True)
+    assert dlg._file_point_counts == [1]
+    assert dlg._imported_flags == [False]
+
+    source.write_text(
+        "PT,NORTHING,EASTING,ELEVATION,DESCRIPTION\n"
+        f"11,{BASE_N + 11},{BASE_E + 11},511.0,EP\n"
+        f"12,{BASE_N + 12},{BASE_E + 12},512.0,EP\n",
+        encoding="utf-8")
+    dlg._refresh_files()
+    assert dlg._file_point_counts == [2]
+    assert dlg._imported_flags == [False]
 
 
 def test_first_field_data_import_resolves_job_root_after_save_as(tmp_path, qapp):
@@ -455,6 +537,8 @@ def test_first_field_data_import_resolves_job_root_after_save_as(tmp_path, qapp)
     stored = job_root / "Field Data" / source.name
     assert tally["points"] == 1 and stored.is_file()
     assert len(state.project.settings["field_data_imports"]) == 1
+    record = state.project.settings["field_data_imports"][0]
+    assert record["point_count"] == 1 and "size" not in record
 
     dlg = ReferenceFolderDialog(state, source_root, None, field_data_only=True)
     assert dlg._imported_flags == [True]

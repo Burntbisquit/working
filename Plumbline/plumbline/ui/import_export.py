@@ -6,7 +6,7 @@ import math
 import shutil
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import numpy as np
 from PySide6.QtCore import Qt
@@ -915,8 +915,8 @@ class Importer:
         """Read selected point files, stage field data inside the package, and import the points.
 
         A source file is copied under the job's standard ``Field Data`` folder before its points
-        are applied.  The relative source/stored paths and byte size are remembered so a later
-        folder scan can disable unchanged files while allowing new or changed-size files.
+        are applied. The source/stored folder and filename plus parsed point count are remembered,
+        so a later folder scan disables only that same identity with the same point count.
         Reference-role imports keep their existing in-place behavior.
         """
         source_root = Path(folder)
@@ -954,7 +954,8 @@ class Importer:
                                              job_root=job_root)
                         if stats.get("points", 0):
                             self._remember_field_data_file(
-                                source_root, source_file, field_root, stored_file)
+                                source_root, source_file, field_root, stored_file,
+                                point_count=len(batch.points))
                 else:
                     job_root = self._job_folder()
                     stats = apply_import(self.state, batch, plan, label, source_file,
@@ -1010,38 +1011,32 @@ class Importer:
         return destination
 
     def _remember_field_data_file(self, source_root: Path, source_file: Path,
-                                  field_root: Path | None, stored_file: Path):
-        """Add one file to the manifest inside its point-import undo transaction."""
+                                  field_root: Path | None, stored_file: Path, *,
+                                  point_count: int):
+        """Record source/stored folder, filename, and original parsed point count."""
         try:
-            if field_root is not None:
-                record = FD.make_import_record(source_root, source_file, field_root, stored_file)
-                data_folder = field_root
-            else:
-                # Keep identity even if this state has no package root yet.  The source-relative
-                # key is enough to suppress a repeat scan of the same selected folder.
-                record = {
-                    "source_relative": FD.relative_file_key(source_root, source_file),
-                    "stored_relative": "",
-                    "size": int(Path(source_file).stat().st_size),
-                }
-                data_folder = source_root
+            record = FD.make_import_record(
+                source_root, source_file, field_root, stored_file, point_count=point_count)
         except OSError as ex:
             self.state.log(f"Could not record field-data file {source_file.name}: {ex}", "warn")
             return
         pr = self.state.project
         records = [r for r in (pr.settings.get("field_data_imports", []) or []) if isinstance(r, dict)]
-        key = (record["source_relative"], record["size"], record["stored_relative"])
+        key = (record["source_folder"], record["source_file"], record["stored_folder"],
+               record["stored_file"], record["point_count"])
         already_recorded = any(
-            (str(old.get("source_relative", "")).casefold(), int(old.get("size", -1)),
-             str(old.get("stored_relative", "")).casefold()) == key
+            (str(old.get("source_folder", "")).casefold(),
+             str(old.get("source_file", "")).casefold(),
+             str(old.get("stored_folder", "")).casefold(),
+             str(old.get("stored_file", "")).casefold(),
+             old.get("point_count")) == key
             for old in records
-            if str(old.get("size", "")).lstrip("-+").isdigit()
         )
         if not already_recorded:
             records.append(record)
         pr.settings["field_data_imports"] = records
         pr.settings["field_data_source_folder"] = str(source_root.expanduser())
-        pr.settings["data_folder"] = str(data_folder)
+        pr.settings["data_folder"] = str(field_root or source_root)
 
     def record_reference_folder(self, folder, role: str | None, tally: dict):
         """Keep lightweight folder history; per-file manifests share their point-import undo."""
@@ -1213,8 +1208,8 @@ class ReferenceFolderDialog(FormDialog):
 
     def __init__(self, state, folder: Path, parent=None, *, field_data_only: bool = False):
         intro = ("Choose the survey files to add to this project's Field Data folder. "
-                 "Previously imported files with the same relative path and size are greyed out; "
-                 "new and changed-size files are selectable." if field_data_only else
+                 "Previously imported files with the same folder, filename, and point count are greyed out; "
+                 "files with a changed point count remain selectable." if field_data_only else
                  "Every point file is imported with the role chosen here. Files that cannot be "
                  "read are left alone and reported - nothing is guessed silently.")
         title = "Import Field Data Folder" if field_data_only else "Import Points from Folder"
@@ -1234,7 +1229,7 @@ class ReferenceFolderDialog(FormDialog):
             self.form.addRow("These points are:", self.cmb_role)
         self.form.addRow("", self.chk_sub)
 
-        self.lbl_manifest = QLabel("Matching-size files already imported are greyed out.")
+        self.lbl_manifest = QLabel("Matching folder, filename, and point count means already imported.")
         self.lbl_manifest.setStyleSheet("color: #777; font-style: italic;")
         self.lbl_manifest.setVisible(self.field_data_only)
         self.form.addRow(self.lbl_manifest)
@@ -1256,7 +1251,7 @@ class ReferenceFolderDialog(FormDialog):
 
         self.chk_table = QTableWidget()
         self.chk_table.setColumnCount(4)
-        self.chk_table.setHorizontalHeaderLabels(["", "File", "Subfolder / Path", "Size"])
+        self.chk_table.setHorizontalHeaderLabels(["", "File", "Subfolder / Path", "Points"])
         self.chk_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.chk_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.chk_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
@@ -1272,6 +1267,7 @@ class ReferenceFolderDialog(FormDialog):
         self.form.addRow(self.lbl_none)
 
         self._file_paths: list[Path] = []
+        self._file_point_counts: list[int | None] = []
         self._checkboxes: list[QCheckBox] = []
         self._imported_flags: list[bool] = []
 
@@ -1290,9 +1286,73 @@ class ReferenceFolderDialog(FormDialog):
     def role(self) -> str | None:
         return self.cmb_role.currentData()
 
+    @staticmethod
+    def _point_count_in_file(file_path: Path) -> int | None:
+        """Count the usable points using the same parser as the actual folder import."""
+        try:
+            sniffed = CSV.sniff(file_path)
+            mapping = CSV.CsvMapping(sniffed.delimiter, 1 if sniffed.has_header else 0,
+                                     list(sniffed.roles))
+            return len(CSV.read_points(file_path, mapping).points)
+        except Exception:
+            return None
+
+    def _legacy_stored_file(self, record: dict) -> Path | None:
+        """Find a pre-point-count manifest's packaged copy so its count can be migrated."""
+        stored_relative = str(record.get("stored_relative") or "").replace("\\", "/")
+        parts = PurePosixPath(stored_relative).parts
+        if len(parts) < 2:
+            return None
+
+        project_path = getattr(self.state.project, "path", None)
+        project_root = Path(project_path).expanduser().parent if project_path else None
+        roots = []
+        data_folder = str((self.state.project.settings or {}).get("data_folder") or "").strip()
+        if data_folder:
+            root = Path(data_folder).expanduser()
+            if not root.is_absolute() and project_root is not None:
+                root = project_root / root
+            roots.append(root)
+        if project_root is not None:
+            roots.append(project_root / "Field Data")
+
+        for root in roots:
+            if root.name.casefold() != parts[0].casefold():
+                continue
+            stored_file = root.joinpath(*parts[1:])
+            if stored_file.is_file():
+                return stored_file
+        return None
+
+    def _records_with_legacy_point_counts(self, records) -> list[dict]:
+        """Recover legacy counts only by parsing their preserved staged original file.
+
+        Point provenance identifies where imported points came from, but the number still in a
+        project is not proof of how many points the original file parsed to (points may have been
+        deleted or edited). If the staged source copy is gone and the manifest has no count, leave
+        that legacy record unmatched rather than guessing.
+        """
+        enriched = []
+        for record in records or ():
+            if not isinstance(record, dict):
+                continue
+            if record.get("point_count") is not None:
+                enriched.append(record)
+                continue
+            original_copy = self._legacy_stored_file(record)
+            count = self._point_count_in_file(original_copy) if original_copy else None
+            if count is None:
+                enriched.append(record)
+            else:
+                migrated = dict(record)
+                migrated["point_count"] = count
+                enriched.append(migrated)
+        return enriched
+
     def _refresh_files(self):
         files = self.files()
         self._file_paths = list(files)
+        self._file_point_counts = []
         self._checkboxes = []
         self._imported_flags = []
         if not files:
@@ -1309,18 +1369,26 @@ class ReferenceFolderDialog(FormDialog):
 
         tracking_field_data = self.field_data_only or self.role() is None
         self.lbl_manifest.setVisible(tracking_field_data)
-        records = self.state.project.settings.get("field_data_imports", []) if tracking_field_data else []
-        imported = [FD.imported_file_matches(records, self.folder, file) for file in files]
+        raw_records = self.state.project.settings.get("field_data_imports", []) if tracking_field_data else []
+        records = self._records_with_legacy_point_counts(raw_records) if tracking_field_data else []
+        point_counts = [self._point_count_in_file(file) for file in files]
+        self._file_point_counts = point_counts
+        imported = []
+        for file, point_count in zip(files, point_counts):
+            has_points = point_count is not None and point_count > 0
+            already_imported = (tracking_field_data and has_points and FD.imported_file_matches(
+                records, self.folder, file, point_count))
+            imported.append(already_imported)
         self.chk_table.setVisible(True)
         self.lbl_none.setVisible(False)
         self.chk_table.setRowCount(len(files))
 
-        for row, (file, already_imported) in enumerate(zip(files, imported)):
+        for row, (file, already_imported, point_count) in enumerate(zip(files, imported, point_counts)):
             chk = QCheckBox()
             chk.setChecked(not already_imported)
             chk.setEnabled(not already_imported)
             if already_imported:
-                chk.setToolTip("Already imported: matching relative path and file size")
+                chk.setToolTip("Already imported: matching folder, filename, and point count")
             chk.toggled.connect(self._update_count)
             self._checkboxes.append(chk)
             self._imported_flags.append(already_imported)
@@ -1338,15 +1406,14 @@ class ReferenceFolderDialog(FormDialog):
                     rel = "(root)"
             except Exception:
                 rel = str(file.parent)
-            size = file.stat().st_size if file.exists() else 0
-            size_text = f"{size:,} B" if size < 1024 else f"{size / 1024:.1f} KB"
-            items = (QTableWidgetItem(file.name), QTableWidgetItem(rel), QTableWidgetItem(size_text))
+            points_text = f"{point_count:,}" if point_count is not None else "—"
+            items = (QTableWidgetItem(file.name), QTableWidgetItem(rel), QTableWidgetItem(points_text))
             items[2].setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             for column, item in enumerate(items, start=1):
                 if already_imported:
                     item.setForeground(QColor(theme.colors()["dim"]))
                     item.setBackground(QColor(theme.colors()["alt"]))
-                    item.setToolTip("Already imported: matching relative path and file size")
+                    item.setToolTip("Already imported: matching folder, filename, and point count")
                     disabled_flags = (Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
                                       | Qt.ItemFlag.ItemIsEditable)
                     item.setFlags(item.flags() & ~disabled_flags)
@@ -1354,7 +1421,7 @@ class ReferenceFolderDialog(FormDialog):
 
         available = sum(1 for chk in self._checkboxes if chk.isEnabled())
         if self.field_data_only and available == 0:
-            self.lbl_none.setText("All matching-size point files have already been imported.")
+            self.lbl_none.setText("All matching folder/file and point-count combinations have already been imported.")
             self.lbl_none.setVisible(True)
         else:
             self.lbl_none.setVisible(False)
@@ -1409,7 +1476,7 @@ class ReferenceFolderDialog(FormDialog):
             return "There are no point files in this folder."
         if not self.selected_files():
             if self.field_data_only and self._file_paths and all(self._imported_flags):
-                return "All matching-size files have already been imported."
+                return "All matching folder/file and point-count combinations have already been imported."
             return "Please select at least one file to import."
         return None
 
