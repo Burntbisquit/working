@@ -157,6 +157,24 @@ def test_declining_default_imagery_does_not_skip_fix_point_errors_offer(win, aut
     assert not project.imagery, "the test message-box handler declines both offers"
 
 
+def test_accepting_imagery_defers_fix_point_errors_offer_until_canvas_refresh(win, monkeypatch):
+    project = win.state.project
+    project.imagery.clear()
+    assert not project.crs.is_local
+
+    events = []
+    monkeypatch.setattr(win, "_offer_default_esri_imagery",
+                        lambda: events.append("imagery") or True)
+    monkeypatch.setattr(win, "_offer_fix_point_errors_after_imagery",
+                        lambda: events.append("wait for canvas refresh"))
+    monkeypatch.setattr(win, "_offer_fix_point_errors",
+                        lambda: events.append("show immediately"))
+
+    win._complete_import_onboarding()
+
+    assert events == ["imagery", "wait for canvas refresh"]
+
+
 def test_accepting_default_imagery_adds_the_shipped_esri_tile_source(win, monkeypatch):
     from PySide6.QtWidgets import QMessageBox
 

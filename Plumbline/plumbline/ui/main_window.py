@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import os
 import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -1183,12 +1184,19 @@ class MainWindow(QMainWindow):
             self._ensure_project_crs()
 
         survey_points = REF.survey_points(pr)
+        imagery_added = False
+        has_visible_imagery = any(layer.visible for layer in pr.imagery.values())
         if survey_points and not pr.crs.is_local and not pr.imagery:
-            self._offer_default_esri_imagery()
+            imagery_added = self._offer_default_esri_imagery()
         # This offer is deliberately independent of the imagery answer: declining imagery must
-        # never skip the Fix Point Errors review.
+        # never skip the Fix Point Errors review. If imagery was just added or was already visible,
+        # let the canvas paint its refreshed frame and give visible tile requests a short, bounded
+        # chance to settle.
         if survey_points:
-            self._offer_fix_point_errors()
+            if imagery_added or has_visible_imagery:
+                self._offer_fix_point_errors_after_imagery()
+            else:
+                self._offer_fix_point_errors()
 
     def _offer_default_esri_imagery(self) -> bool:
         """Offer the shipped Esri World Imagery layer after field data has a project CRS."""
@@ -1229,6 +1237,49 @@ class MainWindow(QMainWindow):
             return False
         self.open_fix_point_errors()
         return True
+
+    def _offer_fix_point_errors_after_imagery(self) -> None:
+        """Defer the post-import prompt until the refreshed imagery has had a chance to draw."""
+        canvas = getattr(self, "canvas", None)
+        if canvas is None:
+            QTimer.singleShot(0, self._offer_fix_point_errors)
+            return
+
+        # Force the invalidated canvas through a paint now so visible tile requests start before
+        # the prompt. Wait for those requests to settle, but cap the delay for offline/slow tiles.
+        if canvas.isVisible():
+            canvas.repaint()
+        started = time.monotonic()
+        no_tiles_deadline = started + 0.45
+        max_deadline = started + 2.5
+        imagery = getattr(canvas, "imagery", None)
+        saw_pending = bool(getattr(imagery, "pending", 0))
+        settled_at = None
+
+        def wait_for_refresh():
+            nonlocal saw_pending, settled_at
+            now = time.monotonic()
+            tile_manager = getattr(canvas, "imagery", None)
+            pending = int(getattr(tile_manager, "pending", 0) or 0)
+            if pending:
+                saw_pending = True
+                settled_at = None
+            elif saw_pending:
+                if settled_at is None:
+                    settled_at = now
+                elif now - settled_at >= 0.2:
+                    self._offer_fix_point_errors()
+                    return
+            elif now >= no_tiles_deadline:
+                self._offer_fix_point_errors()
+                return
+
+            if now >= max_deadline:
+                self._offer_fix_point_errors()
+                return
+            QTimer.singleShot(75, wait_for_refresh)
+
+        QTimer.singleShot(75, wait_for_refresh)
 
     def _ask_field_data_route(self, route: str) -> int:
         """Initial-project onboarding: offer a field-data folder scan/import."""
