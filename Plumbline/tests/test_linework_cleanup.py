@@ -327,10 +327,9 @@ def test_line_order_findings_are_errors_not_warnings():
     report = check_project(project, f2f=F2F)
     line_order_findings = [finding for finding in report["findings"]
                            if finding.get("flag") == "LineOrderError"]
-    assert line_order_findings
-    assert all(finding["level"] == "error" for finding in line_order_findings)
-    assert any(finding.get("check") == "line: line order" for finding in line_order_findings)
-    assert any(finding.get("check") == "Line command order" for finding in line_order_findings)
+    assert len(line_order_findings) == 1
+    assert line_order_findings[0]["level"] == "error"
+    assert line_order_findings[0].get("check") == "Line command order"
 
     repeated_curve_project = Project("Repeated curve start")
     for i, desc in enumerate(("TOC ST", "TOC PC", "TOC PC", "TOC PT", "TOC END")):
@@ -687,20 +686,16 @@ def test_fix_points_owns_valid_multicode_lineorder_findings(win, app, tmp_path):
                        for item in dialog.active_findings)
         point_finding = next(item for item in dialog.active_findings
                              if item.get("check") == "Line command order")
-        sequence_finding = next(item for item in dialog.active_findings
-                                if item.get("check") == "line: line order")
-        assert point_finding["flag"] == sequence_finding["flag"] == "LineOrderError"
-        assert point_finding["level"] == sequence_finding["level"] == "error"
+        assert point_finding["flag"] == "LineOrderError"
+        assert point_finding["level"] == "error"
         displayed_names = [dialog.tbl_active.item(row, 2).text()
                            for row in range(dialog.tbl_active.rowCount())]
-        assert displayed_names.count("Line command order") >= 2
-        assert "line: line order" not in displayed_names
+        assert displayed_names.count("Line command order") == 1
         expected_order_points = [multicode_order.id, curve_before_line.id]
         assert point_finding["pids"] == expected_order_points
-        assert sequence_finding["pids"] == [multicode_order.id]
         assert valid_curves.id not in point_finding["pids"]
+        assert "Only Start Curve before Start Line" in point_finding["message"]
         assert dialog._filter_finding(point_finding)
-        assert dialog._filter_finding(sequence_finding)
         # The stable flag is preferred, but report-compatibility findings without it must
         # still be routed here instead of being dropped by the generic "line" filter.
         flagless_order = {"check": "Line command order", "level": "error", "rows": [0]}
@@ -717,6 +712,25 @@ def test_fix_points_owns_valid_multicode_lineorder_findings(win, app, tmp_path):
         check = next(row for row in dialog._report_check_rows()
                      if row["check_key"] == "LineOrderError")
         assert check["status"] == "FINDINGS"
+        assert check["finding_count"] == check["point_count"] == len(expected_order_points)
+        assert check["pids"] == expected_order_points
+
+        # Cached/compatibility paths may still hand the report both detector rows. An overlap
+        # must be counted once and list the same distinct points as the editor.
+        point_rows = {pid: row for row, pid in enumerate(original_result["ids"])}
+        dialog.result = {
+            **original_result,
+            "findings": [
+                {"check": "Line command order", "flag": "LineOrderError",
+                 "rows": [point_rows[pid] for pid in expected_order_points]},
+                {"check": "line: line order", "flag": "LineOrderError",
+                 "rows": [point_rows[expected_order_points[0]]]},
+            ],
+        }
+        overlap_check = next(row for row in dialog._report_check_rows()
+                             if row["check_key"] == "LineOrderError")
+        assert overlap_check["finding_count"] == overlap_check["point_count"] == 2
+        assert overlap_check["pids"] == expected_order_points
     finally:
         dialog.close()
 

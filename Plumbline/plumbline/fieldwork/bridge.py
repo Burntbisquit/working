@@ -1168,9 +1168,10 @@ def check_project(project, f2f=None, fieldbook_path=None, ne_tol: float | None =
     # Blank descriptions are checked even without a code table; describe_flags deliberately
     # leaves non-empty text alone when no vocabulary is available.
     flags = describe_flags(rows, f2f, fieldbook_path=fieldbook_path)
-    # The point-error run keeps both the existing single-point and cross-point command-order
-    # findings. The row-level pass checks each code's command group in a multicode description
-    # independently, without mixing groups together. Other line-sequence checks run separately.
+    # The point-error run checks command order within each description and across the line's
+    # same-code point sequence. Those two detector passes are combined into one visible finding
+    # below; row-level multicode groups are still checked independently without mixing codes.
+    # Other line-sequence checks run separately.
     if f2f or fieldbook_path:
         try:
             order_flags = P._validate_line_command_order(rows, f2f, fieldbook_path=fieldbook_path)
@@ -1292,12 +1293,29 @@ def check_project(project, f2f=None, fieldbook_path=None, ne_tol: float | None =
                 if len(samples) < 2:
                     samples.append(str(issue.get("detail", "")))
             if order_rows:
-                out["findings"].append({
-                    "level": "error", "check": "line: line order",
-                    "flag": LC.ISSUE_FLAGS["Line Order"], "rows": sorted(order_rows),
-                    "message": f"{len(order_rows)} field point(s) in line(s) with line order - "
-                               + " ".join(samples[:1]) + ".",
-                })
+                line_order_flag = LC.ISSUE_FLAGS["Line Order"]
+                point_finding = next((finding for finding in out["findings"]
+                                      if str(finding.get("flag", "")) == line_order_flag), None)
+                merged_rows = set(order_rows)
+                if point_finding is not None:
+                    merged_rows.update(point_finding.get("rows", []) or [])
+                message = (
+                    f"{len(merged_rows)} point(s) have line commands out of order. "
+                    "Only Start Curve before Start Line, End Line before End Curve, or "
+                    "Close before End Curve are flagged.")
+                if samples:
+                    message += f" Example: {samples[0]}"
+                if point_finding is not None:
+                    point_finding["rows"] = sorted(merged_rows)
+                    point_finding["message"] = message
+                    point_finding["sequence_details"] = list(dict.fromkeys(samples))
+                else:
+                    out["findings"].append({
+                        "level": "error", "check": "Line command order",
+                        "flag": line_order_flag, "rows": sorted(merged_rows),
+                        "message": message,
+                        "sequence_details": list(dict.fromkeys(samples)),
+                    })
     if not out["findings"]:
         out["findings"].append({"level": "info", "check": "ok", "rows": [],
                                 "message": "No problems found in the field data."})

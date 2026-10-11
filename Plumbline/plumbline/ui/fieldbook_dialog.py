@@ -68,16 +68,37 @@ class FieldBookReportDialog(QDialog):
         QApplication.clipboard().setText(self.text_view.toPlainText())
         QMessageBox.information(self, "Field Book Report", "Report copied to clipboard.")
 
+    def _default_report_path(self) -> str:
+        """Start beside the selected Field Book, using its name for the exported report."""
+        if self.fwb_path:
+            return str(Path(self.fwb_path).expanduser().with_suffix(".txt"))
+        project_path = str(getattr(self.project, "path", "") or "").strip()
+        if project_path:
+            source_path = Path(project_path).expanduser()
+            if source_path.suffix:
+                return str(source_path.with_suffix(".txt"))
+        project_name = Path(str(getattr(self.project, "name", "") or "").strip()).name
+        return f"{project_name or 'Field_Book_Report'}.txt"
+
     def _export_report(self):
-        start = str(self.fwb_path or "")
-        path, filt = QFileDialog.getSaveFileName(self, "Export Field Book Report",
-                                                 start,
-                                                 "Text Report (*.txt);;CSV Table (*.csv);;All Files (*)")
+        path, filt = QFileDialog.getSaveFileName(
+            self, "Export Field Book Report", self._default_report_path(),
+            "Text Report (*.txt);;CSV Table (*.csv);;All Files (*)")
         if not path:
             return
+        selected_filter = str(filt or "").casefold()
+        target_extension = ""
+        if "csv" in selected_filter:
+            target_extension = ".csv"
+        elif "text report" in selected_filter:
+            target_extension = ".txt"
+        if target_extension:
+            target_path = Path(path)
+            if target_path.suffix.casefold() != target_extension:
+                path = str(target_path.with_suffix(target_extension))
         codes = self.project.codes
         codes_items = list(codes.items()) if hasattr(codes, "items") else list(getattr(codes, "codes", {}).items()) if hasattr(codes, "codes") else ([(c.code, c) for c in codes] if isinstance(codes, (list, tuple)) else [])
-        if path.lower().endswith(".csv") or "CSV" in filt:
+        if path.lower().endswith(".csv") or "csv" in selected_filter:
             with open(path, "w", encoding="utf-8", newline="") as fh:
                 w = csv.writer(fh)
                 w.writerow(["Code", "Description", "Kind", "Layer", "Symbol"])
@@ -376,7 +397,8 @@ class FieldBookDialog(QDialog):
 
         # Allow user to name and place this field book
         job_dir = Path(pr.path).parent if pr.path and Path(pr.path).is_file() else (Path(pr.path) if pr.path else Path("."))
-        default_dest = job_dir / "Field Book" / f"{pr.name or 'New Job'}.fwb"
+        source_stem = Path(path).stem.strip() or pr.name or "New Job"
+        default_dest = job_dir / "Field Book" / f"{source_stem}.fwb"
         dest_path_str, _ = QFileDialog.getSaveFileName(self, "Save Converted Field Book (.fwb)",
                                                        str(default_dest),
                                                        "Field Book (*.fwb);;All Files (*)")

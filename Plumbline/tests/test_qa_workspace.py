@@ -146,10 +146,66 @@ def test_keep_and_ignore_stack_choices_do_not_submit_a_merge_description(win, ap
     assert not result["average_coords"]
 
 
+def test_fix_point_google_maps_button_opens_at_the_current_point(win, app, monkeypatch):
+    from PySide6.QtGui import QDesktopServices
+    from plumbline.core import maps
+    from plumbline.ui.qa_workspace import FixPointErrorsDialog
+
+    project = win.state.project
+    point = project.add_point(123.4, 567.8, 9.0, number="8901", desc="EP")
+    dialog = FixPointErrorsDialog(win.state, win)
+    opened = []
+    map_args = []
+
+    def fake_maps_link(pr, x, y, scale, satellite=True):
+        map_args.append((pr, x, y, scale, satellite))
+        return "https://www.google.com/maps/test", 32.75, -96.60, 17.5
+
+    monkeypatch.setattr(maps, "maps_link_for_view", fake_maps_link)
+    monkeypatch.setattr(
+        QDesktopServices, "openUrl",
+        staticmethod(lambda url: opened.append(url.toString()) or True),
+    )
+    dialog.state.select(points=[point.id])
+
+    assert dialog.btn_google_maps is not None
+    assert dialog.btn_google_maps.text() == "Google Maps"
+    dialog.btn_google_maps.click()
+    assert opened == ["https://www.google.com/maps/test"]
+    assert map_args == [(project, point.x, point.y, dialog.canvas.view.scale, True)]
+    dialog.close()
+
+
+def test_control_comparison_subview_columns_are_resizable(win, app):
+    from PySide6.QtWidgets import QHeaderView
+    from plumbline.ui.qa_workspace import FixPointErrorsDialog
+
+    project = win.state.project
+    point = project.add_point(250.0, 350.0, 20.0, number="8750", desc="EP")
+    dialog = FixPointErrorsDialog(win.state, win)
+    comparison = {
+        "point_id": point.id,
+        "number": point.number,
+        "field": {"northing": point.y, "easting": point.x, "elevation": point.z},
+        "control": {"northing": point.y + 0.5, "easting": point.x, "elevation": point.z},
+        "delta": {"northing": 0.5, "easting": 0.0, "elevation": 0.0},
+    }
+    finding = {
+        "check": "Control point mismatch", "flag": "ControlMismatch", "level": "warn",
+        "pids": [point.id], "control_comparisons": [comparison],
+        "tolerance": 0.01, "units": "US survey feet", "key": "resizable-control-table",
+    }
+    dialog._open_inline_editor(finding)
+    table = dialog.tbl_control_comparison
+    assert all(table.horizontalHeader().sectionResizeMode(column) == QHeaderView.Interactive
+               for column in range(table.columnCount()))
+    dialog.close()
+
+
 def test_blank_stack_cells_are_locked_and_tab_moves_between_action_combos(win, app, monkeypatch):
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
-    from PySide6.QtWidgets import QAbstractItemView
+    from PySide6.QtWidgets import QAbstractItemView, QHeaderView
     from plumbline.fieldwork import bridge as FB
     from plumbline.ui.qa_workspace import ClosePointsResolveDialog, FixPointErrorsDialog
 
@@ -186,6 +242,8 @@ def test_blank_stack_cells_are_locked_and_tab_moves_between_action_combos(win, a
     app.processEvents()
 
     table = dialog.tbl_edit_pts
+    assert all(table.horizontalHeader().sectionResizeMode(column) == QHeaderView.Interactive
+               for column in range(table.columnCount()))
     blank_stack = table.item(1, 0)
     blank_action = table.item(1, 6)
     assert blank_stack is not None and not blank_stack.flags() & Qt.ItemIsSelectable
@@ -208,6 +266,8 @@ def test_blank_stack_cells_are_locked_and_tab_moves_between_action_combos(win, a
     popup = ClosePointsResolveDialog(win.state, [p1, p2], is_duplicate=True, parent=win)
     popup.show()
     app.processEvents()
+    assert all(popup.tbl.horizontalHeader().sectionResizeMode(column) == QHeaderView.Interactive
+               for column in range(popup.tbl.columnCount()))
     assert popup.tbl.editTriggers() == QAbstractItemView.NoEditTriggers
     assert not popup.tbl.item(0, 0).flags() & Qt.ItemIsEditable
     popup.combos[0].setFocus(Qt.OtherFocusReason)
@@ -352,6 +412,10 @@ def test_fix_point_errors_dialog_opens_and_resolves(win, app, auto):
     app.processEvents()
     assert dlg.isMaximized()
     assert not dlg.isFullScreen()
+    assert dlg.view3d.auto_fit_vexag is False
+    assert dlg.view3d.cam.vexag == 1.0
+    assert dlg.sp_vexag.value() == 1.0
+    assert dlg.btn_google_maps is not None
     assert dlg.windowFlags() & Qt.WindowMaximizeButtonHint
     assert dlg.windowFlags() & Qt.WindowMinimizeButtonHint
     assert not any(button.text() in {"Windowed", "Full Screen"}
@@ -611,10 +675,9 @@ def test_potential_code_in_descriptor_corrections_ui(win, app, auto):
     assert 0.15 <= left_ratio <= 0.45
 
     # Verify interactive resizable table headers
-    assert dlg.tbl_active.horizontalHeader().sectionResizeMode(0) == QHeaderView.Interactive
-    assert dlg.tbl_resolved.horizontalHeader().sectionResizeMode(0) == QHeaderView.Interactive
-    assert dlg.tbl_edit_pts.horizontalHeader().sectionResizeMode(0) == QHeaderView.Interactive
-    assert dlg.tbl_edit_resolved.horizontalHeader().sectionResizeMode(0) == QHeaderView.Interactive
+    for table in (dlg.tbl_active, dlg.tbl_resolved, dlg.tbl_edit_pts, dlg.tbl_edit_resolved):
+        assert all(table.horizontalHeader().sectionResizeMode(column) == QHeaderView.Interactive
+                   for column in range(table.columnCount()))
 
     # Locate "Potential code in descriptor" finding
     sep_finding = next((f for f in dlg.active_findings if "potential code" in f.get("check", "").lower() or "misplaced" in str(f.get("flag", "")).lower()), None)
@@ -637,6 +700,8 @@ def test_potential_code_in_descriptor_corrections_ui(win, app, auto):
     # Verify points list has 5 data columns without Edit button in Col 0
     assert dlg.tbl_edit_pts.columnCount() == 5
     assert dlg.tbl_edit_pts.horizontalHeaderItem(0).text() == "Pt #"
+    assert all(dlg.tbl_edit_pts.horizontalHeader().sectionResizeMode(column) == QHeaderView.Interactive
+               for column in range(dlg.tbl_edit_pts.columnCount()))
 
     # Verify corrections table structure
     assert hasattr(dlg, "tbl_corrections")
@@ -645,7 +710,8 @@ def test_potential_code_in_descriptor_corrections_ui(win, app, auto):
     assert dlg.tbl_corrections.horizontalHeaderItem(1).text() == "Original Code"
     assert dlg.tbl_corrections.horizontalHeaderItem(2).text() == "Fixed Code"
     assert dlg.tbl_corrections.horizontalHeaderItem(3).text() == "Action"
-    assert dlg.tbl_corrections.horizontalHeader().sectionResizeMode(0) == QHeaderView.Interactive
+    assert all(dlg.tbl_corrections.horizontalHeader().sectionResizeMode(column) == QHeaderView.Interactive
+               for column in range(dlg.tbl_corrections.columnCount()))
 
     # Verify all dropdowns default to "Skip" and include "Correct (Leave # in Descriptor)"
     assert hasattr(dlg, "sep_corrections") and len(dlg.sep_corrections) >= 2
@@ -1201,7 +1267,7 @@ def test_issue_page_hides_exit_controls_and_deleted_separator_widgets_are_safe(w
 
 # ------------------------------------------------------------------ Fix Unknown Code & Fieldbook Lookup
 def test_fix_unknown_code_fieldbook_lookup_and_validation(win, app, auto, monkeypatch):
-    from PySide6.QtWidgets import QLabel, QMessageBox, QPushButton
+    from PySide6.QtWidgets import QHeaderView, QLabel, QMessageBox, QPushButton
     from plumbline.fieldwork import clean as clean_module
     from plumbline.ui.qa_workspace import FixPointErrorsDialog
 
@@ -1268,6 +1334,8 @@ def test_fix_unknown_code_fieldbook_lookup_and_validation(win, app, auto, monkey
     assert hasattr(dlg, "fb_search")
     assert hasattr(dlg, "fb_category")
     assert hasattr(dlg, "desc_edits") and len(dlg.desc_edits) >= 1
+    assert all(dlg.fb_table.horizontalHeader().sectionResizeMode(column) == QHeaderView.Interactive
+               for column in range(dlg.fb_table.columnCount()))
 
     # Verify category dropdown contains categories
     assert dlg.fb_category.count() >= 2
@@ -1317,7 +1385,17 @@ def test_fix_unknown_code_fieldbook_lookup_and_validation(win, app, auto, monkey
     dlg._save_and_exit()
 
 
+def test_field_book_report_default_uses_the_selected_book_name(tmp_path, win):
+    from plumbline.ui.fieldbook_dialog import FieldBookReportDialog
+
+    selected_book = tmp_path / "Road Survey Book.fwb"
+    report = FieldBookReportDialog(win.state.project, win, fwb_path=str(selected_book))
+    assert report._default_report_path() == str(selected_book.with_suffix(".txt"))
+    report.close()
+
+
 def test_changed_points_report_lists_every_point_in_a_merge_stack(win):
+    from PySide6.QtWidgets import QHeaderView
     from plumbline.fieldwork import bridge as FB
     from plumbline.ui.qa_workspace import FixPointErrorsDialog, QAReportDialog
 
@@ -1361,6 +1439,9 @@ def test_changed_points_report_lists_every_point_in_a_merge_stack(win):
     assert audit[1]["changed_fields"] == ["removed"]
 
     report = QAReportDialog(dialog._report_check_rows(), audit, win)
+    for table in (report.tbl_checks, report.tbl_point_audit):
+        assert all(table.horizontalHeader().sectionResizeMode(column) == QHeaderView.Interactive
+                   for column in range(table.columnCount()))
     assert report.tbl_point_audit.rowCount() == 2
     assert "#95001" in report.tbl_point_audit.item(0, 2).text()
     assert "#95002" in report.tbl_point_audit.item(1, 2).text()
@@ -1434,7 +1515,10 @@ def test_qa_report_includes_zero_checks_persistent_point_audit_and_export(tmp_pa
     assert audit[0]["after"]["description"] == "EP ST"
     assert audit[0]["changed_fields"] == ["description"]
 
-    report = QAReportDialog(dialog._report_check_rows(), audit, win)
+    selected_book = tmp_path / "Selected Field Book.fwb"
+    dialog.fieldbook_path = str(selected_book)
+    report = QAReportDialog(dialog._report_check_rows(), audit, dialog)
+    assert report.default_export_path == str(selected_book.with_suffix(".csv"))
     assert report.tabs.count() == 2
     assert report.tbl_point_audit.rowCount() == 1
     assert "Description: “BADCODE ST” → “EP ST”" in report.tbl_point_audit.item(0, 3).text()

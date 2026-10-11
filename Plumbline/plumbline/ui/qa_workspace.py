@@ -23,10 +23,11 @@ import math
 import re
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Sequence
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, QUrl
+from PySide6.QtGui import QBrush, QColor, QDesktopServices, QFont, QPainter, QPen
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
                                QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
                                QFormLayout, QFrame, QGridLayout, QGroupBox, QMainWindow,
@@ -103,6 +104,13 @@ def _display_item(text, *, data=None, background=None) -> QTableWidgetItem:
     if background is not None:
         item.setBackground(background)
     return item
+
+
+def _set_resizable_columns(table: QTableWidget):
+    """Let users drag every table column instead of pinning any section to its contents."""
+    header = table.horizontalHeader()
+    header.setStretchLastSection(False)
+    header.setSectionResizeMode(QHeaderView.Interactive)
 
 
 def _is_line_order_finding(finding: dict) -> bool:
@@ -353,6 +361,7 @@ class QAReportDialog(QDialog):
         super().__init__(parent)
         self.check_rows = [dict(row) for row in check_rows]
         self.point_audit = [dict(row) for row in point_audit]
+        self.default_export_path = self._default_export_path()
         self.setWindowTitle("QA Report — Checks and Point Audit")
         self.resize(1150, 720)
         layout = QVBoxLayout(self)
@@ -367,6 +376,9 @@ class QAReportDialog(QDialog):
         self.tbl_checks.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tbl_checks.setAlternatingRowColors(True)
         self.tbl_checks.verticalHeader().setVisible(False)
+        _set_resizable_columns(self.tbl_checks)
+        for column, width in enumerate((220, 90, 90, 90, 500)):
+            self.tbl_checks.setColumnWidth(column, width)
         for row, item in enumerate(self.check_rows):
             values = (
                 item.get("check", ""), item.get("status", ""),
@@ -375,11 +387,6 @@ class QAReportDialog(QDialog):
             )
             for col, value in enumerate(values):
                 self.tbl_checks.setItem(row, col, QTableWidgetItem(str(value)))
-        self.tbl_checks.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.tbl_checks.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.tbl_checks.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.tbl_checks.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.tbl_checks.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
         self.tabs.addTab(self.tbl_checks, "Checks")
 
         self.tbl_point_audit = QTableWidget(len(self.point_audit), 7)
@@ -390,6 +397,9 @@ class QAReportDialog(QDialog):
         self.tbl_point_audit.setWordWrap(True)
         self.tbl_point_audit.setAlternatingRowColors(True)
         self.tbl_point_audit.verticalHeader().setVisible(False)
+        _set_resizable_columns(self.tbl_point_audit)
+        for column, width in enumerate((150, 145, 150, 180, 210, 210, 190)):
+            self.tbl_point_audit.setColumnWidth(column, width)
         for row, item in enumerate(self.point_audit):
             before_state = item.get("before")
             after_state = item.get("after")
@@ -407,14 +417,6 @@ class QAReportDialog(QDialog):
                 cell = QTableWidgetItem(str(value))
                 cell.setToolTip(str(value))
                 self.tbl_point_audit.setItem(row, col, cell)
-        audit_header = self.tbl_point_audit.horizontalHeader()
-        audit_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        audit_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        audit_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        audit_header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        audit_header.setSectionResizeMode(4, QHeaderView.Stretch)
-        audit_header.setSectionResizeMode(5, QHeaderView.Stretch)
-        audit_header.setSectionResizeMode(6, QHeaderView.Stretch)
         self.tbl_point_audit.resizeRowsToContents()
         self.tabs.addTab(self.tbl_point_audit, "Changed Points")
         layout.addWidget(self.tabs, 1)
@@ -430,9 +432,32 @@ class QAReportDialog(QDialog):
         buttons.addWidget(btn_close)
         layout.addLayout(buttons)
 
+    def _default_export_path(self) -> str:
+        """Keep QA exports beside the active Field Book and reuse its base filename."""
+        owner = self.parent()
+        state = getattr(owner, "state", None)
+        project = getattr(state, "project", None)
+        settings = getattr(project, "settings", {}) or {}
+        source = getattr(owner, "fieldbook_path", None) or settings.get("fieldbook_file")
+        if source:
+            source_path = Path(source).expanduser()
+            if not source_path.is_absolute():
+                job_root = getattr(owner, "_job_root", None)
+                try:
+                    root = job_root() if callable(job_root) else job_root
+                except Exception:
+                    root = None
+                if root:
+                    source_path = Path(root).expanduser() / source_path
+            return str(source_path.with_suffix(".csv"))
+        project_name = Path(str(getattr(project, "name", "") or "").strip()).name
+        if project_name:
+            return f"{project_name}.csv"
+        return "QA_Report.csv"
+
     def export_csv(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export QA Report", "QA_Report.csv", "CSV Files (*.csv)")
+            self, "Export QA Report", self.default_export_path, "CSV Files (*.csv)")
         if not path:
             return
         try:
@@ -491,21 +516,13 @@ class ClosePointsResolveDialog(QDialog):
         self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tbl.verticalHeader().setVisible(False)
         self.tbl.setAlternatingRowColors(True)
-        hh = self.tbl.horizontalHeader()
-        hh.setSectionResizeMode(QHeaderView.Interactive)
+        _set_resizable_columns(self.tbl)
         self.tbl.setColumnWidth(0, 65)
         self.tbl.setColumnWidth(1, 105)
         self.tbl.setColumnWidth(2, 105)
         self.tbl.setColumnWidth(3, 90)
         self.tbl.setColumnWidth(4, 220)
         self.tbl.setColumnWidth(5, 170)
-        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(4, QHeaderView.Stretch)
-        hh.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        hh.setStretchLastSection(False)
 
         self.combos: list[QComboBox] = []
         for r, p in enumerate(self.points):
@@ -791,6 +808,16 @@ class BaseQAWorkbenchWindow(QMainWindow):
         row1.setSpacing(4)
         row1.addWidget(QLabel("<b>View:</b>"))
 
+        self.btn_google_maps = None
+        if self.enable_flag_navigation:
+            self.btn_google_maps = QToolButton()
+            self.btn_google_maps.setText("Google Maps")
+            self.btn_google_maps.setIcon(icons.icon("pin"))
+            self.btn_google_maps.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+            self.btn_google_maps.setToolTip("Open Google Maps at the current point in satellite view")
+            self.btn_google_maps.clicked.connect(self._open_google_maps_current_point)
+            row1.addWidget(self.btn_google_maps)
+
         self.chk_show_only_err = QCheckBox("Errors Only")
         self.chk_show_only_err.setToolTip("Hides non-error points in both 2D and 3D views")
         self.chk_show_only_err.toggled.connect(self._sync_view_flags)
@@ -871,7 +898,10 @@ class BaseQAWorkbenchWindow(QMainWindow):
 
         # 3D Elevation / Terrain Canvas
         self.scene_provider = SceneProvider(self.state)
-        self.view3d = View3D(self.state, self.scene_provider, parent=self)
+        self.view3d = View3D(
+            self.state, self.scene_provider, parent=self,
+            auto_fit_vexag=not self.enable_flag_navigation,
+        )
         self.view3d.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.split_views.addWidget(self.view3d)
 
@@ -938,14 +968,12 @@ class BaseQAWorkbenchWindow(QMainWindow):
         self.tbl_active.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tbl_active.setAlternatingRowColors(True)
         self.tbl_active.verticalHeader().setVisible(False)
-        hh = self.tbl_active.horizontalHeader()
-        hh.setSectionResizeMode(QHeaderView.Interactive)
+        _set_resizable_columns(self.tbl_active)
         self.tbl_active.setColumnWidth(0, 60)
         self.tbl_active.setColumnWidth(1, 85)
         self.tbl_active.setColumnWidth(2, 180)
         self.tbl_active.setColumnWidth(3, 350)
         self.tbl_active.setColumnWidth(4, 90)
-        hh.setStretchLastSection(True)
         self.tbl_active.itemSelectionChanged.connect(self._on_active_row_selected)
         lay_sum.addWidget(self.tbl_active, 2)
 
@@ -959,13 +987,11 @@ class BaseQAWorkbenchWindow(QMainWindow):
         self.tbl_resolved.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tbl_resolved.setAlternatingRowColors(True)
         self.tbl_resolved.verticalHeader().setVisible(False)
-        hh_r = self.tbl_resolved.horizontalHeader()
-        hh_r.setSectionResizeMode(QHeaderView.Interactive)
+        _set_resizable_columns(self.tbl_resolved)
         self.tbl_resolved.setColumnWidth(0, 75)
         self.tbl_resolved.setColumnWidth(1, 180)
         self.tbl_resolved.setColumnWidth(2, 380)
         self.tbl_resolved.setColumnWidth(3, 90)
-        hh_r.setStretchLastSection(True)
         lay_sum.addWidget(self.tbl_resolved, 1)
 
         self.scroll_summary = QScrollArea()
@@ -1037,8 +1063,7 @@ class BaseQAWorkbenchWindow(QMainWindow):
         self.tbl_edit_pts.setSelectionMode(QAbstractItemView.SingleSelection)
         self.tbl_edit_pts.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tbl_edit_pts.verticalHeader().setVisible(False)
-        hh_e = self.tbl_edit_pts.horizontalHeader()
-        hh_e.setSectionResizeMode(QHeaderView.Interactive)
+        _set_resizable_columns(self.tbl_edit_pts)
         self.tbl_edit_pts.setColumnWidth(0, 120 if self.enable_flag_navigation else 55)
         self.tbl_edit_pts.setColumnWidth(1, 65)
         self.tbl_edit_pts.setColumnWidth(2, 105)
@@ -1047,7 +1072,6 @@ class BaseQAWorkbenchWindow(QMainWindow):
         self.tbl_edit_pts.setColumnWidth(5, 240 if self.enable_flag_navigation else 260)
         if self.enable_flag_navigation:
             self.tbl_edit_pts.setColumnWidth(6, 220)
-        hh_e.setStretchLastSection(True)
         self.tbl_edit_pts.itemSelectionChanged.connect(self._on_edit_point_selected)
         self.tbl_edit_pts.cellDoubleClicked.connect(self._on_edit_pts_double_clicked)
         self.lay_edit.addWidget(self.tbl_edit_pts, 3)
@@ -1069,12 +1093,10 @@ class BaseQAWorkbenchWindow(QMainWindow):
         self.tbl_edit_resolved.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tbl_edit_resolved.setAlternatingRowColors(True)
         self.tbl_edit_resolved.verticalHeader().setVisible(False)
-        hh_er = self.tbl_edit_resolved.horizontalHeader()
-        hh_er.setSectionResizeMode(QHeaderView.Interactive)
+        _set_resizable_columns(self.tbl_edit_resolved)
         self.tbl_edit_resolved.setColumnWidth(0, 180)
         self.tbl_edit_resolved.setColumnWidth(1, 380)
         self.tbl_edit_resolved.setColumnWidth(2, 90)
-        hh_er.setStretchLastSection(True)
         self.tbl_edit_resolved.setMaximumHeight(150)
         self.lay_edit.addWidget(self.tbl_edit_resolved)
         self.lbl_edit_resolved_title.hide()
@@ -1396,6 +1418,12 @@ class BaseQAWorkbenchWindow(QMainWindow):
                 message = item.get("message") or item.get("detail") or ""
                 if message:
                     details.append(str(message))
+
+            if check_key == "LineOrderError":
+                # Point-level and line-sequence detectors can identify the same bad point.
+                # The workflow shows one row per affected point, so its reported finding count
+                # must use the same deduplicated point set as the list.
+                finding_count = len(pids) if pids else (1 if matches else 0)
 
             if matches:
                 status = "FINDINGS"
@@ -1944,12 +1972,9 @@ class BaseQAWorkbenchWindow(QMainWindow):
             self.tbl_edit_pts.setRowCount(0)
             self.tbl_edit_pts.setColumnCount(5)
             self.tbl_edit_pts.setHorizontalHeaderLabels(["Pt #", "Northing", "Easting", "Elevation", "Description"])
-            hh_e = self.tbl_edit_pts.horizontalHeader()
-            hh_e.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-            hh_e.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-            hh_e.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-            hh_e.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-            hh_e.setSectionResizeMode(4, QHeaderView.Stretch)
+            _set_resizable_columns(self.tbl_edit_pts)
+            for column, width in enumerate((65, 105, 105, 90, 300)):
+                self.tbl_edit_pts.setColumnWidth(column, width)
 
             for pid in finding.get("pids", []):
                 p = pr.points.get(pid)
@@ -1968,15 +1993,9 @@ class BaseQAWorkbenchWindow(QMainWindow):
             self.tbl_edit_pts.setColumnCount(7)
             self.tbl_edit_pts.setHorizontalHeaderLabels(
                 ["Stack", "Pt #", "Northing", "Easting", "Elevation", "Description", "Action"])
-            hh_e = self.tbl_edit_pts.horizontalHeader()
-            hh_e.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-            hh_e.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-            hh_e.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-            hh_e.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-            hh_e.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-            hh_e.setSectionResizeMode(5, QHeaderView.Stretch)
-            hh_e.setSectionResizeMode(6, QHeaderView.ResizeToContents)
-            hh_e.setStretchLastSection(False)
+            _set_resizable_columns(self.tbl_edit_pts)
+            for column, width in enumerate((120, 65, 105, 105, 90, 240, 220)):
+                self.tbl_edit_pts.setColumnWidth(column, width)
 
             dark = theme.current() == "dark"
             c_even = QColor(36, 59, 83, 110) if dark else QColor(245, 248, 252)
@@ -2071,11 +2090,9 @@ class BaseQAWorkbenchWindow(QMainWindow):
             self.tbl_edit_pts.setColumnCount(6)
             self.tbl_edit_pts.setHorizontalHeaderLabels(
                 ["Stack", "Pt #", "Northing", "Easting", "Elevation", "Description"])
-            hh_e = self.tbl_edit_pts.horizontalHeader()
-            for column in range(5):
-                hh_e.setSectionResizeMode(column, QHeaderView.ResizeToContents)
-            hh_e.setSectionResizeMode(5, QHeaderView.Stretch)
-            hh_e.setStretchLastSection(True)
+            _set_resizable_columns(self.tbl_edit_pts)
+            for column, width in enumerate((55, 65, 105, 105, 90, 260)):
+                self.tbl_edit_pts.setColumnWidth(column, width)
 
             dark = theme.current() == "dark"
             c_even = QColor(36, 59, 83, 110) if dark else QColor(245, 248, 252)
@@ -2432,6 +2449,88 @@ class BaseQAWorkbenchWindow(QMainWindow):
         self.state.zoom_to_bbox((min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad))
         self.view3d.center_on_point(sum(xs) / len(xs), sum(ys) / len(ys), sum(zs) / len(zs))
         self._sync_view_flags()
+
+    def _current_point_for_google_maps(self) -> SurveyPoint | None:
+        """Resolve the focused table point or current project selection for the Maps action."""
+        project = self.state.project
+
+        def first_point(pids):
+            for pid in pids or ():
+                point = project.points.get(pid)
+                if point is not None:
+                    return point
+            return None
+
+        if self.stack.currentIndex() == 1 and hasattr(self, "tbl_edit_pts"):
+            row = self.tbl_edit_pts.currentRow()
+            if row >= 0:
+                for column in range(self.tbl_edit_pts.columnCount()):
+                    item = self.tbl_edit_pts.item(row, column)
+                    data = item.data(Qt.UserRole) if item is not None else None
+                    if isinstance(data, tuple):
+                        if len(data) >= 3 and isinstance(data[2], int) and data[2] in project.points:
+                            return project.points[data[2]]
+                        if len(data) >= 2 and isinstance(data[1], (list, tuple)):
+                            point = first_point(data[1])
+                            if point is not None:
+                                return point
+                    elif isinstance(data, int) and data in project.points:
+                        return project.points[data]
+
+        selected_ids = set(getattr(self.state, "sel_points", set()))
+        selected_point = first_point(pid for pid in project.points if pid in selected_ids)
+        if selected_point is not None:
+            return selected_point
+
+        if self.stack.currentIndex() == 0 and hasattr(self, "tbl_active"):
+            row = self.tbl_active.currentRow()
+            if 0 <= row < len(self.active_findings):
+                point = first_point(self.active_findings[row].get("pids", []))
+                if point is not None:
+                    return point
+
+        if self.current_edit_finding:
+            point = first_point(self.current_edit_finding.get("pids", []))
+            if point is not None:
+                return point
+        point = first_point(self.current_selected_stack)
+        if point is not None:
+            return point
+        return first_point(pid for pid in project.points if pid in self.error_point_ids)
+
+    def _open_google_maps_current_point(self):
+        """Open Google Maps at the currently focused/selected point, using the plan zoom."""
+        point = self._current_point_for_google_maps()
+        if point is None:
+            QMessageBox.information(
+                self, "Google Maps", "Select or highlight a point in the table or plan view first.")
+            return
+
+        from ..core import maps as map_links
+        from ..core.crs import LocalCRSError
+        try:
+            url, lat, lon, zoom = map_links.maps_link_for_view(
+                self.state.project, point.x, point.y, self.canvas.view.scale, satellite=True)
+        except LocalCRSError:
+            QMessageBox.information(
+                self, "Google Maps",
+                "This project uses a local coordinate system, so the selected point has no real-world location.\n\n"
+                "Assign a coordinate system first (Survey > Project Coordinate System).")
+            return
+        except Exception as ex:
+            QMessageBox.warning(
+                self, "Google Maps", f"Could not turn point #{point.number} into latitude / longitude:\n{ex}")
+            return
+
+        if QDesktopServices.openUrl(QUrl(url)):
+            self.state.log(
+                f"Opened Google Maps at point #{point.number} ({lat:.6f}, {lon:.6f}), "
+                f"zoom {zoom:.1f}: {url}", "ok")
+        else:
+            QApplication.clipboard().setText(url)
+            self.state.log(
+                f"Could not start a web browser. The Google Maps link for point #{point.number} "
+                f"({lat:.6f}, {lon:.6f}) is on the clipboard: {url}", "warn")
 
     def _sync_view_flags(self):
         opts = self.canvas.opts
@@ -2992,6 +3091,7 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
             self.tbl_control_comparison.setEditTriggers(QAbstractItemView.NoEditTriggers)
             self.tbl_control_comparison.verticalHeader().setVisible(False)
             self.tbl_control_comparison.setAlternatingRowColors(True)
+            _set_resizable_columns(self.tbl_control_comparison)
             for row, item in enumerate(comparisons):
                 pid = item.get("point_id")
                 field = item.get("field") or {}
@@ -3065,13 +3165,11 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
             self.tbl_corrections.setSelectionBehavior(QAbstractItemView.SelectRows)
             self.tbl_corrections.verticalHeader().setVisible(False)
             self.tbl_corrections.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed | QAbstractItemView.SelectedClicked)
-            hh_c = self.tbl_corrections.horizontalHeader()
-            hh_c.setSectionResizeMode(QHeaderView.Interactive)
+            _set_resizable_columns(self.tbl_corrections)
             self.tbl_corrections.setColumnWidth(0, 60)
             self.tbl_corrections.setColumnWidth(1, 200)
             self.tbl_corrections.setColumnWidth(2, 240)
             self.tbl_corrections.setColumnWidth(3, 240)
-            hh_c.setStretchLastSection(True)
 
             self.sep_corrections = []
             _updating_from_combo = False
@@ -3392,12 +3490,10 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
             self.fb_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
             self.fb_table.setAlternatingRowColors(True)
             self.fb_table.verticalHeader().setVisible(False)
-            hh_fb = self.fb_table.horizontalHeader()
-            hh_fb.setSectionResizeMode(QHeaderView.Interactive)
+            _set_resizable_columns(self.fb_table)
             self.fb_table.setColumnWidth(0, 80)
             self.fb_table.setColumnWidth(1, 160)
             self.fb_table.setColumnWidth(2, 120)
-            hh_fb.setStretchLastSection(True)
             self.fb_table.cellDoubleClicked.connect(lambda r, c: self._fb_use_code())
             lay_fb.addWidget(self.fb_table, 1)
 

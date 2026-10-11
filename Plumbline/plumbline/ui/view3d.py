@@ -56,9 +56,10 @@ class SceneProvider(QObject):
 class View3D(QWidget):
     camera_changed = Signal()
 
-    def __init__(self, state, provider: SceneProvider, parent=None):
+    def __init__(self, state, provider: SceneProvider, parent=None, *, auto_fit_vexag: bool = True):
         super().__init__(parent)
         self.state, self.provider = state, provider
+        self.auto_fit_vexag = bool(auto_fit_vexag)
         self.cam = S.Camera(np.zeros(3), 30.0, 35.0, 1000.0, 40.0, True, 1.0)
         self.show_surface = self.show_points = self.show_lines = True
         self.show_wire = self.show_numbers = False
@@ -142,12 +143,13 @@ class View3D(QWidget):
 
     # ------------------------------------------------------------------ rendering
     def _first_fit(self):
-        """Frame a newly opened project (once per project) with a readable vertical exaggeration."""
+        """Frame a newly opened project once, optionally choosing readable exaggeration."""
         pid = id(self.state.project)
         sc = self.provider.scene()
         if self._fitted_for != pid and sc.bounds is not None and self.width() > 60:
             self._fitted_for = pid
-            self.cam.vexag = S.auto_vexag(sc.bounds)
+            if self.auto_fit_vexag:
+                self.cam.vexag = S.auto_vexag(sc.bounds)
             self.cam.fit(sc.bounds, self.width(), self.height())
             self.camera_changed.emit()
 
