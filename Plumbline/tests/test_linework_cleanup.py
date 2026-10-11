@@ -329,7 +329,7 @@ def test_line_order_findings_are_errors_not_warnings():
     assert line_order_findings
     assert all(finding["level"] == "error" for finding in line_order_findings)
     assert any(finding.get("check") == "line: line order" for finding in line_order_findings)
-    assert any(finding.get("check") == "Line command out of order" for finding in line_order_findings)
+    assert any(finding.get("check") == "Line command order" for finding in line_order_findings)
 
     repeated_curve_project = Project("Repeated curve start")
     for i, desc in enumerate(("TOC ST", "TOC PC", "TOC PC", "TOC PT", "TOC END")):
@@ -397,7 +397,7 @@ def test_project_check_keeps_line_order_visible_for_a_code_unknown_to_the_active
 
     report = check_project(project, f2f={"toc"}, fieldbook_path=str(book))
     finding = next(finding for finding in report["findings"]
-                   if finding.get("check") == "Line command out of order")
+                   if finding.get("check") == "Line command order")
 
     assert finding["flag"] == "LineOrderError"
     assert finding["level"] == "error"
@@ -583,6 +583,7 @@ def test_fix_linework_keeps_lineorder_findings_in_fix_points(win, app, tmp_path)
         assert dialog.code_set == {"eg", "ec"}
         assert dialog.fieldbook_path == str(book)
         assert not any(item.get("flag") == "LineOrderError" for item in dialog.active_findings)
+        assert not dialog._filter_finding({"check": "Line command order"})
         assert not dialog._filter_finding({"check": "Line command out of order"})
         assert not dialog._filter_finding({"check": "line: line order"})
         assert "Line Order" not in {row["check_key"] for row in dialog._report_check_rows()}
@@ -662,11 +663,15 @@ def test_fix_points_owns_valid_multicode_lineorder_findings(win, app, tmp_path):
         assert not any(str(item.get("flag", "")).casefold().startswith("unknowncode")
                        for item in dialog.active_findings)
         point_finding = next(item for item in dialog.active_findings
-                             if item.get("check") == "Line command out of order")
+                             if item.get("check") == "Line command order")
         sequence_finding = next(item for item in dialog.active_findings
                                 if item.get("check") == "line: line order")
         assert point_finding["flag"] == sequence_finding["flag"] == "LineOrderError"
         assert point_finding["level"] == sequence_finding["level"] == "error"
+        displayed_names = [dialog.tbl_active.item(row, 2).text()
+                           for row in range(dialog.tbl_active.rowCount())]
+        assert displayed_names.count("Line command order") >= 2
+        assert "line: line order" not in displayed_names
         expected_order_points = [multicode_order.id, curve_before_line.id]
         assert point_finding["pids"] == expected_order_points
         assert sequence_finding["pids"] == [multicode_order.id]
@@ -675,8 +680,9 @@ def test_fix_points_owns_valid_multicode_lineorder_findings(win, app, tmp_path):
         assert dialog._filter_finding(sequence_finding)
         # The stable flag is preferred, but report-compatibility findings without it must
         # still be routed here instead of being dropped by the generic "line" filter.
-        flagless_order = {"check": "Line command out of order", "level": "error", "rows": [0]}
+        flagless_order = {"check": "Line command order", "level": "error", "rows": [0]}
         assert dialog._filter_finding(flagless_order)
+        assert dialog._filter_finding({"check": "Line command out of order"})
         assert dialog._filter_finding({"check": "line: line order"})
         original_result = dialog.result
         dialog.result = {**original_result, "findings": [flagless_order]}
@@ -692,7 +698,7 @@ def test_fix_points_owns_valid_multicode_lineorder_findings(win, app, tmp_path):
         dialog.close()
 
 
-def test_line_order_review_dropdowns_default_to_correct_and_support_skip_ignore_undo(win, app, tmp_path):
+def test_line_order_review_uses_common_error_table_and_supports_skip_ignore_undo(win, app, tmp_path):
     from plumbline.core.point_linework_coder import fix_line_command_order
     from plumbline.fieldwork.io_carlson import write_fwb_file
     from plumbline.ui.qa_workspace import FixPointErrorsDialog
@@ -720,40 +726,73 @@ def test_line_order_review_dropdowns_default_to_correct_and_support_skip_ignore_
     dialog = FixPointErrorsDialog(win.state, win)
     try:
         finding = next(item for item in dialog.active_findings
-                       if item.get("check") == "Line command out of order")
+                       if item.get("check") == "Line command order")
         dialog._open_inline_editor(finding)
-        rows_by_pid = {item[0].id: item for item in dialog.line_order_corrections}
+        assert dialog.lbl_edit_title.text() == "<b>Fix Line command order</b>"
+        assert dialog.tbl_corrections.columnCount() == 4
+        assert [dialog.tbl_corrections.horizontalHeaderItem(i).text() for i in range(4)] == [
+            "Pt #", "Original Description", "Corrected Description", "Action",
+        ]
+        rows_by_pid = {item[0].id: item for item in dialog.sep_corrections}
         assert set(rows_by_pid) == {correct_point.id, skip_point.id}
         for point_id, item in rows_by_pid.items():
-            point, editor, action, _original, _suggestion = item
+            point, _original, fixed, action, proposal, _proposal_number = item
             assert action.currentText() == "Correct"
-            assert [action.itemText(i) for i in range(action.count())] == ["Correct", "Skip", "Ignore"]
-            assert editor.text() == fix_line_command_order(point.desc)
+            assert [action.itemText(i) for i in range(action.count())] == ["Skip", "Correct", "Ignore"]
+            assert proposal == fix_line_command_order(point.desc)
+            assert fixed.text() == proposal
         assert dialog._has_unapplied_issue_edits()
 
         # Apply the first proposal while leaving the second point active via Skip.
-        rows_by_pid[skip_point.id][2].setCurrentText("Skip")
+        rows_by_pid[skip_point.id][3].setCurrentText("Skip")
         assert dialog._action_apply_current_issue_changes()
         assert correct_point.desc == fix_line_command_order(original_correct)
         assert skip_point.desc == original_skip
+        assert len(dialog.sep_corrections) == 1
+        assert dialog.sep_corrections[0][0].id == skip_point.id
+        assert dialog.sep_corrections[0][3].currentText() == "Skip"
 
-        # Undo restores the dropdowns selected at Apply time, but never reapplies their proposals.
+        # Undo restores the dropdowns selected at Apply time, but never reapplies proposals.
         dialog._undo_issue()
         assert correct_point.desc == original_correct
         assert skip_point.desc == original_skip
-        restored = {item[0].id: item for item in dialog.line_order_corrections}
-        assert restored[correct_point.id][2].currentText() == "Correct"
-        assert restored[skip_point.id][2].currentText() == "Skip"
-        assert restored[correct_point.id][1].text() == fix_line_command_order(original_correct)
+        restored = {item[0].id: item for item in dialog.sep_corrections}
+        assert restored[correct_point.id][3].currentText() == "Correct"
+        assert restored[skip_point.id][3].currentText() == "Skip"
+        assert restored[correct_point.id][2].text() == fix_line_command_order(original_correct)
 
         # Ignore suppresses only its point; Skip leaves the other point in the active finding.
-        restored[correct_point.id][2].setCurrentText("Skip")
-        restored[skip_point.id][2].setCurrentText("Ignore")
+        restored[correct_point.id][3].setCurrentText("Skip")
+        restored[skip_point.id][3].setCurrentText("Ignore")
         assert dialog._action_apply_current_issue_changes()
         assert correct_point.desc == original_correct
         assert skip_point.desc == original_skip
         assert dialog.current_edit_finding["ignored_pids"] == {skip_point.id}
         assert dialog.current_edit_finding["pids"] == [correct_point.id]
+
+        # Save applies Correct/Ignore and carries a skipped point's selection back to the
+        # issue list so reopening it does not silently reset the row to Correct.
+        save_correct = project.add_point(102, 202, 5, number="9013", desc="EG PC ST")
+        save_skip = project.add_point(103, 203, 5, number="9014", desc="EG PC ST")
+        dialog.run_check()
+        save_finding = next(item for item in dialog.active_findings
+                            if item.get("check") == "Line command order")
+        dialog._open_inline_editor(save_finding)
+        save_rows = {item[0].id: item for item in dialog.sep_corrections}
+        save_rows[correct_point.id][3].setCurrentText("Ignore")
+        save_rows[save_correct.id][3].setCurrentText("Correct")
+        save_rows[save_skip.id][3].setCurrentText("Skip")
+        assert dialog._action_apply_current_issue_changes(return_to_summary=True)
+        assert save_correct.desc == fix_line_command_order("EG PC ST")
+        assert save_skip.desc == "EG PC ST"
+        remaining = next(item for item in dialog.active_findings
+                         if item.get("check") == "Line command order")
+        assert remaining["pids"] == [save_skip.id]
+        assert remaining["separator_drafts"][save_skip.id]["action"] == "Skip"
+        dialog._open_inline_editor(remaining)
+        assert len(dialog.sep_corrections) == 1
+        assert dialog.sep_corrections[0][0].id == save_skip.id
+        assert dialog.sep_corrections[0][3].currentText() == "Skip"
     finally:
         dialog.close()
 

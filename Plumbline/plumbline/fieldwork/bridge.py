@@ -570,7 +570,7 @@ FLAG_TITLES = {
     "OrphanCommand": "Orphan command",
     "MisplacedAfterSeparator": "Potential code in descriptor",
     "SeparatorSpacingError": "Spacing at the separator",
-    "LineOrderError": "Line command out of order",
+    "LineOrderError": "Line command order",
     "ControlMismatch": "Control point mismatch",
 }
 
