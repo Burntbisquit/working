@@ -17,7 +17,7 @@ questions both halves need to ask.
         |
         |  batch_from_rows()                         <- ImportBatch
         v
-    Plumbline project (points, then apply_feature_codes + process_linework)
+    Plumbline project (points; Process Linework is an explicit separate action)
 
 Why the working-row list is the pivot
 -------------------------------------
@@ -748,9 +748,9 @@ def _compare_control_points(project, ids: list[int], tolerance: float, control_f
 def line_issues(project, f2f=None, fieldbook_path=None) -> list[dict]:
     """The incomplete lines in a project's own points - one implementation, both windows.
 
-    The field window's Line Repair tab and this function call the same reader
-    (:mod:`plumbline.fieldwork.linecheck`), so a line that the field window calls unclosed is
-    unclosed here too.  Reference points are left out, as everywhere else.
+    The field window's Line Repair tab, this helper and the drawing window's Fix Linework
+    workbench call the same reader (:mod:`plumbline.fieldwork.linecheck`). Reference points are
+    left out, as everywhere else.
 
     No vocabulary means no answer rather than a wrong one: a line is grouped by its code, so
     without the codes every description reads unknown, no code owns any command, and the check
@@ -959,7 +959,7 @@ def write_report(path, rows) -> bool:
 # edits project.settings, but does not change any input that affects the QA result. A stable content
 # signature is also stored with saved reports so reopening a project can flag an unverified/stale run.
 # Bump this token when check semantics change, so an older stored report is not certified current.
-_CHECK_INPUT_SIGNATURE_VERSION = "fieldwork-check-v1"
+_CHECK_INPUT_SIGNATURE_VERSION = "fieldwork-check-v2"
 _CHECK_PROJECT_CACHE = weakref.WeakKeyDictionary()
 _CHECK_PROJECT_CACHE_LOCK = threading.RLock()
 
@@ -997,20 +997,17 @@ def _crs_signature(project) -> dict | str:
 
 def check_input_signature(project, f2f=None, fieldbook_path=None, ne_tol: float | None = None,
                           elev_tol: float | None = None, control_file=None, *,
-                          _prepared_rows=None) -> str:
-    """Return a deterministic fingerprint of every input used by :func:`check_project`.
+                          _prepared_rows=None, scope: str = "points") -> str:
+    """Fingerprint the inputs used by one independent fieldwork check run.
 
-    It deliberately excludes Project.revision and the stored QA report: writing a report is not a
-    QA input. Point rows retain their project order because it carries line-command sequence, and
-    exact external file content is hashed so same-size edits with preserved timestamps invalidate
-    the result too.
+    ``scope`` separates the point-error and line-error inputs as well as their caches. It excludes
+    Project.revision and the stored QA report: writing a report is not a QA input. Point rows retain
+    their project order because it carries command sequence, and exact external file content is
+    hashed so same-size edits with preserved timestamps invalidate the result too.
     """
+    if scope not in {"points", "linework"}:
+        raise ValueError(f"Unknown fieldwork check scope: {scope!r}")
     rows, ids = _prepared_rows or working_rows_from_project(project)
-    control_path = _control_file_path(project, control_file)
-    control_points = []
-    for point in REF.reference_points(project, "control"):
-        control_points.append((point.id, str(point.number), point.x, point.y, point.z,
-                               str(point.desc or ""), str(point.layer or "")))
     deleted_oids = sorted(
         str((getattr(point, "attrs", None) or {}).get("fieldwork_oid") or pid)
         for pid, point in project.points.items() if _point_is_deleted(point)
@@ -1028,68 +1025,84 @@ def check_input_signature(project, f2f=None, fieldbook_path=None, ne_tol: float 
         "multicode": spacing_preference("space_around_multicode_separator"),
         "description": spacing_preference("space_around_description_separator"),
     }
-    crs = _crs_signature(project)
     payload = {
-        "version": _CHECK_INPUT_SIGNATURE_VERSION,
+        "version": f"{_CHECK_INPUT_SIGNATURE_VERSION}-{scope}",
         "rows": rows,
         "ids": ids,
         "deleted_oids": deleted_oids,
-        "control_points": control_points,
         "fieldbook": _file_content_signature(fieldbook_path),
-        "control_file": _file_content_signature(control_path),
-        "control_tolerance": _control_tolerance(),
-        "near_tolerance": ne_tol or F.NE_TOLERANCE,
-        "elevation_tolerance": elev_tol or F.ELEV_TOLERANCE,
         "f2f_codes": sorted({str(code) for code in (f2f or ())},
                              key=lambda code: (code.casefold(), code)),
         "active_commands": active_commands,
         "command_map": command_map,
         "separator_spacing": separator_spacing,
-        "crs": crs,
     }
+    if scope == "points":
+        control_path = _control_file_path(project, control_file)
+        payload.update({
+            "control_points": [
+                (point.id, str(point.number), point.x, point.y, point.z,
+                 str(point.desc or ""), str(point.layer or ""))
+                for point in REF.reference_points(project, "control")
+            ],
+            "control_file": _file_content_signature(control_path),
+            "control_tolerance": _control_tolerance(),
+            "near_tolerance": F.NE_TOLERANCE if ne_tol is None else ne_tol,
+            "elevation_tolerance": F.ELEV_TOLERANCE if elev_tol is None else elev_tol,
+            "crs": _crs_signature(project),
+        })
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
                          default=str, allow_nan=True).encode("utf-8")
     return hashlib.blake2b(encoded, digest_size=24).hexdigest()
 
 
-def clear_check_cache(project=None) -> None:
-    """Clear cached QA results (all projects, or one project); primarily useful to tests/tools."""
+def clear_check_cache(project=None, *, scope: str | None = None) -> None:
+    """Clear both independent QA caches, optionally for one project or one check scope."""
+    if scope not in (None, "points", "linework"):
+        raise ValueError(f"Unknown fieldwork check scope: {scope!r}")
     with _CHECK_PROJECT_CACHE_LOCK:
         if project is None:
-            _CHECK_PROJECT_CACHE.clear()
-        else:
+            if scope is None:
+                _CHECK_PROJECT_CACHE.clear()
+            else:
+                for entries in _CHECK_PROJECT_CACHE.values():
+                    entries.pop(scope, None)
+        elif scope is None:
             _CHECK_PROJECT_CACHE.pop(project, None)
+        else:
+            entries = _CHECK_PROJECT_CACHE.get(project)
+            if entries is not None:
+                entries.pop(scope, None)
+                if not entries:
+                    _CHECK_PROJECT_CACHE.pop(project, None)
 
 
-def check_project_cached(project, f2f=None, fieldbook_path=None, ne_tol: float | None = None,
-                         elev_tol: float | None = None, control_file=None, *,
-                         force: bool = False) -> tuple[dict, str, str]:
-    """Run or reuse a check; return ``(result, cache_status, input_signature)``.
-
-    Status is ``hit`` when exact inputs match, ``miss`` when the project has no cached run,
-    ``updated`` when changed inputs replaced an earlier result, or ``rerun`` when ``force`` asks
-    for a fresh computation despite a matching signature. The cached raw result is never handed to
-    callers: the QA Workbench decorates findings for display, so each caller gets an isolated copy.
-    """
+def _check_cached(project, *, scope: str, check_function, f2f=None, fieldbook_path=None,
+                  ne_tol: float | None = None, elev_tol: float | None = None,
+                  control_file=None, force: bool = False) -> tuple[dict, str, str]:
     rows, ids = working_rows_from_project(project)
     prepared = (rows, ids)
-    signature = check_input_signature(project, f2f=f2f, fieldbook_path=fieldbook_path,
-                                      ne_tol=ne_tol, elev_tol=elev_tol, control_file=control_file,
-                                      _prepared_rows=prepared)
+    signature = check_input_signature(
+        project, f2f=f2f, fieldbook_path=fieldbook_path, ne_tol=ne_tol,
+        elev_tol=elev_tol, control_file=control_file, _prepared_rows=prepared, scope=scope)
     with _CHECK_PROJECT_CACHE_LOCK:
-        previous = _CHECK_PROJECT_CACHE.get(project)
+        previous = _CHECK_PROJECT_CACHE.get(project, {}).get(scope)
     if previous is not None and previous[0] == signature and not force:
         return copy.deepcopy(previous[1]), "hit", signature
 
-    check_kwargs = {"f2f": f2f, "fieldbook_path": fieldbook_path, "ne_tol": ne_tol}
-    if elev_tol is not None:
-        check_kwargs["elev_tol"] = elev_tol
-    if control_file is not None:
-        check_kwargs["control_file"] = control_file
-    result = check_project(project, **check_kwargs)
+    check_kwargs = {"f2f": f2f, "fieldbook_path": fieldbook_path}
+    if scope == "points":
+        check_kwargs["ne_tol"] = ne_tol
+        if elev_tol is not None:
+            check_kwargs["elev_tol"] = elev_tol
+        if control_file is not None:
+            check_kwargs["control_file"] = control_file
+    check_kwargs["_prepared_rows"] = prepared
+    result = check_function(project, **check_kwargs)
     cached_result = copy.deepcopy(result)
     with _CHECK_PROJECT_CACHE_LOCK:
-        _CHECK_PROJECT_CACHE[project] = (signature, cached_result)
+        entries = _CHECK_PROJECT_CACHE.setdefault(project, {})
+        entries[scope] = (signature, cached_result)
     if previous is None:
         status = "miss"
     elif previous[0] == signature:
@@ -1099,19 +1112,44 @@ def check_project_cached(project, f2f=None, fieldbook_path=None, ne_tol: float |
     return result, status, signature
 
 
-def check_project(project, f2f=None, fieldbook_path=None, ne_tol: float | None = None,
-                  elev_tol: float | None = None, control_file=None) -> dict:
-    """Run the field-data checks over a project's own points, as findings a dock can show.
+def check_project_cached(project, f2f=None, fieldbook_path=None, ne_tol: float | None = None,
+                         elev_tol: float | None = None, control_file=None, *,
+                         force: bool = False) -> tuple[dict, str, str]:
+    """Run or reuse the point-error check, returning ``(result, status, input_signature)``.
 
-    *f2f* is the field book's code set and *fieldbook_path* the file it came from (the parser
-    also reads that job's command set and correction rules out of it). Without a code vocabulary,
-    non-empty code descriptions are not classified as unknown; genuinely blank descriptions still
-    surface, and an available Field Book command set can still validate line-command order.
-
-    Returns {"rows", "ids", "findings", "stats", "flags", "code_checks"}.  Row indices in a
-    finding index into "rows"; ``ids[i]`` is the project point the i-th row came from.
+    Its cache is independent from :func:`check_linework_project_cached`. Status is ``hit`` for
+    exact inputs, ``miss`` for a new project/scope, ``updated`` when inputs changed, or ``rerun``
+    when ``force`` asks for a fresh computation despite a matching signature. Callers receive a
+    deep copy so display decoration cannot mutate the cached raw findings.
     """
-    rows, ids = working_rows_from_project(project)
+    return _check_cached(
+        project, scope="points", check_function=check_project, f2f=f2f,
+        fieldbook_path=fieldbook_path, ne_tol=ne_tol, elev_tol=elev_tol,
+        control_file=control_file, force=force)
+
+
+def check_linework_project_cached(project, f2f=None, fieldbook_path=None, *,
+                                  force: bool = False) -> tuple[dict, str, str]:
+    """Run or reuse the separate line-error check and cache; same status contract as above."""
+    return _check_cached(
+        project, scope="linework", check_function=check_linework_project,
+        f2f=f2f, fieldbook_path=fieldbook_path, force=force)
+
+
+def check_project(project, f2f=None, fieldbook_path=None, ne_tol: float | None = None,
+                  elev_tol: float | None = None, control_file=None, *, _prepared_rows=None) -> dict:
+    """Run only point-error checks over a project's own field points.
+
+    *f2f* is the Field Book's code set and *fieldbook_path* is its source (also used to read the
+    active command meanings). Without a code vocabulary, non-empty code descriptions are not
+    classified as unknown; genuinely blank descriptions still surface. Line-command order remains
+    here by design because the user directed it to Fix Point Errors; other line errors run through
+    :func:`check_linework_project` and its independent cache.
+
+    Returns point findings plus ``rows``, ``ids``, ``stats`` and ``flags``. Row indices in a finding
+    index into ``rows``; ``ids[i]`` is the project point the i-th row came from.
+    """
+    rows, ids = _prepared_rows or working_rows_from_project(project)
     # A caller may know the Field Book path but omit its decoded code set. Load the
     # vocabulary here so common-conversion rules and unknown codes still get checked.
     if not f2f and fieldbook_path:
@@ -1121,7 +1159,7 @@ def check_project(project, f2f=None, fieldbook_path=None, ne_tol: float | None =
             f2f = set()
     f2f = set(f2f or ())
     out = {"rows": rows, "ids": ids, "findings": [], "stats": summarise(rows) if rows else {},
-           "flags": {}, "code_checks": bool(f2f)}
+           "flags": {}, "code_checks": bool(f2f), "line_issues": []}
     if not rows:
         out["findings"].append({"level": "info", "check": "no field points", "rows": [],
                                 "message": "The project has no field points to check."})
@@ -1130,9 +1168,9 @@ def check_project(project, f2f=None, fieldbook_path=None, ne_tol: float | None =
     # Blank descriptions are checked even without a code table; describe_flags deliberately
     # leaves non-empty text alone when no vocabulary is available.
     flags = describe_flags(rows, f2f, fieldbook_path=fieldbook_path)
-    # Keep single-point command-order findings in the project-side report as well as the
-    # Fieldwork Manager's cross-point sequence findings. The row-level pass checks each code's
-    # command group in a multicode description independently, without mixing groups together.
+    # The point-error run keeps both the existing single-point and cross-point command-order
+    # findings. The row-level pass checks each code's command group in a multicode description
+    # independently, without mixing groups together. Other line-sequence checks run separately.
     if f2f or fieldbook_path:
         try:
             order_flags = P._validate_line_command_order(rows, f2f, fieldbook_path=fieldbook_path)
@@ -1232,38 +1270,94 @@ def check_project(project, f2f=None, fieldbook_path=None, ne_tol: float | None =
                         + (f" (for example, point(s) {examples})" if examples else "") + "."),
         })
 
-    # The linework half: issues that belong to a whole line, not to one point.  Same rule as the
-    # description check - it runs when there is a vocabulary, and the dock says which of the two it did.
-    out["line_issues"] = []
+    # Line command order is the one line-oriented exception owned by the point-error system.
+    # Run only that existing check here; line completeness/curve errors stay exclusively in the
+    # separate linework run and cache.
+    out["line_issues"] = []  # compatibility field: point results never contain line-error rows
     if f2f or fieldbook_path:
         try:
-            found_lines = LC.detect_line_errors(rows, fieldbook_path=fieldbook_path, f2f_set=f2f)
+            order_issues = LC.detect_line_errors(
+                rows, fieldbook_path=fieldbook_path, f2f_set=f2f,
+                issue_types={"Line Order"})
         except Exception as ex:                      # a check must never break the window
-            out["line_error"] = str(ex)
-            found_lines = []
-        out["line_issues"] = found_lines
-        by_line: dict[str, dict] = {}
-        for issue in found_lines:
-            name = str(issue.get("issue_type", "line"))
-            rec = by_line.setdefault(name, {"rows": set(), "samples": []})
-            i = oid_to_row.get(str(issue.get("oid", "")))
-            if i is not None:
-                rec["rows"].add(i)
-            if len(rec["samples"]) < 2:
-                rec["samples"].append(str(issue.get("detail", "")))
-        for name in [t for t in LC.ISSUE_TYPES if t in by_line]:
-            rec = by_line[name]
-            code = LC.ISSUE_FLAGS.get(name, name)
-            out["findings"].append({
-                "level": "error" if name == "Line Order" else "warn",
-                "check": f"line: {name.lower()}", "flag": code,
-                "rows": sorted(rec["rows"]),
-                "message": f"{len(rec['rows'])} field point(s) in line(s) with {name.lower()} - "
-                           + " ".join(rec["samples"][:1]) + ".",
-            })
+            out["line_order_error"] = str(ex)
+            order_issues = []
+        if order_issues:
+            order_rows = set()
+            samples = []
+            for issue in order_issues:
+                row_index = oid_to_row.get(str(issue.get("oid", "")))
+                if row_index is not None:
+                    order_rows.add(row_index)
+                if len(samples) < 2:
+                    samples.append(str(issue.get("detail", "")))
+            if order_rows:
+                out["findings"].append({
+                    "level": "error", "check": "line: line order",
+                    "flag": LC.ISSUE_FLAGS["Line Order"], "rows": sorted(order_rows),
+                    "message": f"{len(order_rows)} field point(s) in line(s) with line order - "
+                               + " ".join(samples[:1]) + ".",
+                })
     if not out["findings"]:
         out["findings"].append({"level": "info", "check": "ok", "rows": [],
                                 "message": "No problems found in the field data."})
+    return out
+
+
+def check_linework_project(project, f2f=None, fieldbook_path=None, *, _prepared_rows=None) -> dict:
+    """Run only the existing whole-line errors for a project's field points.
+
+    Command-order findings are deliberately excluded: they are routed to Fix Point Errors by
+    explicit product direction. No new geometry checks are added here; this is the existing
+    Field Book-driven line-sequence detector on its own result path.
+    """
+    rows, ids = _prepared_rows or working_rows_from_project(project)
+    if not f2f and fieldbook_path:
+        try:
+            f2f = P.build_f2f_set_from_fieldbook(fieldbook_path)
+        except Exception:
+            f2f = set()
+    f2f = set(f2f or ())
+    out = {"rows": rows, "ids": ids, "findings": [],
+           "stats": summarise(rows) if rows else {}, "flags": {},
+           "code_checks": bool(f2f), "line_checks": bool(f2f),
+           "line_issues": []}
+    if not rows:
+        out["findings"].append({"level": "info", "check": "no field points", "rows": [],
+                                "message": "The project has no field points to check."})
+        return out
+
+    if f2f:
+        line_issue_types = tuple(name for name in LC.ISSUE_TYPES if name != "Line Order")
+        try:
+            out["line_issues"] = LC.detect_line_errors(
+                rows, fieldbook_path=fieldbook_path, f2f_set=f2f,
+                issue_types=line_issue_types)
+        except Exception as ex:                      # a check must never break the workbench
+            out["line_error"] = str(ex)
+
+    oid_to_row = {str(row[OID]): index for index, row in enumerate(rows)}
+    by_line: dict[str, dict] = {}
+    for issue in out["line_issues"]:
+        name = str(issue.get("issue_type", "line"))
+        rec = by_line.setdefault(name, {"rows": set(), "samples": []})
+        row_index = oid_to_row.get(str(issue.get("oid", "")))
+        if row_index is not None:
+            rec["rows"].add(row_index)
+        if len(rec["samples"]) < 2:
+            rec["samples"].append(str(issue.get("detail", "")))
+    for name in [issue_type for issue_type in LC.ISSUE_TYPES
+                 if issue_type != "Line Order" and issue_type in by_line]:
+        rec = by_line[name]
+        out["findings"].append({
+            "level": "warn", "check": f"line: {name.lower()}",
+            "flag": LC.ISSUE_FLAGS.get(name, name), "rows": sorted(rec["rows"]),
+            "message": f"{len(rec['rows'])} field point(s) in line(s) with {name.lower()} - "
+                       + " ".join(rec["samples"][:1]) + ".",
+        })
+    if not out["findings"]:
+        out["findings"].append({"level": "info", "check": "ok", "rows": [],
+                                "message": "No linework problems found."})
     return out
 
 
@@ -1289,5 +1383,6 @@ __all__ = [
     "feature_codes_from_f2f", "f2f_code_set", "write_fieldbook_from_f2f",
     "batch_from_rows", "apply_rows_to_project",
     "working_rows_from_project", "check_project", "check_project_cached",
+    "check_linework_project", "check_linework_project_cached",
     "check_input_signature", "clear_check_cache", "fieldwork_set",
 ]

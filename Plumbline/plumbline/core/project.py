@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import os
@@ -350,8 +351,63 @@ class Project:
         self.touch()
         return {"matched": matched, "unknown": unknown}
 
+    def linework_input_signature(self, order: str = "file") -> str:
+        """Fingerprint the point coding, coordinates, feature codes and command map used to build lines."""
+        # Mirror build_linework's ordering exactly: its default/file mode sorts by point id, while
+        # number mode sorts by numeric point number (with the same id tie-breaker).
+        ordered_points = list(self.points.values())
+        if order == "number":
+            def point_number_key(point):
+                try:
+                    return (0, float(point.number), point.id)
+                except ValueError:
+                    return (1, 0.0, point.id)
+            ordered_points.sort(key=point_number_key)
+        else:
+            ordered_points.sort(key=lambda point: point.id)
+        points = [
+            [point.id, str(point.number), point.x, point.y, point.z, str(point.desc or "")]
+            for point in ordered_points
+        ]
+        codes = sorted(self.codes.to_list(),
+                       key=lambda item: (str(item.get("code", "")).casefold(),
+                                         str(item.get("code", ""))))
+        manual_overrides = [
+            [entity.id, entity.attrs or {}]
+            for entity in sorted(self.entities.values(), key=lambda item: item.id)
+            if isinstance(entity, Polyline)
+            and (entity.attrs or {}).get("manual_linework_override")
+        ]
+        payload = {
+            "version": "linework-build-v1",
+            "order": str(order),
+            "points": points,
+            "codes": codes,
+            "commands": (self.settings or {}).get("f2f_commands"),
+            "manual_overrides": manual_overrides,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False, default=str, allow_nan=True).encode("utf-8")
+        return hashlib.blake2b(encoded, digest_size=24).hexdigest()
+
+    def linework_is_processed(self) -> bool:
+        """Whether derived linework matches the current build inputs.
+
+        Older projects predate the content signature. Their existing generated lines are treated as
+        the last processed state once loaded; from_dict records that baseline so subsequent point or
+        code edits make it stale.
+        """
+        signature = str((self.settings or {}).get("linework_processed_signature") or "")
+        if signature:
+            order = str((self.settings or {}).get("linework_processed_order") or "file")
+            return signature == self.linework_input_signature(order)
+        return any(str(getattr(entity, "derived", "") or "").startswith("linework")
+                   or getattr(entity, "derived", "") == "manual-linework"
+                   for entity in self.entities.values())
+
     def process_linework(self, order: str = "file") -> dict:
         """(Re)build coded linework, respecting geometry edits accepted as manual overrides."""
+        input_signature = self.linework_input_signature(order)
         manual_overrides = {}
         for entity in self.entities.values():
             if not isinstance(entity, Polyline):
@@ -435,6 +491,8 @@ class Project:
                               {"code": ls.code, "string": ls.string,
                                "points": [p.number for p in pts], "point_ids": [p.id for p in pts]})
             made += 1
+        self.settings["linework_processed_signature"] = input_signature
+        self.settings["linework_processed_order"] = str(order)
         self.touch()
         return {"strings": made, "replaced": removed}
 
@@ -627,6 +685,15 @@ class Project:
         p._next_id = int(d.get("next_id", 1))
         p.ensure_layer("0", (230, 230, 230))
         p.ensure_layer("POINTS", (255, 255, 255))
+        # Older project files have no input signature. Treat any existing derived linework as
+        # processed at the loaded point/code state, then let signature comparison mark it stale
+        # after the next edit/import.
+        if (not p.settings.get("linework_processed_signature")
+                and any(str(getattr(entity, "derived", "") or "").startswith("linework")
+                        or getattr(entity, "derived", "") == "manual-linework"
+                        for entity in p.entities.values())):
+            p.settings["linework_processed_order"] = "file"
+            p.settings["linework_processed_signature"] = p.linework_input_signature("file")
         p.touch()
         return p
 

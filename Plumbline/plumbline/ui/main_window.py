@@ -1195,7 +1195,7 @@ class MainWindow(QMainWindow):
             if imagery_added or has_visible_imagery:
                 self._offer_fix_point_errors_after_imagery()
             else:
-                self._offer_fix_point_errors()
+                self._offer_linework_then_fix_point_errors()
 
     def _offer_default_esri_imagery(self) -> bool:
         """Offer the shipped Esri World Imagery layer after field data has a project CRS."""
@@ -1221,6 +1221,27 @@ class MainWindow(QMainWindow):
         self.state.log("Esri World Imagery added; visible map tiles are loading automatically.", "ok")
         return True
 
+    def _offer_process_linework(self) -> bool:
+        """Offer the dedicated linework-processing action when current inputs are unprocessed."""
+        project = self.state.project
+        if not REF.survey_points(project) or project.linework_is_processed():
+            return False
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Process Linework")
+        box.setText("Linework has not been processed for the current survey points and Feature Codes. Process it now?")
+        box.setInformativeText(
+            "This builds derived linework from the current point descriptions and Feature Codes. "
+            "You can also run Process Linework later from Survey.")
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.Yes)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            return False
+        # Reuse the dedicated command, whose explicit confirmation and Field Book gate also apply
+        # when this offer is accepted during Open Route.
+        self.process_linework()
+        return True
+
     def _offer_fix_point_errors(self) -> bool:
         """Offer the Fix Point Errors workbench after the import route, regardless of imagery choice."""
         if not REF.survey_points(self.state.project):
@@ -1237,11 +1258,16 @@ class MainWindow(QMainWindow):
         self.open_fix_point_errors()
         return True
 
+    def _offer_linework_then_fix_point_errors(self) -> None:
+        """Keep the optional Process Linework offer immediately before point-error review."""
+        self._offer_process_linework()
+        self._offer_fix_point_errors()
+
     def _offer_fix_point_errors_after_imagery(self) -> None:
-        """Defer the post-import prompt until the refreshed imagery has had a chance to draw."""
+        """Defer both post-import offers until the refreshed imagery has had a chance to draw."""
         canvas = getattr(self, "canvas", None)
         if canvas is None:
-            QTimer.singleShot(0, self._offer_fix_point_errors)
+            QTimer.singleShot(0, self._offer_linework_then_fix_point_errors)
             return
 
         # Force the invalidated canvas through a paint now so visible tile requests start before
@@ -1267,14 +1293,14 @@ class MainWindow(QMainWindow):
                 if settled_at is None:
                     settled_at = now
                 elif now - settled_at >= 0.2:
-                    self._offer_fix_point_errors()
+                    self._offer_linework_then_fix_point_errors()
                     return
             elif now >= no_tiles_deadline:
-                self._offer_fix_point_errors()
+                self._offer_linework_then_fix_point_errors()
                 return
 
             if now >= max_deadline:
-                self._offer_fix_point_errors()
+                self._offer_linework_then_fix_point_errors()
                 return
             QTimer.singleShot(75, wait_for_refresh)
 
@@ -1760,7 +1786,7 @@ class MainWindow(QMainWindow):
     def process_linework(self):
         if not self._ensure_fieldbook_for_processing():
             return
-        with self.state.edit("Process linework"):
+        with self.state.edit("Process linework", kinds=("entities",)):
             r = self.state.project.process_linework()
         self.state.log(f"Linework: {r['strings']} string(s) created" + (f", {r['replaced']} previous replaced" if r["replaced"] else "") + ".", "ok")
 

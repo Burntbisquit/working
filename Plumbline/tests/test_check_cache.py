@@ -137,3 +137,58 @@ def test_stored_report_keeps_its_input_signature_without_invalidating_itself():
 
     assert report["input_signature"] == signature
     assert FB.check_input_signature(project, _prepared_rows=(rows, ids)) == signature
+
+
+def test_point_and_linework_checks_keep_independent_cache_entries(monkeypatch):
+    project, _point = _project_with_point()
+    point_calls, line_calls = [], []
+    FB.clear_check_cache(project)
+    monkeypatch.setattr(FB, "check_project", _fake_check(point_calls))
+
+    def fake_linework(project, f2f=None, fieldbook_path=None, *, _prepared_rows=None):
+        line_calls.append((f2f, fieldbook_path))
+        rows, ids = _prepared_rows or FB.working_rows_from_project(project)
+        return {"rows": rows, "ids": ids, "findings": [], "stats": {},
+                "line_issues": [], "flags": {}}
+
+    monkeypatch.setattr(FB, "check_linework_project", fake_linework)
+
+    _, point_status, point_signature = FB.check_project_cached(project)
+    _, line_status, line_signature = FB.check_linework_project_cached(project)
+    assert (point_status, line_status) == ("miss", "miss")
+    assert point_signature != line_signature
+
+    _, point_status, _ = FB.check_project_cached(project)
+    _, line_status, _ = FB.check_linework_project_cached(project)
+    assert (point_status, line_status) == ("hit", "hit")
+    assert len(point_calls) == len(line_calls) == 1
+
+    # A control tolerance is a point-QA input only; it must not invalidate the line-error cache.
+    monkeypatch.setitem(settings()._data, "control_point_tolerance", 0.02)
+    _, point_status, _ = FB.check_project_cached(project)
+    _, line_status, _ = FB.check_linework_project_cached(project)
+    assert (point_status, line_status) == ("updated", "hit")
+    assert len(point_calls) == 2 and len(line_calls) == 1
+
+
+def test_linework_cache_recomputes_on_line_inputs_and_supports_explicit_rerun(monkeypatch):
+    project, point = _project_with_point()
+    calls = []
+    FB.clear_check_cache(project)
+
+    def fake_linework(project, f2f=None, fieldbook_path=None, *, _prepared_rows=None):
+        calls.append(1)
+        rows, ids = _prepared_rows or FB.working_rows_from_project(project)
+        return {"rows": rows, "ids": ids, "findings": [], "stats": {},
+                "line_issues": [], "flags": {}}
+
+    monkeypatch.setattr(FB, "check_linework_project", fake_linework)
+    _, status, signature = FB.check_linework_project_cached(project, f2f={"topo"})
+    assert status == "miss"
+    _, status, same_signature = FB.check_linework_project_cached(project, f2f={"topo"}, force=True)
+    assert (status, same_signature) == ("rerun", signature)
+    point.desc = "EDGE ST"
+    _, status, new_signature = FB.check_linework_project_cached(project, f2f={"topo"})
+    assert status == "updated"
+    assert new_signature != signature
+    assert len(calls) == 3

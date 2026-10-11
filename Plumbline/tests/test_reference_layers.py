@@ -75,6 +75,19 @@ def _import_csv(state, path, role=None, dup_policy="renumber"):
     return apply_import(state, batch, plan, f"points ({Path(path).name})")
 
 
+def test_import_never_processes_linework_implicitly(tmp_path):
+    project = _project()
+    state = _State(project)
+    source = _csv(tmp_path / "field.csv", [(1, BASE_N, BASE_E, 500.0, "EP ST")])
+    calls = []
+    project.process_linework = lambda: calls.append("processed")
+
+    _import_csv(state, source)
+
+    assert calls == []
+    assert not hasattr(ImportPlan(), "process_linework")
+
+
 # --------------------------------------------------------------------------- core: the lists
 def test_a_stakeout_csv_lands_on_its_own_layer_and_not_in_the_fieldwork_list(tmp_path):
     pr = _project()
@@ -268,12 +281,12 @@ def test_the_import_dialog_offers_the_three_roles_and_a_way_in_for_field_data(tm
     dlg.cmb_role.setCurrentIndex(dlg.cmb_role.findData("stakeout"))
     assert dlg.target_role() == "stakeout"
     assert not dlg.panel.ed_layer.isEnabled(), "the role owns the layer, so the layer box steps aside"
-    assert not dlg.panel.chk_lw.isEnabled(), "reference points do not build linework"
+    assert not hasattr(dlg.panel, "chk_lw"), "imports never process linework automatically"
     assert "STAKE-OUT" in dlg.status.text() or "stake-out" in dlg.status.text().lower()
 
     dlg.cmb_role.setCurrentIndex(0)                                  # this job's field data
     assert dlg.target_role() is None
-    assert dlg.panel.ed_layer.isEnabled() and dlg.panel.chk_lw.isEnabled()
+    assert dlg.panel.ed_layer.isEnabled()
 
 
 def test_the_export_dialog_offers_each_list_with_its_count(tmp_path, qapp):

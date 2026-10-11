@@ -282,11 +282,77 @@ def test_project_process_linework_and_layers():
     res = pr.apply_codes_to_points()
     assert res["matched"] == 4 and "XYZ" in res["unknown"]
     assert pr.point_by_number("4").layer == "UTIL-MH"
+    assert not pr.linework_is_processed()
     out = pr.process_linework()
     assert out["strings"] == 1
     pl = next(pr.polylines(kinds={"breakline"}))
     assert pl.layer == "ROAD-EP" and len(pl.verts) == 3 and pl.derived == "linework"
+    assert pr.linework_is_processed()
     assert pr.process_linework()["replaced"] == 1          # regenerating replaces, never duplicates
+    assert pr.linework_is_processed()
+    assert Project.from_dict(pr.to_dict()).linework_is_processed()
+
+    pr.point_by_number("1").desc = "MH"
+    pr.touch()
+    assert not pr.linework_is_processed(), "point edits stale the processed-state marker"
+    pr.process_linework()
+    assert pr.linework_is_processed()
+
+
+def test_linework_processed_state_tracks_the_requested_order():
+    pr = Project("linework order")
+    pr.codes = default_codes()
+    pr.add_point(0, 0, 0, number="20", desc="EP")
+    pr.add_point(10, 0, 0, number="10", desc="EP")
+
+    file_signature = pr.linework_input_signature("file")
+    number_signature = pr.linework_input_signature("number")
+    assert file_signature != number_signature
+
+    pr.process_linework(order="file")
+    assert pr.linework_is_processed()
+    pr.process_linework(order="number")
+    assert pr.linework_is_processed(), "the saved processing order is checked with its own fingerprint"
+
+
+def test_manual_linework_overrides_are_part_of_the_processed_state():
+    pr = Project("manual linework")
+    pr.codes = default_codes()
+    first = pr.add_point(0, 0, 0, number="1", desc="EP")
+    second = pr.add_point(10, 0, 0, number="2", desc="EP")
+    pr.process_linework()
+    assert pr.linework_is_processed()
+
+    manual = pr.add_polyline(
+        [[0, 0, 0], [10, 1, 0]], layer="ROAD-EP", kind="breakline",
+        derived="manual-linework",
+        attrs={"manual_linework_override": True,
+               "linework_override_keys": [["EP", "1"]],
+               "linework_override_point_ids": [first.id, second.id]},
+    )
+    assert not pr.linework_is_processed(), "a new manual override changes the build inputs"
+
+    pr.process_linework()
+    assert pr.linework_is_processed()
+    manual.attrs["linework_override_point_ids"] = [first.id]
+    pr.touch()
+    assert not pr.linework_is_processed(), "editing an override must make the built state stale"
+
+
+def test_legacy_project_linework_gets_a_processed_baseline_then_goes_stale_on_import():
+    pr = Project("legacy linework")
+    pr.codes = default_codes()
+    pr.add_point(0, 0, 0, number="1", desc="EP ST")
+    pr.add_point(10, 0, 0, number="2", desc="EP END")
+    pr.process_linework()
+    data = pr.to_dict()
+    data["settings"].pop("linework_processed_signature", None)
+    data["settings"].pop("linework_processed_order", None)
+
+    restored = Project.from_dict(data)
+    assert restored.linework_is_processed()
+    restored.add_point(20, 0, 0, number="3", desc="EP")
+    assert not restored.linework_is_processed()
 
 
 # ============================================================ project

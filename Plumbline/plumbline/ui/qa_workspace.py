@@ -1315,11 +1315,18 @@ class BaseQAWorkbenchWindow(QMainWindow):
 
         n = len(self.code_set)
         if v["source"] == "none" and not self.code_set:
-            self.banner.set(f"No field book or code table loaded ({v.get('why', '')}). "
-                            "Geometry checks run; vocabulary checks paused.", "warn")
+            reason = f" ({v.get('why', '')})" if v.get("why") else ""
+            if self.enable_flag_navigation:
+                message = (f"No field book or code table loaded{reason}. Number/position and blank-"
+                           "description checks run; vocabulary-dependent point checks are paused.")
+            else:
+                message = (f"No field book or code table loaded{reason}. Whole-line checks are not "
+                           "run until a vocabulary is available.")
+            self.banner.set(message, "warn")
         else:
             label = v.get("label") or "Project Feature Codes"
-            self.banner.set(f"Vocabulary: {label} ({n:,} codes active) — All checks active.", "info")
+            scope = "Point-error checks" if self.enable_flag_navigation else "Linework checks"
+            self.banner.set(f"Vocabulary: {label} ({n:,} codes active) — {scope} active.", "info")
 
     def _report_check_catalog(self) -> list[tuple[str, str, str]]:
         """Canonical checks for this workbench: (display name, key, category)."""
@@ -1351,7 +1358,7 @@ class BaseQAWorkbenchWindow(QMainWindow):
         ids = result.get("ids") or list(self.state.project.points)
         have_points = bool(result.get("rows") or self.state.project.points)
         code_checks_ran = bool(result.get("code_checks") or self.code_set)
-        line_checks_ran = bool(self.fieldbook_path or self.code_set)
+        line_checks_ran = bool(result.get("line_checks", self.code_set))
         rows = []
 
         for label, check_key, category in self._report_check_catalog():
@@ -1460,14 +1467,20 @@ class BaseQAWorkbenchWindow(QMainWindow):
         # Re-read the active Field Book/vocabulary before keying the result; an external book edit
         # must both invalidate the cache and affect the check that replaces it.
         self._refresh_vocabulary()
-        ne_tol = getattr(self, "close_tol", 0.05)
-        self.result, cache_status, _signature = FB.check_project_cached(
-            pr, f2f=self.code_set, fieldbook_path=self.fieldbook_path or None,
-            ne_tol=ne_tol, force=force)
+        if self.enable_flag_navigation:
+            self.result, cache_status, _signature = FB.check_project_cached(
+                pr, f2f=self.code_set, fieldbook_path=self.fieldbook_path or None,
+                ne_tol=getattr(self, "close_tol", 0.05), force=force)
+        else:
+            self.result, cache_status, _signature = FB.check_linework_project_cached(
+                pr, f2f=self.code_set, fieldbook_path=self.fieldbook_path or None,
+                force=force)
         self._populate_findings()
         self._sync_view_flags()
         if cache_status == "updated" and hasattr(self, "lbl_status"):
-            self.lbl_status.setText("QA inputs changed; the cached check was refreshed.")
+            scope_name = "point" if self.enable_flag_navigation else "linework"
+            self.lbl_status.setText(
+                f"QA inputs changed; the cached {scope_name} check was refreshed.")
 
     def _populate_findings(self):
         if not hasattr(self, "result") or not self.result:
@@ -2516,7 +2529,6 @@ class BaseQAWorkbenchWindow(QMainWindow):
             changed = True
 
         if changed:
-            pr.process_linework()
             self.state.set_dirty(True)
             self.state.refresh(("points", "entities"))
         return changed
@@ -2732,7 +2744,6 @@ class BaseQAWorkbenchWindow(QMainWindow):
             project_changed = True
 
         if project_changed:
-            pr.process_linework()
             self.state.set_dirty(True)
             self.state.refresh(("points", "entities"))
 
@@ -4557,7 +4568,6 @@ class BowtieRepairDialog(QDialog):
         with self.state.edit(f"Repair bowtie {c1} <-> {c2}"):
             PLC.swap_parallel_line_codes(
                 pts, c1, c2, commands=(self.state.project.settings or {}).get("f2f_commands"))
-            self.state.project.process_linework()
             self.state.set_dirty(True)
             self.state.refresh(("points", "entities"))
         self.accept()
@@ -4637,7 +4647,6 @@ class ReclassMergeLinesDialog(QDialog):
             PLC.merge_and_reclass_strings(
                 pr, pts1, pts2, target_code=t_code, new_string_id=t_id,
                 commands=(pr.settings or {}).get("f2f_commands"))
-            pr.process_linework()
             self.state.set_dirty(True)
             self.state.refresh(("points", "entities"))
         self.accept()

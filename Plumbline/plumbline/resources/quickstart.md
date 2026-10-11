@@ -25,8 +25,8 @@ the dialog says so and offers a one-click swap.
 
 Descriptions use a Field Book feature code, optional string identifier, configured line/curve commands, and optional notes.
 The active Field Book assigns each command its meaning: Start Line begins a string, End Line finishes it, and Close returns a
-closed feature to its first point. Intermediate coded points continue the string. **Survey > Process Linework** turns those
-coded strings into polylines (breaklines for codes flagged as such). Edit feature codes and command meanings in the Field Book.
+closed feature to its first point. Intermediate coded points continue the string. **Survey > Process Linework** explicitly turns those
+coded strings into polylines (breaklines for codes flagged as such); import and QA never run this automatically. Edit feature codes and command meanings in the Field Book.
 
 ## 4. Surfaces, contours, volumes, profiles
 

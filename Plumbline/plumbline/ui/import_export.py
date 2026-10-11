@@ -56,7 +56,6 @@ class ImportPlan:
     z_scale: float = 1.0
     dup_policy: str = "renumber"
     layer_override: str | None = None
-    process_linework: bool = False
     reference_role: str | None = None      # stakeout | control | other -> a reference list, not field data
 
 
@@ -144,8 +143,6 @@ def apply_import(state, batch: ImportBatch, plan: ImportPlan, label: str, path=N
             if source_rec is not None:
                 rec["source_crs"] = source_rec
             FCRC.record(pr, src.name, rec)
-        if plan.process_linework:
-            stats["linework"] = pr.process_linework()["strings"]
     return stats
 
 
@@ -269,10 +266,8 @@ class ImportOptionsPanel(QWidget):
             self.cmb_dup.addItem(lbl, v)
         self.ed_layer = QLineEdit()
         self.ed_layer.setPlaceholderText("(blank = keep layers from the file / feature codes)")
-        self.chk_lw = QCheckBox("Build linework from feature codes after import")
         of.addRow("If a point number already exists:", self.cmb_dup)
         of.addRow("Put everything on layer:", self.ed_layer)
-        of.addRow("", self.chk_lw)
         lay.addWidget(o)
 
         self.btn_other.clicked.connect(self._choose_other)
@@ -357,7 +352,7 @@ class ImportOptionsPanel(QWidget):
         # them here is what makes them "part of import" (change order, item 7).
         self.vg.apply_to(pc)
         p = ImportPlan(geographic=self.geographic, dup_policy=self.cmb_dup.currentData(),
-                       layer_override=self.ed_layer.text().strip() or None, process_linework=self.chk_lw.isChecked(),
+                       layer_override=self.ed_layer.text().strip() or None,
                        swap_xy=self.chk_swap.isChecked() and not self.geographic)
         eff = self._assign if (self.r_assign.isChecked() and self._assign is not None) else pc
         if self.r_other.isChecked() and self._chosen is not None:
@@ -624,10 +619,8 @@ class CsvImportDialog(QDialog):
         self.panel.ed_layer.setEnabled(role is None)
         self.panel.ed_layer.setPlaceholderText("(the layer of the chosen role)" if role
                                               else "(blank = keep layers from the file / feature codes)")
-        self.panel.chk_lw.setEnabled(role is None)
         if role:
             self.panel.ed_layer.clear()
-            self.panel.chk_lw.setChecked(False)
         self._update_preview()
 
     def _geo_changed(self):

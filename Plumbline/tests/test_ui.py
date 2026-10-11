@@ -250,6 +250,52 @@ def test_accepting_imagery_defers_fix_point_errors_offer_until_canvas_refresh(wi
     assert events == ["imagery", "wait for canvas refresh"]
 
 
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        (QMessageBox.StandardButton.Yes,
+         ["Process Linework", "processed", "Fix Point Errors"]),
+        (QMessageBox.StandardButton.No,
+         ["Process Linework", "Fix Point Errors"]),
+    ],
+)
+def test_open_route_offers_unprocessed_linework_before_point_errors(
+        win, monkeypatch, answer, expected):
+    project = Project("Unprocessed route")
+    project.add_point(10.0, 20.0, 3.0, number="1", desc="EP ST")
+    win.state.set_project(project, dirty=False)
+    events = []
+
+    def answer_linework(box):
+        events.append(box.windowTitle())
+        return answer
+
+    monkeypatch.setattr(QMessageBox, "exec", answer_linework)
+    monkeypatch.setattr(win, "process_linework", lambda: events.append("processed"))
+    monkeypatch.setattr(win, "_offer_fix_point_errors", lambda: events.append("Fix Point Errors"))
+
+    win._complete_import_onboarding()
+
+    assert events == expected
+
+
+def test_open_route_skips_process_linework_offer_when_current_inputs_are_processed(
+        win, monkeypatch):
+    project = Project("Processed route")
+    project.add_point(10.0, 20.0, 3.0, number="1", desc="EP ST")
+    project.process_linework()
+    win.state.set_project(project, dirty=False)
+    prompts = []
+    monkeypatch.setattr(QMessageBox, "exec", lambda box: prompts.append(box.windowTitle()))
+    point_prompt = []
+    monkeypatch.setattr(win, "_offer_fix_point_errors", lambda: point_prompt.append("shown"))
+
+    win._complete_import_onboarding()
+
+    assert prompts == []
+    assert point_prompt == ["shown"]
+
+
 def test_accepting_default_imagery_adds_the_shipped_esri_tile_source(win, monkeypatch):
     from PySide6.QtWidgets import QMessageBox
 

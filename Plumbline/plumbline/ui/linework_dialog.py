@@ -127,9 +127,7 @@ class JoinPointsDialog(QDialog):
             PLC.join_points_to_string(self.points, code, str_id, closed=closed,
                                       commands=self.commands)
             pr.touch()
-            if hasattr(pr, "process_linework"):
-                res = pr.process_linework()
-                self.state.log(f"Linework generated: {res.get('strings', 0)} string(s).", "ok")
+        self.state.log("Linework coding saved. Use Process Linework to build the geometry.", "info")
         self.accept()
 
 
@@ -290,9 +288,8 @@ class EditLineworkCodingDialog(QDialog):
             with self.state.edit("Edit Linework Coding", kinds=("points", "entities")):
                 for point_id, description in changes.items():
                     pr.points[point_id].desc = description
-                if hasattr(pr, "process_linework"):
-                    pr.process_linework()
         except Exception as ex:
             QMessageBox.warning(self, "Apply Linework Coding", str(ex))
             return
+        self.state.log("Linework coding updated. Use Process Linework to rebuild derived geometry.", "info")
         self.accept()

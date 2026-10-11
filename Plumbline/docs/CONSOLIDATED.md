@@ -196,11 +196,11 @@ That is how a check gets switched off and stays off.
   * `field book + job codes` - a book with no code table merged with the job's own converted codes;
   * `job codes` - only when they came from the office's Carlson export (`f2f_path`), because the
     program's built-in default codes are a starting set, not this job's vocabulary;
-  * `none` - and then the description and line checks **do not run**, and the banner says which
-    half cannot and why.  An empty vocabulary is never run as if it were one.
-* The dock and the field window run the same checks (`bridge.check_project`), so the same data says
-  the same thing through either door.
-* **Auditable across close/reopen**: each run is stored on the project
+  * `none` - number/position and blank-description checks still run; vocabulary-dependent checks
+    pause and the banner says which inputs are missing. An empty vocabulary is never run as if it were one.
+* The Check Fieldwork dock and Fix Point Errors use the point-error run/cache. Whole-line findings
+  use a separate Fix Linework run/cache; `Line command order` remains in Fix Point Errors by direction.
+* **Auditable across close/reopen**: each point-check run is stored on the project
   (`settings["check_report"]`: when, how many points, crews, every finding with the point ids it
   named *and* their numbers, the vocabulary used and its size), written beside the job as
   `Reports/Check Fieldwork <stamp>.fwc` (the same unified 9-column report the field window writes,

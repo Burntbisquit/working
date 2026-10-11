@@ -3575,7 +3575,7 @@ class MainWindow(QMainWindow):
         """Build line errors from current working rows, through the shared line engine.
 
         ``fieldwork/linecheck.py`` is the one reader of a line: this tab and the drawing window's
-        Check Fieldwork dock both call it, so the two cannot disagree about where a line ends.
+        Fix Linework workbench both use it, so their whole-line findings cannot disagree.
         """
         try:
             detect_line_errors = detect_line_issues

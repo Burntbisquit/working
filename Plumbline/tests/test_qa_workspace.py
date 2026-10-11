@@ -1483,7 +1483,7 @@ def test_qa_workbench_uses_selected_vocabulary_and_fieldbook_path(win, monkeypat
     assert checked[-1] == {"f2f": set(), "fieldbook_path": selected_path}
 
 
-def test_qa_fixes_and_rollbacks_rebuild_derived_linework(win):
+def test_qa_fixes_and_rollbacks_do_not_process_linework_implicitly(win):
     from plumbline.core.featurecodes import FeatureCode
     from plumbline.ui.qa_workspace import FixPointErrorsDialog
 
@@ -1511,21 +1511,30 @@ def test_qa_fixes_and_rollbacks_rebuild_derived_linework(win):
     dialog._apply_fix("Move QA line vertex", lambda: setattr(start, "x", 2.0),
                       resolved_points=[start.id])
     assert start.x == pytest.approx(2.0)
-    assert line_start()[0] == pytest.approx(2.0)
+    assert line_start() == pytest.approx(initial_line_start)
+    assert not pr.linework_is_processed()
 
     dialog._undo_issue()
     assert start.x == pytest.approx(0.0)
     assert line_start() == pytest.approx(initial_line_start)
+    assert pr.linework_is_processed()
 
     dialog._redo_issue()
     assert start.x == pytest.approx(2.0)
+    assert line_start() == pytest.approx(initial_line_start)
+    assert not pr.linework_is_processed()
+
+    # Only an explicit invocation rebuilds the derived geometry.
+    pr.process_linework()
     assert line_start()[0] == pytest.approx(2.0)
+    assert pr.linework_is_processed()
 
     unrelated.desc = "Changed outside this issue"
     dialog._action_discard_issue()
     assert start.x == pytest.approx(0.0)
     assert unrelated.desc == "Changed outside this issue"
-    assert line_start() == pytest.approx(initial_line_start)
+    assert line_start()[0] == pytest.approx(2.0)
+    assert not pr.linework_is_processed()
     assert dialog.resolved_findings == []
     assert dialog.history_undo == []
     assert not dialog.dirty

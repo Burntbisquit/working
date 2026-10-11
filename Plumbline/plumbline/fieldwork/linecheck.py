@@ -11,8 +11,8 @@ commands and unrelated sequence-state issues are not reported as line-order erro
 **proposed, then validated**: after it is applied, the line is read again to verify the result.
 
 This module is Qt-free on purpose: the field window's Line Repair tab and the drawing window's
-Check Fieldwork dock both use it, and neither should be able to disagree with the other about
-where a line ends.
+Fix Linework workbench use the same detector, and neither should be able to disagree about where
+a line ends.
 """
 from __future__ import annotations
 
@@ -82,8 +82,15 @@ def _command_set_for(fieldbook_path, command_set, commands=None):
 
 # --------------------------------------------------------------------------------- detection
 def detect_line_errors(working_rows, fieldbook_path=None, f2f_set=None, command_set=None,
-                       rules=None, commands=None) -> list[dict]:
-    """Read each coded line in file order and report incomplete line/curve command sequences."""
+                       rules=None, commands=None, issue_types=None) -> list[dict]:
+    """Read coded lines and report the selected existing line-sequence issue types.
+
+    ``issue_types`` lets the project point-check route only the existing ``Line Order`` finding
+    through its point-error workflow while the geometry-correction workbench runs the other
+    existing line checks independently. With no filter, this retains the full Fieldwork Manager
+    behavior.
+    """
+    selected_issue_types = set(ISSUE_TYPES if issue_types is None else issue_types)
     if not working_rows:
         return []
     from .parse import parse_desc_field
@@ -154,6 +161,8 @@ def detect_line_errors(working_rows, fieldbook_path=None, f2f_set=None, command_
         code_raw = points[0][3] if points else line_id
 
         def add(issue_type, oid, detail, suggestion):
+            if issue_type not in selected_issue_types:
+                return
             out.append({
                 "issue_type": issue_type, "oid": oid, "line_id": line_id,
                 "detail": detail, "fix_suggestion": suggestion, "seg_id": len(segments) + 1,
@@ -161,6 +170,36 @@ def detect_line_errors(working_rows, fieldbook_path=None, f2f_set=None, command_
                                          command_set=cs, commands=semantic_tokens,
                                          f2f_set=f2f, fieldbook_path=fieldbook_path),
             })
+
+        def add_order_issue():
+            sequence_events = [(meaning, oid, raw) for oid, line_commands, raw, _code in points
+                               for meaning in line_commands if meaning in RANK]
+            order_violation = first_line_order_pair_violation(
+                [meaning for meaning, _oid, _raw in sequence_events])
+            if order_violation is None:
+                return
+            bad_index, counterpart_index, reason = order_violation
+            _bad_meaning, bad_oid, _bad_raw = sequence_events[bad_index]
+            first_index, second_index = sorted((bad_index, counterpart_index))
+            first_meaning, first_oid, first_raw = sequence_events[first_index]
+            second_meaning, second_oid, second_raw = sequence_events[second_index]
+            first_label = first_meaning.replace("_", " ").title()
+            second_label = second_meaning.replace("_", " ").title()
+            if reason == "Start Curve appears before Start Line":
+                suggestion = "Place Start Line before Start Curve in this code section."
+            elif reason == "End Line appears before End Curve":
+                suggestion = "Place End Curve before End Line in this code section."
+            else:
+                suggestion = "Place End Curve before Close in this code section."
+            add("Line Order", bad_oid,
+                f"Line {code_raw} has {reason} in its same-code point sequence: "
+                f"{first_label} at OID {first_oid} ({first_raw}) precedes "
+                f"{second_label} at OID {second_oid} ({second_raw}).",
+                suggestion)
+
+        if selected_issue_types == {"Line Order"}:
+            add_order_issue()
+            return out
 
         for oid, line_commands, raw, _code in points:
             if "start_line" in line_commands:
@@ -196,29 +235,8 @@ def detect_line_errors(working_rows, fieldbook_path=None, f2f_set=None, command_
                 f"Add End Line to OID {current_segment[-1][0]}")
             segments.append(current_segment)
 
-        sequence_events = [(meaning, oid, raw) for oid, line_commands, raw, _code in points
-                           for meaning in line_commands if meaning in RANK]
-        order_violation = first_line_order_pair_violation(
-            [meaning for meaning, _oid, _raw in sequence_events])
-        if order_violation is not None:
-            bad_index, counterpart_index, reason = order_violation
-            _bad_meaning, bad_oid, _bad_raw = sequence_events[bad_index]
-            first_index, second_index = sorted((bad_index, counterpart_index))
-            first_meaning, first_oid, first_raw = sequence_events[first_index]
-            second_meaning, second_oid, second_raw = sequence_events[second_index]
-            first_label = first_meaning.replace("_", " ").title()
-            second_label = second_meaning.replace("_", " ").title()
-            if reason == "Start Curve appears before Start Line":
-                suggestion = "Place Start Line before Start Curve in this code section."
-            elif reason == "End Line appears before End Curve":
-                suggestion = "Place End Curve before End Line in this code section."
-            else:
-                suggestion = "Place End Curve before Close in this code section."
-            add("Line Order", bad_oid,
-                f"Line {code_raw} has {reason} in its same-code point sequence: "
-                f"{first_label} at OID {first_oid} ({first_raw}) precedes "
-                f"{second_label} at OID {second_oid} ({second_raw}).",
-                suggestion)
+        if "Line Order" in selected_issue_types:
+            add_order_issue()
 
         for segment in segments:
             curve_open_oid = None

@@ -11,9 +11,10 @@ and the fix routinely clears something it was not aimed at.  These tests pin:
   it cleared - and says so plainly when it cleared nothing;
 * that a decision (Ignore) is written into the check report and read back, so a re-run does not
   reopen it;
-* that the same reader serves the field window's Line Repair tab and the drawing window's Check
-  Fieldwork dock, so the two cannot disagree about where a line ends;
-* that the drawing side hears about it at all ("the field-side flags on the drawing side").
+* that the same reader serves the field window's Line Repair tab and the drawing window's Fix
+  Linework workbench, so the two cannot disagree about where a line ends;
+* that point-error and line-error runs/caches stay separate, with Line command order routed to
+  Fix Point Errors.
 
 Qt-free where it can be: the engine tests import nothing from Qt, and the two window tests use the
 same offscreen fixtures the other UI tests use.
@@ -497,9 +498,10 @@ def test_line_order_autofix_reorders_only_the_supported_pairs_in_each_code_secti
         "EA BEGINLN EC FINISH"
 
 
-def test_the_dock_reports_the_line_issues_and_they_select_the_points(win, app):
-    """The field-side flags, on the drawing side: findings over the project's own points."""
+def test_point_dock_and_linework_check_use_separate_findings(win, app, monkeypatch):
+    """Whole-line findings live in their own run; only Line command order stays point-side."""
     from plumbline.ui.check_dock import CheckFieldworkDock
+    from plumbline.fieldwork import bridge as FB
 
     pr = win.state.project
     for p in list(pr.points.values()):
@@ -508,19 +510,40 @@ def test_the_dock_reports_the_line_issues_and_they_select_the_points(win, app):
         pr.add_point(2000.0 + i, 1000.0 + i, 500.0, number=f"81{i}", desc=desc)
     ids = sorted(pr.points)
 
+    point_result = FB.check_project(pr, f2f={"toc"}, fieldbook_path=None)
     dock = CheckFieldworkDock(win.state, job_root=lambda: None)
-    dock.code_set = {"toc"}
-    dock.result = None
-    from plumbline.fieldwork import bridge as FB
-    dock.result = FB.check_project(pr, f2f={"toc"}, fieldbook_path=None)
+    dock.result = point_result
+    assert not [f for f in dock.result["findings"]
+                if str(f["check"]).startswith("line: missing")]
+    assert dock.result["line_issues"] == []
 
-    line_findings = [f for f in dock.result["findings"] if f["check"].startswith("line:")]
-    assert line_findings, [f["check"] for f in dock.result["findings"]]
-    assert all(f["level"] == "warn" for f in line_findings)
-    picked = {dock.result["ids"][i] for f in line_findings for i in f["rows"]}
+    order_point = next(iter(pr.points.values()))
+    order_point.desc = "TOC PC ST"
+    pr.touch()
+    dock.result = FB.check_project(pr, f2f={"toc"}, fieldbook_path=None)
+    dock._fill_table()
+    displayed_checks = [dock.tbl.item(row, 1).text() for row in range(dock.tbl.rowCount())]
+    assert "Line command order" in displayed_checks
+    assert "line: line order" not in displayed_checks
+    order_row = next(row for row, finding in enumerate(dock.result["findings"])
+                     if finding.get("flag") == "LineOrderError")
+    order_action = dock.tbl.cellWidget(order_row, 4)
+    assert order_action is not None and order_action.text() == "Fix..."
+    opened = []
+    monkeypatch.setattr(dock, "open_workbench", lambda: opened.append("Fix Point Errors"))
+    order_action.click()
+    assert opened == ["Fix Point Errors"]
+
+    line_result = FB.check_linework_project(pr, f2f={"toc"}, fieldbook_path=None)
+    line_findings = [finding for finding in line_result["findings"]
+                     if finding["check"].startswith("line:")]
+    assert line_findings, [finding["check"] for finding in line_result["findings"]]
+    assert all(finding["level"] == "warn" for finding in line_findings)
+    picked = {line_result["ids"][i] for finding in line_findings for i in finding["rows"]}
     assert picked <= set(ids) and picked, "a finding names the points it is about"
-    assert any(f["check"] == "line: missing end" for f in line_findings)
-    assert any("never closed" in f["message"] for f in line_findings)
+    assert any(finding["check"] == "line: missing end" for finding in line_findings)
+    assert any("never received" in finding["message"] for finding in line_findings)
+    assert all(issue["issue_type"] != "Line Order" for issue in line_result["line_issues"])
 
 
 def test_fix_points_workbench_surfaces_blank_descriptions_with_job_book(win, app, tmp_path):
@@ -814,7 +837,7 @@ def test_a_job_with_no_vocabulary_is_told_the_line_check_cannot_run_and_is_not_f
     dock.run()
     assert dock.result["line_issues"] == []
     assert not [f for f in dock.result["findings"] if f["check"].startswith("line:")]
-    assert "line checks cannot" in dock.banner.text(), "and the banner says which half it ran"
+    assert "whole-line checks run separately" in dock.banner.text(), "and the banner says which run is separate"
 
 
 def test_the_jobs_own_code_table_is_a_vocabulary_like_a_field_book(win, app, tmp_path):
@@ -834,11 +857,20 @@ def test_the_jobs_own_code_table_is_a_vocabulary_like_a_field_book(win, app, tmp
 
     dock = CheckFieldworkDock(win.state, job_root=lambda: None)
     assert dock.code_set == {"toc"}
-    assert "all five checks" in dock.banner.text()
+    assert "Point-error checks are active" in dock.banner.text()
     dock.run()
-    checks = {f["check"] for f in dock.result["findings"]}
+    checks = {finding["check"] for finding in dock.result["findings"]}
     assert "Unknown code" not in checks, "the office's own table is a vocabulary, not a mystery"
-    assert any(c.startswith("line: ") for c in checks), "and the line check could run on it"
+    assert not any(check.startswith("line: missing") for check in checks)
+
+    from plumbline.ui.qa_workspace import FixLineworkDialog
+    linework = FixLineworkDialog(win.state, win)
+    try:
+        assert linework.code_set == {"toc"}
+        assert any(finding.get("check") == "line: missing end"
+                   for finding in linework.active_findings)
+    finally:
+        linework.close()
 
 
 # ------------------------------------------------------------------ the field window's tools
