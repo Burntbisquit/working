@@ -426,6 +426,38 @@ def test_curve_start_before_line_start_is_flagged_when_feature_code_is_unknown()
     assert "LineOrderError" not in line_order_flags("ZZ ST PC").get("17", [])
 
 
+def test_point_check_does_not_reopen_cross_point_order_pairs_after_a_description_fix():
+    from plumbline.core.point_linework_coder import fix_line_command_order
+    from plumbline.core.project import Project
+    from plumbline.fieldwork.bridge import check_project
+
+    project = Project("Line-order refresh")
+    corrected = project.add_point(0, 0, 0, number="1", desc="TOC PC ST")
+    curve_point = project.add_point(1, 0, 0, number="2", desc="TOC PC")
+    start_point = project.add_point(2, 0, 0, number="3", desc="TOC ST")
+
+    first_report = check_project(project, f2f=F2F)
+    first_order = next(finding for finding in first_report["findings"]
+                       if finding.get("flag") == "LineOrderError")
+    assert [first_report["ids"][row] for row in first_order["rows"]] == [corrected.id]
+
+    # The point-level proposal fixes the multi-command description. A sequence-only pair on two
+    # other points must not be merged into this Fix Point Errors finding on the next check.
+    corrected.desc = fix_line_command_order(corrected.desc)
+    project.touch()
+    refreshed = check_project(project, f2f=F2F)
+    assert not any(finding.get("flag") == "LineOrderError" for finding in refreshed["findings"])
+
+    # The independent line-sequence detector still recognizes that cross-point pair; it simply
+    # cannot turn a singleton description into a point-level auto-correction row.
+    cross_point = [issue for issue in LC.detect_line_errors(
+        rows("TOC ST PC", "TOC PC", "TOC ST"), f2f_set=F2F,
+        issue_types={"Line Order"}) if issue.get("issue_type") == "Line Order"]
+    assert [(issue["oid"], "Start Curve appears before Start Line" in issue["detail"])
+            for issue in cross_point] == [("3", True)]
+    assert (curve_point.desc, start_point.desc) == ("TOC PC", "TOC ST")
+
+
 def test_point_order_checks_only_three_pairs_per_code_occurrence():
     from plumbline.core.fieldbook_syntax import command_map
     from plumbline.fieldwork.parse import _validate_line_command_order
@@ -731,6 +763,54 @@ def test_fix_points_owns_valid_multicode_lineorder_findings(win, app, tmp_path):
                              if row["check_key"] == "LineOrderError")
         assert overlap_check["finding_count"] == overlap_check["point_count"] == 2
         assert overlap_check["pids"] == expected_order_points
+    finally:
+        dialog.close()
+
+
+def test_accepting_all_point_line_order_fixes_does_not_create_a_partial_cross_point_flag(
+    win, app, tmp_path
+):
+    from plumbline.fieldwork.io_carlson import write_fwb_file
+    from plumbline.ui.qa_workspace import FixPointErrorsDialog
+
+    project = win.state.project
+    for point in list(project.points.values()):
+        del project.points[point.id]
+    project.settings.pop("fieldbook_file", None)
+    project.settings.pop("f2f_path", None)
+    job_root = tmp_path / "line-order-refresh"
+    book = job_root / "Field Book" / "Refresh.fwb"
+    book.parent.mkdir(parents=True)
+    assert write_fwb_file(
+        book,
+        ["Code", "Description", "Symbol", "Layer", "Entity Type", "Category"],
+        [["TOC", "Top of curb", "", "ROAD", "Line", "Road"]],
+    )
+    win._job_root_choice = job_root
+
+    correct_first = project.add_point(100, 200, 5, number="9201", desc="TOC PC ST")
+    correct_second = project.add_point(101, 201, 5, number="9202", desc="TOC PC ST")
+    curve_point = project.add_point(102, 202, 5, number="9203", desc="TOC PC")
+    start_point = project.add_point(103, 203, 5, number="9204", desc="TOC ST")
+
+    dialog = FixPointErrorsDialog(win.state, win)
+    try:
+        finding = next(item for item in dialog.active_findings
+                       if item.get("check") == "Line command order")
+        assert finding["pids"] == [correct_first.id, correct_second.id]
+        dialog._open_inline_editor(finding)
+        assert len(dialog.sep_corrections) == 2
+        assert all(item[3].currentText() == "Correct" for item in dialog.sep_corrections)
+        assert dialog._action_apply_current_issue_changes(return_to_summary=True)
+
+        assert correct_first.desc == "TOC ST PC"
+        assert correct_second.desc == "TOC ST PC"
+        assert (curve_point.desc, start_point.desc) == ("TOC PC", "TOC ST")
+        remaining_order = [item for item in dialog.active_findings
+                           if item.get("check") == "Line command order"
+                           and not item.get("zero_check")
+                           and item.get("status") != "resolved"]
+        assert remaining_order == []
     finally:
         dialog.close()
 

@@ -959,7 +959,7 @@ def write_report(path, rows) -> bool:
 # edits project.settings, but does not change any input that affects the QA result. A stable content
 # signature is also stored with saved reports so reopening a project can flag an unverified/stale run.
 # Bump this token when check semantics change, so an older stored report is not certified current.
-_CHECK_INPUT_SIGNATURE_VERSION = "fieldwork-check-v2"
+_CHECK_INPUT_SIGNATURE_VERSION = "fieldwork-check-v3"
 _CHECK_PROJECT_CACHE = weakref.WeakKeyDictionary()
 _CHECK_PROJECT_CACHE_LOCK = threading.RLock()
 
@@ -1143,8 +1143,9 @@ def check_project(project, f2f=None, fieldbook_path=None, ne_tol: float | None =
     *f2f* is the Field Book's code set and *fieldbook_path* is its source (also used to read the
     active command meanings). Without a code vocabulary, non-empty code descriptions are not
     classified as unknown; genuinely blank descriptions still surface. Line-command order remains
-    here by design because the user directed it to Fix Point Errors; other line errors run through
-    :func:`check_linework_project` and its independent cache.
+    here by design because the user directed it to Fix Point Errors, but it is checked within each
+    description/code section so every row is actionable in that workflow. Other line errors run
+    through :func:`check_linework_project` and its independent cache.
 
     Returns point findings plus ``rows``, ``ids``, ``stats`` and ``flags``. Row indices in a finding
     index into ``rows``; ``ids[i]`` is the project point the i-th row came from.
@@ -1168,10 +1169,13 @@ def check_project(project, f2f=None, fieldbook_path=None, ne_tol: float | None =
     # Blank descriptions are checked even without a code table; describe_flags deliberately
     # leaves non-empty text alone when no vocabulary is available.
     flags = describe_flags(rows, f2f, fieldbook_path=fieldbook_path)
-    # The point-error run checks command order within each description and across the line's
-    # same-code point sequence. Those two detector passes are combined into one visible finding
-    # below; row-level multicode groups are still checked independently without mixing codes.
-    # Other line-sequence checks run separately.
+    order_details = {}
+    # Point-error Line command order is description-level: the correction in Fix Point Errors
+    # reorders commands within one point's code section. A pair split across separate point
+    # descriptions belongs to whole-line review and must not be merged into this actionable
+    # finding; doing so can make the next cross-point pair appear as a new, uncorrectable row
+    # after an otherwise successful correction. Row-level multicode groups are checked
+    # independently without mixing codes. Other line-sequence checks run separately.
     if f2f or fieldbook_path:
         try:
             order_flags = P._validate_line_command_order(rows, f2f, fieldbook_path=fieldbook_path)
@@ -1228,11 +1232,13 @@ def check_project(project, f2f=None, fieldbook_path=None, ne_tol: float | None =
             i = oid_to_row.get(str(oid))
             for flag in parsed.get("flags") or ["Description"]:
                 name = str(flag).split(":")[0]
-                rec = by_flag.setdefault(name, {"rows": set(), "sample": ""})
+                rec = by_flag.setdefault(name, {"rows": set(), "sample": "", "details": []})
                 if i is not None:
                     rec["rows"].add(i)
                 if not rec["sample"]:
                     rec["sample"] = str(parsed.get("raw", "") or "")
+                if name == "LineOrderError":
+                    rec["details"].extend(order_details.get(str(oid), []) or [])
         flag_rows = sorted(by_flag.items(), key=lambda kv: (-len(kv[1]["rows"]), kv[0]))
         common_errors = [item for item in flag_rows if item[0] == "CommonConversionError"]
         if common_errors:
@@ -1245,10 +1251,23 @@ def check_project(project, f2f=None, fieldbook_path=None, ne_tol: float | None =
             lvl = "error" if name in {
                 "UnknownCode", "OrphanCommand", "SeparatorSpacingError", "LineOrderError"
             } else "warn"
+            if name == "LineOrderError":
+                message = (
+                    f"{len(rec['rows'])} description(s) flagged {title.lower()}. "
+                    "Only Start Curve before Start Line, End Line before End Curve, or "
+                    "Close before End Curve are checked.")
+                if rec["details"]:
+                    message += f" Example: {rec['details'][0]}."
+                elif rec["sample"]:
+                    message += f" Example description: {rec['sample']!r}."
+            else:
+                message = f"{len(rec['rows'])} description(s) flagged {title.lower()}"
+                if rec["sample"]:
+                    message += f" (e.g. {rec['sample']!r})"
+                message += "."
             out["findings"].append({
                 "level": lvl, "check": title, "flag": name, "rows": sorted(rec["rows"]),
-                "message": f"{len(rec['rows'])} description(s) flagged {title.lower()}"
-                           + (f" (e.g. {rec['sample']!r})" if rec["sample"] else "") + "."})
+                "message": message})
     out["flags"] = flags
 
     # Control comparisons use the project's standard Control/Control Points.csv (or imported
@@ -1271,51 +1290,11 @@ def check_project(project, f2f=None, fieldbook_path=None, ne_tol: float | None =
                         + (f" (for example, point(s) {examples})" if examples else "") + "."),
         })
 
-    # Line command order is the one line-oriented exception owned by the point-error system.
-    # Run only that existing check here; line completeness/curve errors stay exclusively in the
-    # separate linework run and cache.
-    out["line_issues"] = []  # compatibility field: point results never contain line-error rows
-    if f2f or fieldbook_path:
-        try:
-            order_issues = LC.detect_line_errors(
-                rows, fieldbook_path=fieldbook_path, f2f_set=f2f,
-                issue_types={"Line Order"})
-        except Exception as ex:                      # a check must never break the window
-            out["line_order_error"] = str(ex)
-            order_issues = []
-        if order_issues:
-            order_rows = set()
-            samples = []
-            for issue in order_issues:
-                row_index = oid_to_row.get(str(issue.get("oid", "")))
-                if row_index is not None:
-                    order_rows.add(row_index)
-                if len(samples) < 2:
-                    samples.append(str(issue.get("detail", "")))
-            if order_rows:
-                line_order_flag = LC.ISSUE_FLAGS["Line Order"]
-                point_finding = next((finding for finding in out["findings"]
-                                      if str(finding.get("flag", "")) == line_order_flag), None)
-                merged_rows = set(order_rows)
-                if point_finding is not None:
-                    merged_rows.update(point_finding.get("rows", []) or [])
-                message = (
-                    f"{len(merged_rows)} point(s) have line commands out of order. "
-                    "Only Start Curve before Start Line, End Line before End Curve, or "
-                    "Close before End Curve are flagged.")
-                if samples:
-                    message += f" Example: {samples[0]}"
-                if point_finding is not None:
-                    point_finding["rows"] = sorted(merged_rows)
-                    point_finding["message"] = message
-                    point_finding["sequence_details"] = list(dict.fromkeys(samples))
-                else:
-                    out["findings"].append({
-                        "level": "error", "check": "Line command order",
-                        "flag": line_order_flag, "rows": sorted(merged_rows),
-                        "message": message,
-                        "sequence_details": list(dict.fromkeys(samples)),
-                    })
+    # Line command order comes from the point-description parser above. Do not append
+    # cross-point sequence findings here: Fix Point Errors can safely reorder commands only
+    # inside one description/code section. `line_issues` remains an empty compatibility field;
+    # line-sequence checks and their cache stay separate.
+    out["line_issues"] = []
     if not out["findings"]:
         out["findings"].append({"level": "info", "check": "ok", "rows": [],
                                 "message": "No problems found in the field data."})
