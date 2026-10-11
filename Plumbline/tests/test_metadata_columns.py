@@ -274,15 +274,33 @@ def test_the_dock_finds_a_duplicate_number_and_selects_the_points_it_names(win, 
     assert win.state.sel_points == set(ids), "clicking a finding selects those points in the drawing"
 
 
-def test_the_dock_says_when_the_check_is_out_of_date(win, app, auto):
+def test_the_dock_says_when_the_check_is_out_of_date_and_button_forces_a_rerun(
+        win, app, auto, monkeypatch):
     from plumbline.ui.check_dock import CheckFieldworkDock
+
+    calls = []
+    real_check = FB.check_project
+
+    def counted_check(*args, **kwargs):
+        calls.append(1)
+        return real_check(*args, **kwargs)
+
+    monkeypatch.setattr(FB, "check_project", counted_check)
     dock = CheckFieldworkDock(win.state, job_root=win._job_folder)
-    dock.run()
+    dock.run(store=False)
+    count_after_check = len(calls)
+    dock.run(store=False)
+    assert len(calls) == count_after_check, "automatic unchanged-input checks reuse the cache"
+
     win.state.changed.emit({"points"})
     pump(app, 2)
     assert dock.btn_run.text().endswith("*")
-    dock.run()
+    dock.run(store=False)
     assert not dock.btn_run.text().endswith("*")
+
+    dock.alert_if_no_fieldbook = lambda: None  # Avoid a modal vocabulary prompt in this button test.
+    dock.btn_run.click()
+    assert len(calls) == count_after_check + 1, "the explicit Run button computes and refreshes the cache"
 
 
 def _write_fieldbook(path: Path, codes):

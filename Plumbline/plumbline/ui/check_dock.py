@@ -516,7 +516,7 @@ class CheckFieldworkDock(QWidget):
                                  "the job's Reports folder when the job has one.")
         row.addWidget(self.btn_save)
         self.btn_workbench.clicked.connect(self.open_workbench)
-        self.btn_run.clicked.connect(lambda *_: self.run(alert=True))
+        self.btn_run.clicked.connect(lambda *_: self.run(alert=True, force=True))
         self.btn_autofix.clicked.connect(self.auto_fix)
         self.btn_save.clicked.connect(self.save_report)
         self.btn_book.clicked.connect(self.choose_field_book)
@@ -626,20 +626,22 @@ class CheckFieldworkDock(QWidget):
             self.banner.set(f"No field book, but this job's {n:,} feature codes are the vocabulary "
                             f"({v['label']}) - all five checks run.", "info")
 
-    def choose_field_book(self):
+    def choose_field_book(self, _checked=False, *, run_check: bool = True):
         from .fieldbook_dialog import FieldBookDialog
         dlg = FieldBookDialog(self.state, self)
         dlg.exec()
         self.refresh_banner()
-        self.run()
+        if run_check:
+            self.run()
 
-    def build_code_table(self):
+    def build_code_table(self, _checked=False, *, run_check: bool = True):
         """Hand off to the window's own Convert Field to Finish, then re-check with its codes."""
         from .fieldbook_dialog import FieldBookDialog
         dlg = FieldBookDialog(self.state, self)
         dlg.action_convert()
         self.refresh_banner()
-        self.run()
+        if run_check:
+            self.run()
 
     def alert_if_no_fieldbook(self):
         """Say it once, in a box, when a check is run on a job without a vocabulary.
@@ -666,11 +668,11 @@ class CheckFieldworkDock(QWidget):
         m.setDefaultButton(b_pick)
         m.exec()
         if m.clickedButton() is b_pick:
-            self.choose_field_book()
+            self.choose_field_book(run_check=False)
         elif m.clickedButton() is b_conv:
-            self.build_code_table()
+            self.build_code_table(run_check=False)
         elif m.clickedButton() is b_later:
-            self.run()
+            pass  # The outer run() continues with the checks that do not need a code table.
 
     def _no_field_points(self) -> bool:
         from ..fieldwork import bridge as FB
@@ -687,20 +689,24 @@ class CheckFieldworkDock(QWidget):
             self.run(store=False)
 
     def _changed(self, kinds=None):
-        """Something in the drawing moved: say the check is out of date, do not re-run by itself."""
+        """Flag the displayed run as stale; never silently leave old findings looking current."""
         if self.result is None or self._stale:
             return
         self._stale = True
-        self.btn_run.setText("Run the Check *")
-        self.btn_run.setToolTip("The drawing has changed since this check was run")
+        self.btn_run.setText("Update Check *")
+        self.btn_run.setToolTip("QA inputs changed since this check. Click to compute a fresh check "
+                                "and update the cache.")
+        current = self.lbl_when.text().split("  |  Inputs changed", 1)[0]
+        self.lbl_when.setText(current + "  |  Inputs changed; update the check.")
 
-    def run(self, alert: bool = False, store: bool = True):
+    def run(self, alert: bool = False, store: bool = True, force: bool = False):
         """Run the field-data checks and show the findings.
 
         *alert* is set from the Run button: with no vocabulary loaded the check can only do half
-        its job, and that is the moment to say so in a box rather than in a strip.  *store* is
-        False for a run nobody asked for (the one that fills the dock when a project is opened),
-        because a window that dirties a project on sight is a window that loses trust.
+        its job, and that is the moment to say so in a box rather than in a strip. *force* is for an
+        explicit rerun; automatic refreshes reuse a result only when the complete QA-input
+        signature still matches. *store* is False for a run nobody asked for (the one that fills
+        the dock when a project is opened), because opening a window must not dirty the project.
         """
         from ..fieldwork import bridge as FB
 
@@ -710,8 +716,9 @@ class CheckFieldworkDock(QWidget):
         book = self.fieldbook()
         v = getattr(self, "_vocabulary", None) or self.vocabulary()
         try:
-            self.result = FB.check_project(self.state.project, f2f=self.code_set,
-                                           fieldbook_path=book or (v.get("path") or None))
+            self.result, cache_status, input_signature = FB.check_project_cached(
+                self.state.project, f2f=self.code_set,
+                fieldbook_path=book or (v.get("path") or None), force=force)
         except Exception as ex:                          # a check must never break the window
             self.banner.set(f"The check could not run: {ex}", "bad")
             self.state.log(f"Check fieldwork could not run: {ex}", "warn")
@@ -720,19 +727,24 @@ class CheckFieldworkDock(QWidget):
         # there, with what it found, when it ran and which vocabulary it used.  It goes inside an
         # edit so it is undoable and so the project knows it has changed.
         if store:
-            self._store(v)
+            self._store(v, input_signature)
         self._stale = False
         self.btn_run.setText("Run the Check")
-        self.btn_run.setToolTip("")
+        self.btn_run.setToolTip("Force a fresh check now; automatic refreshes reuse results only "
+                                "when QA inputs are unchanged.")
         self._fill_table()
         findings = self.result["findings"]
         stats = self.result["stats"] or {}
         points = stats.get("rows", 0)
         crews = stats.get("crews") or []
         line_count = len(self.result.get("line_issues") or [])
+        cache_note = {"hit": "cached inputs unchanged", "updated": "refreshed after input changes",
+                      "rerun": "freshly recomputed"}.get(
+                          cache_status, "freshly computed" if force else "")
         self.lbl_when.setText(f"{points:,} point(s) in the check"
                               + (f", crews {', '.join(str(c) for c in crews)}" if crews else "")
-                              + (f", {line_count} line issue(s)" if line_count else ""))
+                              + (f", {line_count} line issue(s)" if line_count else "")
+                              + (f"  |  {cache_note}" if cache_note else ""))
         errors = sum(1 for f in findings if f["level"] == "error")
         warns = sum(1 for f in findings if f["level"] == "warn")
         self.state.log(f"Check fieldwork: {points:,} field point(s), {len(findings)} finding(s)"
@@ -740,13 +752,13 @@ class CheckFieldworkDock(QWidget):
                        + ".  " + PROV.summary(self.state.project), "warn" if errors else "ok")
 
     # --------------------------------------------------------------------- the audit trail
-    def _store(self, vocabulary: dict):
-        """Save this run on the project, and write the same run beside the job when there is one."""
+    def _store(self, vocabulary: dict, input_signature: str | None = None):
+        """Save this run, its verified inputs and the same report beside the job when available."""
         from ..fieldwork import bridge as FB
         try:
             with self.state.edit("Run the Check"):
                 payload = FB.store_report(self.state.project, self.result, vocabulary=vocabulary,
-                                          job_root=self.job_root())
+                                          job_root=self.job_root(), input_signature=input_signature)
                 path = None
                 root = self.job_root()
                 if root:
@@ -783,6 +795,17 @@ class CheckFieldworkDock(QWidget):
             return False
         from ..fieldwork import bridge as FB
         rows, ids = FB.working_rows_from_project(self.state.project)
+        vocabulary = getattr(self, "_vocabulary", None) or self.vocabulary()
+        book = self.fieldbook()
+        saved_signature = payload.get("input_signature")
+        try:
+            current_signature = FB.check_input_signature(
+                self.state.project, f2f=self.code_set,
+                fieldbook_path=book or (vocabulary.get("path") or None),
+                _prepared_rows=(rows, ids))
+        except Exception:
+            current_signature = None
+        signature_matches = bool(saved_signature and current_signature == saved_signature)
         id_to_row = {pid: i for i, pid in enumerate(ids)}
         findings = []
         for f in payload.get("findings") or []:
@@ -793,9 +816,18 @@ class CheckFieldworkDock(QWidget):
         self.result = {"rows": rows, "ids": ids, "findings": findings, "stats": {}, "flags": {},
                        "code_checks": payload.get("vocabulary") not in ("none", "", None),
                        "line_issues": [], "stored": payload}
-        self._stale = False
-        self.btn_run.setText("Run the Check")
-        self.btn_run.setToolTip("")
+        self._stale = not signature_matches or bool(self.state.dirty)
+        self.btn_run.setText("Update Check *" if self._stale else "Run the Check")
+        if self._stale:
+            if signature_matches and self.state.dirty:
+                self.btn_run.setToolTip("The project has unsaved changes. Click to compute a fresh check "
+                                        "and update the cache.")
+            else:
+                self.btn_run.setToolTip("The saved check is unverified or its QA inputs changed. "
+                                        "Click to compute a fresh check and update the cache.")
+        else:
+            self.btn_run.setToolTip("Force a fresh check now; automatic refreshes reuse results only "
+                                "when QA inputs are unchanged.")
         self._fill_table()
         when = payload.get("when", "")
         vocab = payload.get("vocabulary_label") or payload.get("vocabulary", "")
@@ -805,8 +837,14 @@ class CheckFieldworkDock(QWidget):
                               f"{len(findings)} finding(s){extra}"
                               + (f", vocabulary {vocab}" if vocab else "")
                               + (f"  |  {Path(payload['file']).name}" if payload.get("file") else ""))
-        if self.state.dirty:
-            self.lbl_when.setText(self.lbl_when.text() + "  (the drawing has changed since)")
+        if not saved_signature:
+            self.lbl_when.setText(self.lbl_when.text() + "  |  Older report: QA inputs were not "
+                                  "fingerprinted; update check to verify.")
+        elif not signature_matches:
+            self.lbl_when.setText(self.lbl_when.text() + "  |  QA inputs changed since this run; "
+                                  "update the check.")
+        elif self.state.dirty:
+            self.lbl_when.setText(self.lbl_when.text() + "  |  The project has unsaved changes.")
         return True
 
     def _fill_table(self):

@@ -37,11 +37,16 @@ Design rules carried over from Fieldwork Manager (do not "improve" these)
 """
 from __future__ import annotations
 
+import copy
 import csv
 import csv as _csv
+import hashlib
+import json
 import math
 import re
 import tempfile
+import threading
+import weakref
 from collections import Counter, OrderedDict
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
@@ -854,7 +859,7 @@ def vocabulary_for(project, job_root=None, fieldbook=None) -> dict:
 
 
 def store_report(project, result: dict, *, vocabulary: dict | None = None, job_root=None,
-                 note: str = "") -> dict:
+                 note: str = "", input_signature: str | None = None) -> dict:
     """Write the run into the project, so reopening the project reopens the check (item 13).
 
     Stored on the project - not only in a file - because the project is what is reopened, and a
@@ -885,6 +890,8 @@ def store_report(project, result: dict, *, vocabulary: dict | None = None, job_r
                "warnings": sum(1 for f in findings if f["level"] == "warn"),
                "vocabulary": vocab.get("source", "none"), "vocabulary_label": vocab.get("label", ""),
                "vocabulary_codes": len(vocab.get("codes") or ()), "note": note}
+    if input_signature:
+        payload["input_signature"] = str(input_signature)
     project.settings[REPORT_KEY] = payload
     return payload
 
@@ -946,6 +953,150 @@ def write_report(path, rows) -> bool:
     """Write a unified ``.fwc`` (``True`` on success).  The file is optional; the project is not."""
     from . import io_carlson as ICO
     return ICO.write_unified_report(Path(path), rows)
+
+
+# The in-memory result cache is intentionally separate from Project.revision: storing a report
+# edits project.settings, but does not change any input that affects the QA result. A stable content
+# signature is also stored with saved reports so reopening a project can flag an unverified/stale run.
+# Bump this token when check semantics change, so an older stored report is not certified current.
+_CHECK_INPUT_SIGNATURE_VERSION = "fieldwork-check-v1"
+_CHECK_PROJECT_CACHE = weakref.WeakKeyDictionary()
+_CHECK_PROJECT_CACHE_LOCK = threading.RLock()
+
+
+def _file_content_signature(path) -> dict | None:
+    """Fingerprint the exact bytes of an external QA input, not just its mtime or size."""
+    if not path:
+        return None
+    candidate = Path(path).expanduser()
+    original_path = str(candidate)
+    try:
+        resolved_path = str(candidate.resolve(strict=False))
+    except (OSError, RuntimeError, ValueError):
+        resolved_path = original_path
+    digest = hashlib.blake2b(digest_size=20)
+    try:
+        with candidate.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as ex:
+        return {"path": original_path, "resolved_path": resolved_path,
+                "content": None, "error": type(ex).__name__}
+    return {"path": original_path, "resolved_path": resolved_path,
+            "content": digest.hexdigest()}
+
+
+def _crs_signature(project) -> dict | str:
+    crs = getattr(project, "crs", None)
+    to_dict = getattr(crs, "to_dict", None)
+    try:
+        return to_dict() if callable(to_dict) else repr(crs)
+    except Exception:
+        return repr(crs)
+
+
+def check_input_signature(project, f2f=None, fieldbook_path=None, ne_tol: float | None = None,
+                          elev_tol: float | None = None, control_file=None, *,
+                          _prepared_rows=None) -> str:
+    """Return a deterministic fingerprint of every input used by :func:`check_project`.
+
+    It deliberately excludes Project.revision and the stored QA report: writing a report is not a
+    QA input. Point rows retain their project order because it carries line-command sequence, and
+    exact external file content is hashed so same-size edits with preserved timestamps invalidate
+    the result too.
+    """
+    rows, ids = _prepared_rows or working_rows_from_project(project)
+    control_path = _control_file_path(project, control_file)
+    control_points = []
+    for point in REF.reference_points(project, "control"):
+        control_points.append((point.id, str(point.number), point.x, point.y, point.z,
+                               str(point.desc or ""), str(point.layer or "")))
+    deleted_oids = sorted(
+        str((getattr(point, "attrs", None) or {}).get("fieldwork_oid") or pid)
+        for pid, point in project.points.items() if _point_is_deleted(point)
+    )
+    try:
+        active_commands = sorted({str(command).casefold() for command in F.get_command_set(fieldbook_path)})
+    except Exception:
+        active_commands = sorted({str(command).casefold() for command in F.COMMAND_SET})
+    try:
+        command_map = F.get_command_map(fieldbook_path)
+    except Exception:
+        command_map = {}
+    from ..core.fieldbook_syntax import spacing_preference
+    separator_spacing = {
+        "multicode": spacing_preference("space_around_multicode_separator"),
+        "description": spacing_preference("space_around_description_separator"),
+    }
+    crs = _crs_signature(project)
+    payload = {
+        "version": _CHECK_INPUT_SIGNATURE_VERSION,
+        "rows": rows,
+        "ids": ids,
+        "deleted_oids": deleted_oids,
+        "control_points": control_points,
+        "fieldbook": _file_content_signature(fieldbook_path),
+        "control_file": _file_content_signature(control_path),
+        "control_tolerance": _control_tolerance(),
+        "near_tolerance": ne_tol or F.NE_TOLERANCE,
+        "elevation_tolerance": elev_tol or F.ELEV_TOLERANCE,
+        "f2f_codes": sorted({str(code) for code in (f2f or ())},
+                             key=lambda code: (code.casefold(), code)),
+        "active_commands": active_commands,
+        "command_map": command_map,
+        "separator_spacing": separator_spacing,
+        "crs": crs,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                         default=str, allow_nan=True).encode("utf-8")
+    return hashlib.blake2b(encoded, digest_size=24).hexdigest()
+
+
+def clear_check_cache(project=None) -> None:
+    """Clear cached QA results (all projects, or one project); primarily useful to tests/tools."""
+    with _CHECK_PROJECT_CACHE_LOCK:
+        if project is None:
+            _CHECK_PROJECT_CACHE.clear()
+        else:
+            _CHECK_PROJECT_CACHE.pop(project, None)
+
+
+def check_project_cached(project, f2f=None, fieldbook_path=None, ne_tol: float | None = None,
+                         elev_tol: float | None = None, control_file=None, *,
+                         force: bool = False) -> tuple[dict, str, str]:
+    """Run or reuse a check; return ``(result, cache_status, input_signature)``.
+
+    Status is ``hit`` when exact inputs match, ``miss`` when the project has no cached run,
+    ``updated`` when changed inputs replaced an earlier result, or ``rerun`` when ``force`` asks
+    for a fresh computation despite a matching signature. The cached raw result is never handed to
+    callers: the QA Workbench decorates findings for display, so each caller gets an isolated copy.
+    """
+    rows, ids = working_rows_from_project(project)
+    prepared = (rows, ids)
+    signature = check_input_signature(project, f2f=f2f, fieldbook_path=fieldbook_path,
+                                      ne_tol=ne_tol, elev_tol=elev_tol, control_file=control_file,
+                                      _prepared_rows=prepared)
+    with _CHECK_PROJECT_CACHE_LOCK:
+        previous = _CHECK_PROJECT_CACHE.get(project)
+    if previous is not None and previous[0] == signature and not force:
+        return copy.deepcopy(previous[1]), "hit", signature
+
+    check_kwargs = {"f2f": f2f, "fieldbook_path": fieldbook_path, "ne_tol": ne_tol}
+    if elev_tol is not None:
+        check_kwargs["elev_tol"] = elev_tol
+    if control_file is not None:
+        check_kwargs["control_file"] = control_file
+    result = check_project(project, **check_kwargs)
+    cached_result = copy.deepcopy(result)
+    with _CHECK_PROJECT_CACHE_LOCK:
+        _CHECK_PROJECT_CACHE[project] = (signature, cached_result)
+    if previous is None:
+        status = "miss"
+    elif previous[0] == signature:
+        status = "rerun"
+    else:
+        status = "updated"
+    return result, status, signature
 
 
 def check_project(project, f2f=None, fieldbook_path=None, ne_tol: float | None = None,
@@ -1137,5 +1288,6 @@ __all__ = [
     "run_checks", "describe_flags", "summarise", "line_issues",
     "feature_codes_from_f2f", "f2f_code_set", "write_fieldbook_from_f2f",
     "batch_from_rows", "apply_rows_to_project",
-    "working_rows_from_project", "check_project", "fieldwork_set",
+    "working_rows_from_project", "check_project", "check_project_cached",
+    "check_input_signature", "clear_check_cache", "fieldwork_set",
 ]

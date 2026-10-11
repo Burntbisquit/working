@@ -1174,8 +1174,7 @@ class BaseQAWorkbenchWindow(QMainWindow):
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setSizes([560, 790])
 
-        # Initial run
-        self._refresh_vocabulary()
+        # Initial run also refreshes vocabulary before computing/cache-keying the results.
         self.run_check()
         self._sync_view_flags()
 
@@ -1455,15 +1454,20 @@ class BaseQAWorkbenchWindow(QMainWindow):
             })
         return entries
 
-    def run_check(self):
+    def run_check(self, *, force: bool = False):
         pr = self.state.project
         from ..fieldwork import bridge as FB
+        # Re-read the active Field Book/vocabulary before keying the result; an external book edit
+        # must both invalidate the cache and affect the check that replaces it.
+        self._refresh_vocabulary()
         ne_tol = getattr(self, "close_tol", 0.05)
-        self.result = FB.check_project(pr, f2f=self.code_set,
-                                       fieldbook_path=self.fieldbook_path or None,
-                                       ne_tol=ne_tol)
+        self.result, cache_status, _signature = FB.check_project_cached(
+            pr, f2f=self.code_set, fieldbook_path=self.fieldbook_path or None,
+            ne_tol=ne_tol, force=force)
         self._populate_findings()
         self._sync_view_flags()
+        if cache_status == "updated" and hasattr(self, "lbl_status"):
+            self.lbl_status.setText("QA inputs changed; the cached check was refreshed.")
 
     def _populate_findings(self):
         if not hasattr(self, "result") or not self.result:
