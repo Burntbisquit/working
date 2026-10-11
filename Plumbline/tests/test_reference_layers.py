@@ -370,6 +370,7 @@ def test_reference_folder_dialog_lists_and_filters_csvs(tmp_path, qapp):
 
 
 def test_field_data_import_is_staged_and_same_size_files_are_greyed(tmp_path, qapp):
+    from PySide6.QtCore import Qt
     from plumbline.ui.app_state import AppState
     from plumbline.ui.import_export import Importer, ReferenceFolderDialog
 
@@ -398,7 +399,19 @@ def test_field_data_import_is_staged_and_same_size_files_are_greyed(tmp_path, qa
     dlg = ReferenceFolderDialog(state, source_root, None, field_data_only=True)
     assert dlg._imported_flags == [True]
     assert dlg._checkboxes[0].isEnabled() is False
+    assert dlg.chk_table.cellWidget(0, 0).isEnabled() is False
+    assert all(not (dlg.chk_table.item(0, col).flags() & Qt.ItemFlag.ItemIsEnabled)
+               for col in range(1, 4))
     assert dlg.selected_files() == []
+
+    # The disabled/grey state survives save and reopen, and also matches the packaged Field Data copy.
+    state.project.save()
+    reopened_state = AppState(Project.load(state.project.path))
+    reopened_dlg = ReferenceFolderDialog(reopened_state, source_root, None, field_data_only=True)
+    assert reopened_dlg._imported_flags == [True]
+    stored_dlg = ReferenceFolderDialog(
+        state, job_root / "Field Data", None, field_data_only=True)
+    assert stored_dlg._imported_flags == [True]
 
     source.write_bytes(source.read_bytes() + b"\n")
     dlg._refresh_files()
@@ -410,6 +423,42 @@ def test_field_data_import_is_staged_and_same_size_files_are_greyed(tmp_path, qa
     assert state.undo().startswith("Import points")
     assert not state.project.points
     assert state.project.settings.get("field_data_imports", []) == []
+
+
+def test_first_field_data_import_resolves_job_root_after_save_as(tmp_path, qapp):
+    from plumbline.ui.app_state import AppState
+    from plumbline.ui.import_export import Importer, ReferenceFolderDialog
+
+    source_root = tmp_path / "Downloads" / "First Import"
+    source_root.mkdir(parents=True)
+    source = _csv(source_root / "survey.csv", [(8, BASE_N + 8, BASE_E + 8, 508.0, "EP")])
+    job_root = tmp_path / "Saved Job"
+    state = AppState(Project("Untitled", C.ProjectCRS.from_key(6584)))
+
+    def _save_as_before_edit():
+        job_root.mkdir()
+        state.project.path = str(job_root / "Saved Job.plb")
+        return True
+
+    state._save_untitled_before_edit = _save_as_before_edit
+
+    class _Win:
+        def __init__(self, app_state):
+            self.state = app_state
+
+        def _job_folder(self):
+            path = self.state.project.path
+            return Path(path).parent if path else None
+
+    tally = Importer(_Win(state)).import_reference_folder(
+        source_root, None, recursive=True, selected_files=[source])
+    stored = job_root / "Field Data" / source.name
+    assert tally["points"] == 1 and stored.is_file()
+    assert len(state.project.settings["field_data_imports"]) == 1
+
+    dlg = ReferenceFolderDialog(state, source_root, None, field_data_only=True)
+    assert dlg._imported_flags == [True]
+    assert dlg.selected_files() == []
 
 
 def test_folder_points_preview_dialog(tmp_path, qapp):

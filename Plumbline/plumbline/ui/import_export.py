@@ -921,8 +921,6 @@ class Importer:
         """
         source_root = Path(folder)
         files = reference_folder_files(source_root, recursive) if selected_files is None else list(selected_files)
-        job_root = self._job_folder()
-        field_root = Path(job_root) / "Field Data" if role is None and job_root else None
         tally = dict(files=0, points=0, duplicates=0, skipped=0, failed=0, unreadable=[])
         for source_file in files:
             source_file = Path(source_file)
@@ -940,19 +938,27 @@ class Importer:
                 continue
 
             try:
-                stored_file = (self._stage_field_data_file(source_file, source_root, field_root)
-                               if field_root is not None else source_file)
                 plan = ImportPlan(reference_role=role, dup_policy="renumber")
                 label = (f"{REF.label_for(role)} points ({source_file.name})" if role
                          else f"points ({source_file.name})")
-                if field_root is not None:
-                    # Keep the copied-file manifest in the same undo snapshot as its points.
+                if role is None:
+                    # Let the edit transaction finish Save As first.  An Untitled project has no
+                    # job root yet, so computing Field Data/ before entering this block silently
+                    # skipped both the package copy and the manifest for its first folder import.
                     with self.state.edit(f"Import {label}"):
-                        stats = apply_import(self.state, batch, plan, label, stored_file, job_root=job_root)
+                        job_root = self._job_folder()
+                        field_root = Path(job_root) / "Field Data" if job_root else None
+                        stored_file = (self._stage_field_data_file(source_file, source_root, field_root)
+                                       if field_root is not None else source_file)
+                        stats = apply_import(self.state, batch, plan, label, stored_file,
+                                             job_root=job_root)
                         if stats.get("points", 0):
-                            self._remember_field_data_file(source_root, source_file, field_root, stored_file)
+                            self._remember_field_data_file(
+                                source_root, source_file, field_root, stored_file)
                 else:
-                    stats = apply_import(self.state, batch, plan, label, stored_file, job_root=job_root)
+                    job_root = self._job_folder()
+                    stats = apply_import(self.state, batch, plan, label, source_file,
+                                         job_root=job_root)
             except Exception as ex:
                 tally["failed"] += 1
                 tally["unreadable"].append((source_file.name, str(ex)))
@@ -1004,10 +1010,21 @@ class Importer:
         return destination
 
     def _remember_field_data_file(self, source_root: Path, source_file: Path,
-                                  field_root: Path, stored_file: Path):
-        """Add one file to the portable manifest inside its point-import undo transaction."""
+                                  field_root: Path | None, stored_file: Path):
+        """Add one file to the manifest inside its point-import undo transaction."""
         try:
-            record = FD.make_import_record(source_root, source_file, field_root, stored_file)
+            if field_root is not None:
+                record = FD.make_import_record(source_root, source_file, field_root, stored_file)
+                data_folder = field_root
+            else:
+                # Keep identity even if this state has no package root yet.  The source-relative
+                # key is enough to suppress a repeat scan of the same selected folder.
+                record = {
+                    "source_relative": FD.relative_file_key(source_root, source_file),
+                    "stored_relative": "",
+                    "size": int(Path(source_file).stat().st_size),
+                }
+                data_folder = source_root
         except OSError as ex:
             self.state.log(f"Could not record field-data file {source_file.name}: {ex}", "warn")
             return
@@ -1024,7 +1041,7 @@ class Importer:
             records.append(record)
         pr.settings["field_data_imports"] = records
         pr.settings["field_data_source_folder"] = str(source_root.expanduser())
-        pr.settings["data_folder"] = str(field_root)
+        pr.settings["data_folder"] = str(data_folder)
 
     def record_reference_folder(self, folder, role: str | None, tally: dict):
         """Keep lightweight folder history; per-file manifests share their point-import undo."""
@@ -1302,10 +1319,13 @@ class ReferenceFolderDialog(FormDialog):
             chk = QCheckBox()
             chk.setChecked(not already_imported)
             chk.setEnabled(not already_imported)
+            if already_imported:
+                chk.setToolTip("Already imported: matching relative path and file size")
             chk.toggled.connect(self._update_count)
             self._checkboxes.append(chk)
             self._imported_flags.append(already_imported)
             chk_widget = QWidget()
+            chk_widget.setEnabled(not already_imported)
             chk_lay = QHBoxLayout(chk_widget)
             chk_lay.addWidget(chk)
             chk_lay.setAlignment(Qt.AlignCenter)
@@ -1324,9 +1344,12 @@ class ReferenceFolderDialog(FormDialog):
             items[2].setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             for column, item in enumerate(items, start=1):
                 if already_imported:
-                    item.setForeground(QColor("#888888"))
+                    item.setForeground(QColor(theme.colors()["dim"]))
+                    item.setBackground(QColor(theme.colors()["alt"]))
                     item.setToolTip("Already imported: matching relative path and file size")
-                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+                    disabled_flags = (Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                                      | Qt.ItemFlag.ItemIsEditable)
+                    item.setFlags(item.flags() & ~disabled_flags)
                 self.chk_table.setItem(row, column, item)
 
         available = sum(1 for chk in self._checkboxes if chk.isEnabled())
