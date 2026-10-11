@@ -130,6 +130,81 @@ def test_opening_an_unassigned_project_asks_for_crs_before_field_data_route(win,
     assert events == ["CRS", "Field Book", ("route", "existing"), ("complete", 0)]
 
 
+@pytest.mark.parametrize("choose_control", [True, False])
+def test_open_field_data_route_offers_optional_control_before_importing_points(
+        win, monkeypatch, tmp_path, choose_control):
+    from pathlib import Path
+    from plumbline.ui import main_window as MW
+
+    job_root = tmp_path / "Job"
+    control_dir = job_root / "Control"
+    control_dir.mkdir(parents=True)
+    win.state.project.path = str(job_root / "Job.plb")
+    field_root = tmp_path / "Downloads"
+    field_root.mkdir()
+    control_file = tmp_path / "control.csv"
+    field_file = field_root / "survey.csv"
+    events = []
+
+    class _CheckSubfolders:
+        @staticmethod
+        def isChecked():
+            return False
+
+    class _FolderDialog:
+        def __init__(self, _state, folder, _parent, *, field_data_only=False):
+            assert field_data_only
+            self.folder = folder
+            self.chk_sub = _CheckSubfolders()
+            events.append(("point-picker", folder))
+
+        @staticmethod
+        def exec():
+            return 1
+
+        def selected_files(self):
+            events.append(("selected",))
+            return [field_file]
+
+    monkeypatch.setattr(QMessageBox, "exec",
+                        lambda _self: QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        lambda *_args: str(field_root))
+
+    def choose_file(_parent, caption, start, _filter):
+        events.append(("control-picker", caption, start))
+        return (str(control_file) if choose_control else "", "")
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", choose_file)
+    monkeypatch.setattr(MW, "ReferenceFolderDialog", _FolderDialog)
+
+    def import_file(path, *, default_role=None):
+        events.append(("control-import", Path(path), default_role))
+        return True
+
+    def import_folder(folder, role, recursive, selected_files=None):
+        events.append(("field-import", folder, role, selected_files))
+        return {"files": 1, "points": 2, "duplicates": 0, "skipped": 0,
+                "failed": 0, "unreadable": []}
+
+    monkeypatch.setattr(win.importer, "import_path", import_file)
+    monkeypatch.setattr(win.importer, "import_reference_folder", import_folder)
+
+    assert win._ask_field_data_route("existing") == 2
+    assert events[0][0] == "point-picker"
+    assert events[1] == ("selected",)
+    assert events[2][0] == "control-picker"
+    assert events[2][1] == "Choose Control File (optional)"
+    assert events[2][2] == str(control_dir)
+    if choose_control:
+        assert events[3] == ("control-import", control_file, "control")
+        assert events[4][0] == "field-import"
+        assert win.state.project.settings["control_file"] == str(control_file.resolve())
+    else:
+        assert events[3][0] == "field-import", (
+            "cancelling the optional control picker must continue")
+        assert "control_file" not in win.state.project.settings
+
+
 def test_imagery_import_is_blocked_if_the_project_crs_picker_is_cancelled(win, monkeypatch, tmp_path):
     project = Project("Unassigned imagery")
     win.state.set_project(project, dirty=False)

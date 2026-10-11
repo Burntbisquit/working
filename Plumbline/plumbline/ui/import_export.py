@@ -461,7 +461,7 @@ class _ImportDialog(QDialog):
 class CsvImportDialog(QDialog):
     MAXPREV = 40
 
-    def __init__(self, state, path, parent=None):
+    def __init__(self, state, path, parent=None, *, default_role: str | None = None):
         super().__init__(parent)
         self.state = state
         self.path = Path(path)
@@ -504,7 +504,8 @@ class CsvImportDialog(QDialog):
                             ("Control - reference layer CONTROL", "control"),
                             ("Other reference - reference layer OTHER", "other")]:
             self.cmb_role.addItem(label, role)
-        self.cmb_role.setCurrentIndex(0)
+        role_index = self.cmb_role.findData(default_role) if default_role is not None else 0
+        self.cmb_role.setCurrentIndex(role_index if role_index >= 0 else 0)
         self.cmb_role.setToolTip("Reference points draw, snap and export with everything else, but they are kept\n"
                                  "out of the fieldwork list and out of the data-quality checks - they are not our shots.\n"
                                  "Each role has its own layer and its own point numbers.")
@@ -521,7 +522,7 @@ class CsvImportDialog(QDialog):
         self.panel = ImportOptionsPanel(state, geographic=False, assume_project_crs=True)
         root.addWidget(self.panel)
         self.bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.bb.button(QDialogButtonBox.Ok).setText("Import points")
+        self.bb.button(QDialogButtonBox.Ok).setText("Import Points")
         self.bb.accepted.connect(self._ok)
         self.bb.rejected.connect(self.reject)
         root.addWidget(self.bb)
@@ -778,7 +779,7 @@ class Importer:
         self.w = window
         self.state = window.state
 
-    def import_path(self, path) -> bool:
+    def import_path(self, path, *, default_role: str | None = None) -> bool:
         p = Path(path)
         ext = p.suffix.lower()
         try:
@@ -800,7 +801,7 @@ class Importer:
             if ext in IMAGE_EXT:
                 return self.w.add_imagery_file(str(p))
             if ext in CSV_EXT or True:
-                return self._csv(p)
+                return self._csv(p, default_role=default_role)
         except Exception as ex:
             import traceback
             error_box(self.w, "Import Failed", f"{p.name} could not be imported:\n{ex}", traceback.format_exc())
@@ -839,8 +840,8 @@ class Importer:
                 complete(imported_points=stats["points"])
         return True
 
-    def _csv(self, p: Path) -> bool:
-        dlg = CsvImportDialog(self.state, p, self.w)
+    def _csv(self, p: Path, *, default_role: str | None = None) -> bool:
+        dlg = CsvImportDialog(self.state, p, self.w, default_role=default_role)
         if not dlg.exec():
             return False
         return self._finish(dlg.batch, dlg.plan, f"points ({p.name})", p)

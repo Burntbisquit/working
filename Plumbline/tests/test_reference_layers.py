@@ -244,6 +244,7 @@ def qapp():
 
 
 def test_the_import_dialog_offers_the_three_roles_and_a_way_in_for_field_data(tmp_path, qapp):
+    from PySide6.QtWidgets import QDialogButtonBox
     from plumbline.ui.app_state import AppState
 
     st = AppState(_project())
@@ -259,6 +260,10 @@ def test_the_import_dialog_offers_the_three_roles_and_a_way_in_for_field_data(tm
     assert "Control - reference layer CONTROL" in labels
     assert "Other reference - reference layer OTHER" in labels
     assert dlg.cmb_role.itemData(0) is None
+    assert dlg.bb.button(QDialogButtonBox.Ok).text() == "Import Points"
+
+    control_dlg = CsvImportDialog(st, f, None, default_role="control")
+    assert control_dlg.target_role() == "control"
 
     dlg.cmb_role.setCurrentIndex(dlg.cmb_role.findData("stakeout"))
     assert dlg.target_role() == "stakeout"

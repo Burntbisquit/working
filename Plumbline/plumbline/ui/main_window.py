@@ -943,12 +943,11 @@ class MainWindow(QMainWindow):
             self.state.log("Opened the Fieldwork Manager window", "ok")
 
     def import_points_file(self):
-        """Survey > Import Points from File - a CSV of stake-out, control or other coordinates.
+        """Survey > Import Points from File - a CSV or point file with a selectable role.
 
-        The import dialog asks what the points are; stake-out is the default, because a CSV that
-        lands on the office desk is usually somebody else's coordinates rather than this job's own
-        shots.  Chosen a role, the points go on that role's layer with their own numbering and stay
-        out of the fieldwork list and the data-quality checks.
+        The ordinary file command defaults to this job's field data. The Open Project route's
+        optional control-file picker uses the same importer with Control preselected. Reference
+        points stay on their own layer and out of the fieldwork list and data-quality checks.
         """
         p, _ = QFileDialog.getOpenFileName(self, "Import Points from File", self._job_hint(), POINTS_FILTER)
         if p:
@@ -1312,8 +1311,43 @@ class MainWindow(QMainWindow):
         settings().set("field_data_import_folder", str(Path(folder).expanduser()))
         return self._run_field_data_folder_import(Path(folder))
 
+    def _control_file_start(self) -> str:
+        """Start the optional control picker at the job's standard Control folder."""
+        root = self._job_folder()
+        control_dir = root / "Control" if root is not None else None
+        if control_dir is not None and control_dir.is_dir():
+            return str(control_dir)
+        return self._job_hint() or self._default_field_data_folder()
+
+    def _remember_control_file(self, path: str) -> None:
+        """Keep a chosen control file portable when it lives inside the project folder."""
+        control_path = Path(path).expanduser().resolve()
+        project_path = getattr(self.state.project, "path", None)
+        project_root = Path(project_path).expanduser().parent.resolve() if project_path else None
+        value = str(control_path)
+        if project_root is not None:
+            try:
+                value = control_path.relative_to(project_root).as_posix()
+            except ValueError:
+                pass
+        if self.state.project.settings.get("control_file") == value:
+            return
+        with self.state.edit("Set control file"):
+            self.state.project.settings["control_file"] = value
+
+    def _import_optional_control_file(self) -> bool:
+        """Offer a control-point file just before field points; Cancel means skip."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose Control File (optional)", self._control_file_start(), POINTS_FILTER)
+        if not path:
+            return False
+        imported = self.importer.import_path(path, default_role="control")
+        if imported:
+            self._remember_control_file(path)
+        return imported
+
     def _run_field_data_folder_import(self, folder: Path) -> int:
-        """Show the reusable per-file picker and import only its selected field-data files."""
+        """Show the per-file picker; offer an optional control file immediately before importing."""
         folder = Path(folder).expanduser()
         if not folder.is_dir():
             error_box(self, "Import Field Data", f"{folder} is not a folder.")
@@ -1322,6 +1356,9 @@ class MainWindow(QMainWindow):
         if not dlg.exec():
             return 0
         selected = dlg.selected_files()
+        if not selected:
+            return 0
+        self._import_optional_control_file()
         tally = self.importer.import_reference_folder(
             folder, None, dlg.chk_sub.isChecked(), selected_files=selected)
         if not tally.get("points"):
