@@ -517,7 +517,7 @@ class CsvImportDialog(QDialog):
         self.panel = ImportOptionsPanel(state, geographic=False, assume_project_crs=True)
         root.addWidget(self.panel)
         self.bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.bb.button(QDialogButtonBox.Ok).setText("Import Points")
+        self.bb.button(QDialogButtonBox.Ok).setText("Import")
         self.bb.accepted.connect(self._ok)
         self.bb.rejected.connect(self.reject)
         root.addWidget(self.bb)

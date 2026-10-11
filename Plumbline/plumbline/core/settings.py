@@ -15,6 +15,21 @@ def user_dir() -> Path:
     return p
 
 
+def default_project_folder() -> Path:
+    """Return the configured parent folder for new project/job folders.
+
+    The setting is intentionally a *parent* path: each new job is created in its own
+    named folder underneath it. Until the user chooses a different location, prefer
+    the familiar Documents location and fall back to the home directory when there is
+    no Documents folder.
+    """
+    configured = str(settings().get("default_project_folder", "") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    documents = Path.home() / "Documents"
+    return (documents if documents.is_dir() else Path.home()) / "Plumbline Projects"
+
+
 DEFAULTS = {
     "theme": "dark",
     "coord_order": "NE",            # order used for typed input: NE (Northing,Easting) or XY
@@ -28,6 +43,7 @@ DEFAULTS = {
                       "EPSG:6318", "EPSG:26914", "EPSG:6343", "EPSG:32614", "EPSG:3857"],
     "recent_files": [],
     "field_data_import_folder": "",  # last field-data folder chooser location; machine-specific
+    "default_project_folder": "",  # parent folder for new jobs; machine-specific
     "tile_cache_dir": "",
     "offline_imagery": False,
     "proj_network": False,

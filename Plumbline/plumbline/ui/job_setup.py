@@ -1,9 +1,9 @@
 """New Project -> the cancelable job-folder setup.
 
-Making a job folder is eleven folders and four files, some of them seeded from a code
-table that may be a megabyte of CSV.  Doing that inside a dialog's OK handler freezes
-the window with no explanation and no way out, so this runs it as a short sequence of
-steps behind a progress dialog with a real, working **Cancel**.
+Making a job folder creates the standard subfolders, a short setup note, and the root
+project file. The subfolders start empty; no placeholder Field Book or control file is
+seeded. Doing this inside a dialog's OK handler freezes the window with no explanation
+and no way out, so this runs it behind a progress dialog with a real, working **Cancel**.
 
 Cancel means cancel
 -------------------
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QFileDialog, QFormLayo
                                QVBoxLayout, QWidget)
 
 from ..core import jobtemplate as JT
+from ..core.settings import default_project_folder
 
 
 # --------------------------------------------------------------------------------------------- options panel
@@ -37,7 +38,7 @@ class JobSetupPanel(QWidget):
 
         form = QFormLayout()
         row = QHBoxLayout()
-        self.ed_folder = QLineEdit(default_parent_folder or str(Path.cwd()))
+        self.ed_folder = QLineEdit(default_parent_folder or str(default_project_folder()))
         self.ed_folder.setPlaceholderText("Parent folder - the job folder is created inside it")
         btn = QPushButton("Browse...")
         btn.clicked.connect(self._browse)
@@ -79,7 +80,8 @@ class JobSetupPanel(QWidget):
         here = self.folder_path()
         rows = [f"Project folder: {here}/", f"Folders:"]
         rows.extend(f"  {folder.name}/ - {folder.purpose}" for folder in JT.JOB_TEMPLATE.folders)
-        rows.append(f"Project file: {here.name}{JT.PROJECT_EXT}")
+        rows.append(f"Files at root: Job Setup.txt and {here.name}{JT.PROJECT_EXT}")
+        rows.append("All subfolders start empty (no placeholder Field Book or control files).")
         self.lbl_preview.setText("\n".join(rows))
 
     @property

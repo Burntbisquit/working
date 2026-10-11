@@ -12,20 +12,24 @@ from plumbline.core.settings import settings
 from test_ui import app, auto, pump, win  # noqa: F401  (fixtures)
 
 
-def test_settings_dialog_applies_theme_and_values(win, app, auto):
+def test_settings_dialog_applies_theme_and_values(win, app, auto, tmp_path):
     from plumbline.ui import theme
     from plumbline.ui.dialogs import SettingsDialog
+    old_project_folder = settings().get("default_project_folder", "")
     win.settings_dialog()                                             # accepted unchanged: nothing breaks
     d = SettingsDialog(win)
     d.cmb_theme.setCurrentIndex(d.cmb_theme.findData("light"))
     d.cmb_order.setCurrentIndex(d.cmb_order.findData("XY"))
     d.sp_snap.setValue(20)
+    project_folder = str(tmp_path / "Projects")
+    d.ed_project_folder.setText(project_folder)
     assert d.chk_require_fieldbook.isChecked()
     d.chk_require_fieldbook.setChecked(False)
     d.apply()
     s = settings()
     assert s.get("theme") == "light" and s.get("coord_order") == "XY" and s.get("snap_px") == 20
     assert s.get("require_fieldbook_for_processing") is False
+    assert s.get("default_project_folder") == project_folder
     win._apply_theme()
     assert theme.current() == "light"
     win.points.reload()
@@ -33,6 +37,7 @@ def test_settings_dialog_applies_theme_and_values(win, app, auto):
     win.canvas.render_image(300)
     s.set("coord_order", "NE")
     s.set("require_fieldbook_for_processing", True)
+    s.set("default_project_folder", old_project_folder)
     win.toggle_theme()                                                # back to dark
 
 
@@ -327,10 +332,13 @@ def test_welcome_help_about_plugins_dialogs_open(win, app, auto):
     win.show_welcome()                                                 # exec auto-accepts, choice "none"
 
 
-def test_new_project_dialog_defers_crs_to_the_project_crs_step(win, app, auto):
+def test_new_project_dialog_defers_crs_to_the_project_crs_step(win, app, auto, tmp_path, monkeypatch):
     from plumbline.ui.new_project import NewProjectDialog
 
+    parent_folder = str(tmp_path / "Project folders")
+    monkeypatch.setitem(settings()._data, "default_project_folder", parent_folder)
     dialog = NewProjectDialog(win)
+    assert dialog.setup_parent_folder == parent_folder
     assert dialog.setup_job is True
     assert not hasattr(dialog, "r_unassigned")
     assert not hasattr(dialog, "cmb_texas")
@@ -339,6 +347,8 @@ def test_new_project_dialog_defers_crs_to_the_project_crs_step(win, app, auto):
                ("Field Data", "Field Book", "Control", "Drawings", "Surfaces", "Imagery", "Reports"))
 
     dialog.ed_name.setText("Job 42")
+    assert "Job Setup.txt" in dialog.setup.lbl_preview.text()
+    assert "All subfolders start empty" in dialog.setup.lbl_preview.text()
     dialog._accept()
     assert dialog.project_name == "Job 42"
     assert dialog.crs.is_unassigned and dialog.crs.unit == "ftUS"
@@ -360,6 +370,18 @@ def test_save_as_dialog_shows_the_fixed_standard_folder_tree(win, app):
     preview = dlg.lbl_folders.text()
     for folder in ("Field Data", "Field Book", "Control", "Drawings", "Surfaces", "Imagery", "Reports"):
         assert f"{folder}/" in preview
+
+
+def test_job_setup_uses_the_configured_default_project_parent(app, tmp_path, monkeypatch):
+    from plumbline.core.settings import settings
+    from plumbline.ui.job_setup import JobSetupPanel
+
+    parent_folder = str(tmp_path / "Survey Jobs")
+    monkeypatch.setitem(settings()._data, "default_project_folder", parent_folder)
+    panel = JobSetupPanel()
+    panel.set_job_name("Job 42")
+    assert panel.parent_folder == parent_folder
+    assert panel.folder_path() == tmp_path / "Survey Jobs" / "Job 42"
 
 
 def test_find_select_all_zoom_and_layer_creation(win, app, auto, monkeypatch):
@@ -403,6 +425,51 @@ def test_png_export_and_reports_open(win, app, auto, monkeypatch, tmp_path):
     win.state.clear_selection()
     win.report_polylines()                                            # nothing selected -> message, not a crash
     assert len(shown) == 5
+
+
+def test_local_imagery_import_is_copied_into_the_project_and_survives_a_move(win, app, tmp_path):
+    import json
+    import shutil
+    from pathlib import Path
+
+    from PIL import Image
+
+    project_root = tmp_path / "Portable Job"
+    project_root.mkdir()
+    project_file = project_root / "Portable Job.plb"
+    project = win.state.project
+    project.save(project_file)
+
+    source_root = tmp_path / "Original imagery"
+    source_root.mkdir()
+    image = source_root / "aerial.png"
+    Image.new("RGB", (4, 4), (20, 100, 30)).save(image)
+    image.with_suffix(".pgw").write_text(chr(10).join(("1", "0", "0", "-1", "100.5", "200.5")) + chr(10), encoding="ascii")
+    image.with_suffix(".prj").write_text("test projection sidecar", encoding="utf-8")
+
+    assert win.create_imagery_layer({"kind": "file", "name": "Local aerial", "source": {
+        "path": str(image), "corners": [[100, 200], [104, 200], [100, 196]],
+        "crs": None, "attribution": ""}})
+    layer = next(layer for layer in project.imagery.values() if layer.name == "Local aerial")
+    staged = Path(layer.source["path"])
+    assert staged.parent == project_root / "Imagery"
+    assert staged.read_bytes() == image.read_bytes()
+    assert staged.with_suffix(".pgw").is_file() and staged.with_suffix(".prj").is_file()
+    assert image.is_file()  # the import leaves the source untouched
+
+    project.save()
+    saved = json.loads(project_file.read_text(encoding="utf-8"))
+    stored_layer = next(layer for layer in saved["imagery"] if layer["name"] == "Local aerial")
+    assert stored_layer["source"]["path"] == "Imagery/aerial.png"
+
+    moved_root = tmp_path / "Moved" / project_root.name
+    moved_root.parent.mkdir()
+    shutil.move(str(project_root), moved_root)
+    moved_project = Project.load(moved_root / project_file.name)
+    moved_image = Path(next(layer for layer in moved_project.imagery.values()
+                            if layer.name == "Local aerial").source["path"])
+    assert moved_image == moved_root / "Imagery" / "aerial.png"
+    assert moved_image.with_suffix(".pgw").is_file() and moved_image.with_suffix(".prj").is_file()
 
 
 def test_the_imagery_panel_has_no_check_controls_and_notes_checks_from_older_files(win, app, auto):

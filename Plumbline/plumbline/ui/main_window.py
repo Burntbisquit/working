@@ -25,8 +25,9 @@ from ..core import units as U
 from ..core.model import ImageryLayer, Polyline, Surface
 from ..core.project import Project
 from ..core.project_package import create_project_package
+from ..core.imagery_assets import stage_imagery_asset
 from ..core.qa import run_checks
-from ..core.settings import settings, user_dir
+from ..core.settings import default_project_folder, settings, user_dir
 from ..core.surface import (apply_contours, build_tin, compute_contour_data, gather_surface_inputs, surface_signature)
 from ..io import f2f, kml_io, reports
 from . import icons, theme
@@ -916,7 +917,7 @@ class MainWindow(QMainWindow):
     def new_project(self):
         if not self.maybe_save():
             return
-        dlg = NewProjectDialog(self, job_hint=self._job_hint() or str(Path.cwd()))
+        dlg = NewProjectDialog(self, job_hint=str(default_project_folder()))
         if not dlg.exec():
             return
         name = dlg.project_name
@@ -1049,11 +1050,11 @@ class MainWindow(QMainWindow):
                 return panel.validate()
 
         dlg = _Dlg(self, "New Job Folder",
-                   intro="Creates the folder tree, an empty field book and control list, and a project "
-                         "file with no coordinate system assigned yet.")
+                   intro="Creates the standard folder tree (all subfolders empty), Job Setup.txt, "
+                         "and a project file with no coordinate system assigned yet.")
         name_edit = QLineEdit("New Job")
         dlg.form.addRow("Job name:", name_edit)
-        panel = JobSetupPanel(dlg, self._job_hint())
+        panel = JobSetupPanel(dlg, str(default_project_folder()))
         dlg.root.insertWidget(2, panel)
         if not dlg.exec():
             return
@@ -1512,15 +1513,10 @@ class MainWindow(QMainWindow):
 
     def save_as(self) -> bool:
         pr = self.state.project
+        parent_start = default_project_folder()
         if pr.path:
-            current_root = Path(pr.path).expanduser().parent
-            parent_start = current_root.parent
             suggested_name = f"{pr.name or 'Project'} Copy"
         else:
-            parent_start = Path.cwd()
-            data_folder = (pr.settings or {}).get("data_folder")
-            if data_folder and Path(str(data_folder)).expanduser().exists():
-                parent_start = Path(str(data_folder)).expanduser().parent
             suggested_name = ("Untitled Project" if str(pr.name or "").strip().casefold() in {"", "untitled"}
                               else str(pr.name))
         dlg = ProjectPackageDialog(self, name=suggested_name, parent_folder=str(parent_start))
@@ -2056,9 +2052,24 @@ class MainWindow(QMainWindow):
 
     def create_imagery_layer(self, spec: dict):
         pr = self.state.project
+        spec = dict(spec)
+        source = dict(spec.get("source") or {})
+        if str(spec.get("kind", "")).casefold() == "file" and source.get("path"):
+            project_root = (Path(pr.path).expanduser().parent if pr.path
+                            else self._job_folder())
+            if project_root is not None:
+                try:
+                    staged = run_blocking(self, "Copying imagery into the project...",
+                                          stage_imagery_asset, source["path"], project_root)
+                except RuntimeError as ex:
+                    error_box(self, "Imagery", "Could not copy the imagery into this project's Imagery folder.",
+                              str(ex))
+                    return False
+                source["path"] = str(staged)
+        spec["source"] = source
         with self.state.edit("Add imagery", kinds=("imagery",)):
             lid = pr.new_id()
-            pr.imagery[lid] = ImageryLayer(lid, self._unique_layer_name(spec["name"]), spec["kind"], dict(spec["source"]), True, 1.0, (0.0, 0.0))
+            pr.imagery[lid] = ImageryLayer(lid, self._unique_layer_name(spec["name"]), spec["kind"], source, True, 1.0, (0.0, 0.0))
         self.canvas.opts.show_imagery = True
         self.view_toggles["show_imagery"].setChecked(True)
         self.d_img.show()
@@ -2068,6 +2079,7 @@ class MainWindow(QMainWindow):
         self.canvas.invalidate()
         self.canvas.update()
         self.state.log(f"Imagery layer added: {spec['name']}", "ok")
+        return True
 
     def _default_view_for_crs(self):
         crs = self.state.project.crs
@@ -2095,17 +2107,15 @@ class MainWindow(QMainWindow):
         except RuntimeError as ex:
             error_box(self, "Imagery", str(ex).strip().splitlines()[-1], str(ex))
             return False
-        self.create_imagery_layer({"kind": "file", "name": Path(path).stem,
-                                   "source": {"path": path, "corners": [list(c) for c in r["corners"]], "crs": r["crs"], "attribution": ""}})
-        return True
+        return bool(self.create_imagery_layer({"kind": "file", "name": Path(path).stem,
+                                               "source": {"path": path, "corners": [list(c) for c in r["corners"]], "crs": r["crs"], "attribution": ""}}))
 
     def add_kml_overlay(self, o: dict) -> bool:
         if not self._ensure_project_crs():
             return False
         corners = IM.kml_overlay_corners(o["north"], o["south"], o["east"], o["west"], o.get("rotation", 0.0))
-        self.create_imagery_layer({"kind": "file", "name": o.get("name", "Overlay"),
-                                   "source": {"path": o["file"], "corners": [list(c) for c in corners], "crs": "EPSG:4326", "attribution": ""}})
-        return True
+        return bool(self.create_imagery_layer({"kind": "file", "name": o.get("name", "Overlay"),
+                                               "source": {"path": o["file"], "corners": [list(c) for c in corners], "crs": "EPSG:4326", "attribution": ""}}))
 
 
 

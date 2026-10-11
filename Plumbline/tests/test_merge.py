@@ -302,21 +302,19 @@ def test_job_folder_has_the_expected_shape(tmp_path):
     # teaches people to delete it.
     assert list((root / "Field Data").iterdir()) == []
     assert out.paths.project_file.exists()
-    assert out.paths.fieldbook_file.exists()
-    assert out.paths.control_file.exists()
     assert out.paths.setup_note.exists()
+    assert {p.name for p in root.iterdir()} == {out.paths.project_file.name, out.paths.setup_note.name}
+    assert all(list((root / rel).iterdir()) == [] for rel in
+               ("Field Data", "Field Book", "Control", "Drawings", "Surfaces", "Imagery", "Reports"))
+    assert not out.paths.fieldbook_file.exists()
+    assert not out.paths.control_file.exists()
     note = out.paths.setup_note.read_text(encoding="utf-8")
     assert "Crew N owns N00-N99" in note and "EPSG:6584" in note
     # the project opens, carries the job name, and starts with no coordinate system unless told
     from plumbline.core.project import Project
     pr = Project.load(out.paths.project_file)
     assert pr.name == "23-036.03 Murchison" and pr.crs.authority == "EPSG:6584"
-    assert len(pr.codes) == 0
-    from plumbline.fieldwork.io_carlson import read_fwb_file, read_fwb_extra
-    headers, rows = read_fwb_file(out.paths.fieldbook_file)
-    assert headers and rows == []  # a blank Field Book shell, not the old five-code sample
-    assert read_fwb_extra(out.paths.fieldbook_file)["rules"] == []
-    assert pr.settings["fieldbook_file"] == str(out.paths.fieldbook_file)
+    assert not pr.settings.get("fieldbook_file")
 
 
 def test_new_job_starts_unassigned_by_default(tmp_path):

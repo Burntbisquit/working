@@ -18,7 +18,7 @@ from .. import __version__
 from ..core import cogo
 from ..core import units as U
 from ..core.featurecodes import FeatureCode, FeatureCodeTable, default_codes
-from ..core.settings import settings, user_dir
+from ..core.settings import default_project_folder, settings, user_dir
 from ..io import reports
 from ..core.qa import run_checks
 from .widgets import Banner, ColorButton, FormDialog, Hint, dspin, error_box, info_box, ispin, confirm
@@ -98,7 +98,8 @@ class ReportViewer(QDialog):
 # ----------------------------------------------------------------------------- settings
 class SettingsDialog(FormDialog):
     def __init__(self, parent=None):
-        super().__init__(parent, "Settings", "", "Save", 480)
+        super().__init__(parent, "Settings", "", "Save", 680)
+        self.setMinimumWidth(640)
         s = settings()
         self.cmb_theme = QComboBox()
         self.cmb_theme.addItem("Dark", "dark")
@@ -138,6 +139,17 @@ class SettingsDialog(FormDialog):
             "Turn this off to allow processing without one.")
         self.ed_cache = QLineEdit(s.get("tile_cache_dir") or "")
         self.ed_cache.setPlaceholderText(str(s.tile_cache_dir))
+        self.ed_project_folder = QLineEdit(
+            str(s.get("default_project_folder") or default_project_folder()))
+        self.ed_project_folder.setToolTip(
+            "New Project, New Job Folder, and Save As create project folders inside this location.")
+        self.browse_project_folder = QPushButton("Browse...")
+        self.browse_project_folder.clicked.connect(self._browse_project_folder)
+        project_folder_row = QHBoxLayout()
+        project_folder_row.addWidget(self.ed_project_folder, 1)
+        project_folder_row.addWidget(self.browse_project_folder)
+        project_folder_holder = QWidget()
+        project_folder_holder.setLayout(project_folder_row)
         self.chk_space_commands = QCheckBox("Separate a feature code from its line command")
         self.chk_space_commands.setChecked(bool(s.get("space_between_commands", True)))
         self.chk_space_multicode = QCheckBox("Add spaces around the multi-code separator")
@@ -154,6 +166,7 @@ class SettingsDialog(FormDialog):
         self.form.addRow("Label size (pixels):", self.sp_lab)
         self.form.addRow("Control comparison tolerance:", self.sp_control_tolerance)
         self.form.addRow("", self.chk_require_fieldbook)
+        self.form.addRow("Default project folder:", project_folder_holder)
         self.form.addRow("Imagery cache folder:", self.ed_cache)
         syntax_box = QGroupBox("Field Book command spacing")
         syntax_layout = QVBoxLayout(syntax_box)
@@ -176,6 +189,15 @@ class SettingsDialog(FormDialog):
         self.b_sites.clicked.connect(self.open_registry)
         self.b_save_settings.clicked.connect(self.save_settings)
         self.b_load_settings.clicked.connect(self.load_settings)
+
+    def _browse_project_folder(self):
+        start = Path(self.ed_project_folder.text()).expanduser()
+        if not start.is_dir():
+            start = start.parent if start.parent.is_dir() else Path.home()
+        folder = QFileDialog.getExistingDirectory(
+            self, "Default project folder", str(start))
+        if folder:
+            self.ed_project_folder.setText(folder)
 
     # -- settings files / the pull-site registry
     def open_registry(self):
@@ -225,6 +247,7 @@ class SettingsDialog(FormDialog):
         s.set("space_between_commands", self.chk_space_commands.isChecked(), False)
         s.set("space_around_multicode_separator", self.chk_space_multicode.isChecked(), False)
         s.set("space_around_description_separator", self.chk_space_description.isChecked(), False)
+        s.set("default_project_folder", self.ed_project_folder.text().strip(), False)
         s.set("tile_cache_dir", self.ed_cache.text().strip(), True)
 
 

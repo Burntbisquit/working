@@ -25,7 +25,6 @@ half-way through, the job does not exist in a half-made state that a later
 """
 from __future__ import annotations
 
-import csv
 import datetime as _dt
 import re
 import os
@@ -261,22 +260,6 @@ def _setup_note_text(paths: JobPaths, template: JobTemplate, crs_label: str, com
     return "\n".join(lines)
 
 
-def _template_fieldbook(paths: JobPaths) -> None:
-    """Create an empty Field Book shell; office codes are added only when a book is selected."""
-    from ..fieldwork import io_carlson as IC
-    from .fieldbook_syntax import DEFAULT_COMMAND_TOKENS
-    headers = ["Code", "Description", "Symbol", "Layer", "Entity Type", "Category"]
-    IC.write_fwb_file(paths.fieldbook_file, headers, [],
-                      commands=list(DEFAULT_COMMAND_TOKENS), rules=[])
-
-
-def _control_csv(paths: JobPaths) -> None:
-    paths.control_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(paths.control_file, "w", encoding="utf-8-sig", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow(["Point", "Northing", "Easting", "Elevation", "Datum", "Description", "Note"])
-
-
 def job_folder_contents(root, name: str) -> dict:
     """What is already in ``root/name`` - the facts a "this will be deleted" question needs."""
     folder = Path(root).expanduser() / _safe_name(name)
@@ -347,8 +330,8 @@ def create_job(root, name: str, template: JobTemplate | str = JOB_TEMPLATE,
                     geoid, ground scale and its base point exactly
     weeks           how many ``Field Data/Week N`` folders to make
     overwrite       allow writing into a non-empty existing job folder
-    starter_files   write the field book / control list / setup note / project file;
-                    False leaves an empty folder tree for a caller that will fill it
+    starter_files   write Job Setup.txt and the project file at the job root;
+                    standard subfolders remain empty. False leaves only the folder tree.
     progress        ``progress(fraction, message)`` - called before each step
     is_cancelled    ``is_cancelled() -> bool`` - polled before each step
 
@@ -410,20 +393,12 @@ def create_job(root, name: str, template: JobTemplate | str = JOB_TEMPLATE,
                 progress(1.0, "done")
             return creation
 
-        check("writing the field book", 0.70)
-        _template_fieldbook(paths)
-        creation.files.append(paths.fieldbook_file)
-
-        check("writing the control list", 0.78)
-        _control_csv(paths)
-        creation.files.append(paths.control_file)
-
-        check("writing the job setup note", 0.86)
+        check("writing the job setup note", 0.76)
         paths.setup_note.write_text(_setup_note_text(paths, template, crs_label, comment),
                                     encoding="utf-8")
         creation.files.append(paths.setup_note)
 
-        check("saving the project", 0.94)
+        check("saving the project", 0.90)
         _write_empty_project(paths, crs_label, crs_record)
         creation.files.append(paths.project_file)
 
@@ -459,10 +434,10 @@ def _write_empty_project(paths: JobPaths, crs_label: str, crs_record: dict | Non
     from ..core.crs import ProjectCRS
     project_crs = ProjectCRS.from_dict(crs_record) if crs_record else _crs_from_label(crs_label)
     prj = Project(paths.name, project_crs)
-    # The blank .fwb shell gives the job a predictable place to install its selected book,
-    # but it is not a vocabulary: never seed the project code table with sample/test codes.
+    # The standard subfolders are intentionally empty. Preserve the default command
+    # vocabulary for the first Field Book the user chooses, without pointing at a
+    # placeholder file that does not exist.
     from .fieldbook_syntax import DEFAULT_COMMAND_TOKENS
-    prj.settings["fieldbook_file"] = str(paths.fieldbook_file)
     prj.settings["f2f_commands"] = list(DEFAULT_COMMAND_TOKENS)
     prj.settings["f2f_rules"] = []
     prj.notes = (f"New job created {_dt.datetime.now():%Y-%m-%d}.\n"

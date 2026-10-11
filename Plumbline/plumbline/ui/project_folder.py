@@ -8,8 +8,8 @@ all the same decision - *where does this job live* - so they are one dialog:
 * **Open the folder this job is in** (and reveal it in the desktop's file manager);
 * **Open another folder** - and if it holds a project file, offer to open that project, with
   overwrite offered second and explained in full (``ui.job_setup.overwrite_job_folder``);
-* **Create a job folder** named after the job, inside the current directory by default, with the
-  folder tree as its subfolders.
+* **Create a job folder** named after the job, inside the configured default project-folder
+  location, with the fixed standard folder tree as its subfolders.
 
 Nothing here writes anything by itself: creating goes through ``run_job_setup``, which is
 cancelable and rolls back, and overwriting goes through the three-step confirmation.
@@ -22,6 +22,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QPushButton,
                                QVBoxLayout)
 
+from ..core.settings import default_project_folder
 from .job_setup import JobSetupPanel, run_job_setup
 from .widgets import Hint, error_box
 
@@ -50,9 +51,10 @@ class ProjectFolderDialog(QDialog):
         root.addLayout(row)
         root.addWidget(Hint("A job folder holds the project file and, inside it, the folders for the "
                             "work: Field Data, Field Book, Control, Reports, Drawings, Surfaces, "
-                            "Imagery.  Opening a folder that holds a project file offers to open that "
-                            "project; starting fresh there deletes what is in it, and asks twice "
-                            "before it does."))
+                            "Imagery.  The subfolders start empty; only Job Setup.txt and the project "
+                            "file are created at the root.  Opening a folder that holds a project file "
+                            "offers to open that project; starting fresh there deletes what is in it, "
+                            "and asks twice before it does."))
 
         root.addWidget(QLabel("<b>Create a job folder</b>"))
         self.ed_name = QLineEdit(default_name)
@@ -60,7 +62,7 @@ class ProjectFolderDialog(QDialog):
         name_row.addWidget(QLabel("Job name:"))
         name_row.addWidget(self.ed_name, 1)
         root.addLayout(name_row)
-        self.setup = JobSetupPanel(self, str(Path.cwd()))
+        self.setup = JobSetupPanel(self, str(default_project_folder()))
         self.ed_name.textChanged.connect(lambda t: self.setup.set_job_name(t))
         self.setup.set_job_name(self.ed_name.text())
         root.addWidget(self.setup, 1)
@@ -88,7 +90,7 @@ class ProjectFolderDialog(QDialog):
         self.accept()
 
     def _pick_folder(self):
-        start = str(self.current) if self.current else str(Path.cwd())
+        start = str(self.current) if self.current else str(default_project_folder())
         folder = QFileDialog.getExistingDirectory(self, "Open a project folder", start)
         if not folder:
             return

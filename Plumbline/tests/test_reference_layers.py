@@ -273,7 +273,7 @@ def test_the_import_dialog_offers_the_three_roles_and_a_way_in_for_field_data(tm
     assert "Control - reference layer CONTROL" in labels
     assert "Other reference - reference layer OTHER" in labels
     assert dlg.cmb_role.itemData(0) is None
-    assert dlg.bb.button(QDialogButtonBox.Ok).text() == "Import Points"
+    assert dlg.bb.button(QDialogButtonBox.Ok).text() == "Import"
 
     control_dlg = CsvImportDialog(st, f, None, default_role="control")
     assert control_dlg.target_role() == "control"

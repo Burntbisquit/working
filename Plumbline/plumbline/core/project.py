@@ -633,6 +633,34 @@ class Project:
                     imported = attrs.get("import")
                     if isinstance(imported, dict) and imported.get("folder"):
                         imported["folder"] = _package_relative_path(root, imported["folder"])
+        if self.path:
+            # File-backed imagery inside the project folder should remain usable after
+            # the folder is moved, even for projects not created through Save As.
+            root = Path(self.path).expanduser().resolve().parent
+            data["imagery"] = [
+                {**layer, "source": dict(layer.get("source") or {})}
+                for layer in data["imagery"]
+            ]
+            has_internal_imagery = False
+            for layer in data["imagery"]:
+                if layer.get("kind") != "file":
+                    continue
+                source = layer.get("source")
+                value = source.get("path") if isinstance(source, dict) else None
+                if not value or "://" in str(value):
+                    continue
+                try:
+                    path = Path(str(value)).expanduser()
+                    candidate = path if path.is_absolute() else root / path
+                    source["path"] = candidate.resolve().relative_to(root).as_posix()
+                except (OSError, RuntimeError, ValueError, TypeError):
+                    continue
+                has_internal_imagery = True
+            if has_internal_imagery:
+                package_meta = data.get("package")
+                if not isinstance(package_meta, dict):
+                    package_meta = {}
+                data["package"] = {**package_meta, "relative_asset_paths": True}
         return data
 
     def save(self, path: str | os.PathLike | None = None):
