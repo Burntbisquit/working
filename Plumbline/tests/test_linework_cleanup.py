@@ -692,6 +692,72 @@ def test_fix_points_owns_valid_multicode_lineorder_findings(win, app, tmp_path):
         dialog.close()
 
 
+def test_line_order_review_dropdowns_default_to_correct_and_support_skip_ignore_undo(win, app, tmp_path):
+    from plumbline.core.point_linework_coder import fix_line_command_order
+    from plumbline.fieldwork.io_carlson import write_fwb_file
+    from plumbline.ui.qa_workspace import FixPointErrorsDialog
+
+    project = win.state.project
+    for point in list(project.points.values()):
+        del project.points[point.id]
+    project.settings.pop("fieldbook_file", None)
+    project.settings.pop("f2f_path", None)
+    job_root = tmp_path / "line-order-actions"
+    book = job_root / "Field Book" / "Actions.fwb"
+    book.parent.mkdir(parents=True)
+    assert write_fwb_file(
+        book,
+        ["Code", "Description", "Symbol", "Layer", "Entity Type", "Category"],
+        [["EG", "Edge of gravel", "", "ROAD", "Line", "Road"],
+         ["EC", "Edge of concrete", "", "ROAD", "Line", "Road"]],
+    )
+    win._job_root_choice = job_root
+    correct_point = project.add_point(100, 200, 5, number="9011", desc="EG PC ST - EC1 END")
+    skip_point = project.add_point(101, 201, 5, number="9012", desc="EG PC ST")
+    original_correct = correct_point.desc
+    original_skip = skip_point.desc
+
+    dialog = FixPointErrorsDialog(win.state, win)
+    try:
+        finding = next(item for item in dialog.active_findings
+                       if item.get("check") == "Line command out of order")
+        dialog._open_inline_editor(finding)
+        rows_by_pid = {item[0].id: item for item in dialog.line_order_corrections}
+        assert set(rows_by_pid) == {correct_point.id, skip_point.id}
+        for point_id, item in rows_by_pid.items():
+            point, editor, action, _original, _suggestion = item
+            assert action.currentText() == "Correct"
+            assert [action.itemText(i) for i in range(action.count())] == ["Correct", "Skip", "Ignore"]
+            assert editor.text() == fix_line_command_order(point.desc)
+        assert dialog._has_unapplied_issue_edits()
+
+        # Apply the first proposal while leaving the second point active via Skip.
+        rows_by_pid[skip_point.id][2].setCurrentText("Skip")
+        assert dialog._action_apply_current_issue_changes()
+        assert correct_point.desc == fix_line_command_order(original_correct)
+        assert skip_point.desc == original_skip
+
+        # Undo restores the dropdowns selected at Apply time, but never reapplies their proposals.
+        dialog._undo_issue()
+        assert correct_point.desc == original_correct
+        assert skip_point.desc == original_skip
+        restored = {item[0].id: item for item in dialog.line_order_corrections}
+        assert restored[correct_point.id][2].currentText() == "Correct"
+        assert restored[skip_point.id][2].currentText() == "Skip"
+        assert restored[correct_point.id][1].text() == fix_line_command_order(original_correct)
+
+        # Ignore suppresses only its point; Skip leaves the other point in the active finding.
+        restored[correct_point.id][2].setCurrentText("Skip")
+        restored[skip_point.id][2].setCurrentText("Ignore")
+        assert dialog._action_apply_current_issue_changes()
+        assert correct_point.desc == original_correct
+        assert skip_point.desc == original_skip
+        assert dialog.current_edit_finding["ignored_pids"] == {skip_point.id}
+        assert dialog.current_edit_finding["pids"] == [correct_point.id]
+    finally:
+        dialog.close()
+
+
 def test_a_job_with_no_vocabulary_is_told_the_line_check_cannot_run_and_is_not_faked(win, app):
     """No field book, no codes: the number checks run, the line check does not pretend."""
     from plumbline.ui.check_dock import CheckFieldworkDock

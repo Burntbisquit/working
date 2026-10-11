@@ -1746,6 +1746,28 @@ class BaseQAWorkbenchWindow(QMainWindow):
         self._update_issue_undo_buttons()
         self._update_review_navigation()
 
+    def _on_line_order_action_changed(
+        self, point: SurveyPoint, editor: QLineEdit, combo: QComboBox,
+        suggestion: str | None = None,
+    ):
+        """Remember one point's Correct/Skip/Ignore selection without changing project data."""
+        action = self._safe_widget_text(combo, "currentText")
+        fixed = self._safe_widget_text(editor, "text")
+        if action is None or fixed is None:
+            return
+        if action == "Correct" and fixed.strip() == (point.desc or "").strip() and suggestion:
+            if suggestion.strip() != (point.desc or "").strip():
+                editor.setText(suggestion)
+                fixed = suggestion
+        if self.current_edit_finding is not None:
+            self.current_edit_finding.setdefault("line_order_drafts", {})[point.id] = {
+                "action": action,
+                "fixed": fixed,
+            }
+        self.lbl_status.setText("Line-order choice staged; project data is unchanged until Apply or Save.")
+        self._update_issue_undo_buttons()
+        self._update_review_navigation()
+
     def _capture_current_issue_ui_state(self) -> dict | None:
         """Capture staged controls so Undo can restore them without applying them."""
         finding = self.current_edit_finding
@@ -1755,6 +1777,7 @@ class BaseQAWorkbenchWindow(QMainWindow):
             "stack_action_drafts": copy.deepcopy(finding.get("stack_action_drafts", {})),
             "description_drafts": {},
             "separator_drafts": {},
+            "line_order_drafts": {},
         }
         for item in getattr(self, "desc_edits", []):
             if len(item) < 2:
@@ -1773,6 +1796,15 @@ class BaseQAWorkbenchWindow(QMainWindow):
             if action is not None and fixed is not None:
                 state["separator_drafts"][point.id] = {"action": action, "fixed": fixed}
 
+        for item in getattr(self, "line_order_corrections", []):
+            if len(item) < 3:
+                continue
+            point, editor, combo = item[:3]
+            action = self._safe_widget_text(combo, "currentText")
+            fixed = self._safe_widget_text(editor, "text")
+            if action is not None and fixed is not None:
+                state["line_order_drafts"][point.id] = {"action": action, "fixed": fixed}
+
         for stack_key, combo in getattr(self, "stack_action_combos", {}).items():
             action = self._safe_widget_text(combo, "currentData")
             if action is None:
@@ -1785,7 +1817,9 @@ class BaseQAWorkbenchWindow(QMainWindow):
     def _restore_issue_ui_state(finding: dict, ui_state: dict | None):
         if ui_state is None:
             return
-        for key in ("stack_action_drafts", "description_drafts", "separator_drafts"):
+        for key in (
+            "stack_action_drafts", "description_drafts", "separator_drafts", "line_order_drafts",
+        ):
             finding[key] = copy.deepcopy(ui_state.get(key, {}))
 
     def _finding_point_scope(self, finding: dict) -> set[int] | None:
@@ -1821,6 +1855,7 @@ class BaseQAWorkbenchWindow(QMainWindow):
                 "stack_action_drafts": copy.deepcopy(finding.get("stack_action_drafts", {})),
                 "description_drafts": copy.deepcopy(finding.get("description_drafts", {})),
                 "separator_drafts": copy.deepcopy(finding.get("separator_drafts", {})),
+                "line_order_drafts": copy.deepcopy(finding.get("line_order_drafts", {})),
             },
             "resolved_findings": list(self.resolved_findings),
             "history_undo": list(self.history_undo),
@@ -1836,6 +1871,7 @@ class BaseQAWorkbenchWindow(QMainWindow):
         # later save/back check still calls text() or currentText() on them.
         self.desc_edits = []
         self.sep_corrections = []
+        self.line_order_corrections = []
         self.current_focused_ed = None
         self.btn_autofix_descriptions = None
         self.autofix_buttons = {}
@@ -2120,6 +2156,7 @@ class BaseQAWorkbenchWindow(QMainWindow):
         self.issue_dirty = False
         self.desc_edits = []
         self.sep_corrections = []
+        self.line_order_corrections = []
         self.current_focused_ed = None
         if hasattr(self, "w_close_tol_bar"):
             self.w_close_tol_bar.hide()
@@ -2221,6 +2258,7 @@ class BaseQAWorkbenchWindow(QMainWindow):
             finding["stack_action_drafts"] = {}
             finding["description_drafts"] = {}
             finding["separator_drafts"] = {}
+            finding["line_order_drafts"] = {}
             finding["status"] = "active"
 
         if finding is not None:
@@ -2242,11 +2280,24 @@ class BaseQAWorkbenchWindow(QMainWindow):
     def _has_unapplied_issue_edits(self) -> bool:
         if not hasattr(self, "stack") or self.stack.currentIndex() != 1:
             return False
+        line_order_issue = _is_line_order_finding(self.current_edit_finding or {})
+        line_order_actions = {}
+        for item in getattr(self, "line_order_corrections", []):
+            if len(item) < 3:
+                continue
+            point, _editor, combo = item[:3]
+            action = self._safe_widget_text(combo, "currentText")
+            line_order_actions[point.id] = action
+            if action == "Ignore":
+                return True
+
         for item in getattr(self, "desc_edits", []):
             if len(item) < 2:
                 continue
             p, ed = item[0], item[1]
             text = self._safe_widget_text(ed, "text")
+            if line_order_issue and line_order_actions.get(p.id, "Correct") != "Correct":
+                continue
             if text is not None and text.strip() != (p.desc or ""):
                 return True
 
@@ -2269,11 +2320,23 @@ class BaseQAWorkbenchWindow(QMainWindow):
             finding["stack_action_drafts"] = {}
             finding["description_drafts"] = {}
             finding["separator_drafts"] = {}
+            finding["line_order_drafts"] = {}
         for combo in getattr(self, "stack_action_combos", {}).values():
             combo.setCurrentIndex(0)
         for item in getattr(self, "desc_edits", []):
             if len(item) >= 2:
                 item[1].setText(item[0].desc or "")
+        for item in getattr(self, "line_order_corrections", []):
+            if len(item) >= 5:
+                point, editor, combo, original, _suggestion = item[:5]
+                editor.setText(original)
+                combo.blockSignals(True)
+                combo.setCurrentText("Skip")
+                combo.blockSignals(False)
+                if finding is not None:
+                    finding.setdefault("line_order_drafts", {})[point.id] = {
+                        "action": "Skip", "fixed": original,
+                    }
         for item in getattr(self, "sep_corrections", []):
             if len(item) >= 4:
                 if len(item) > 4:
@@ -2296,6 +2359,18 @@ class BaseQAWorkbenchWindow(QMainWindow):
         # A stale wrapper is ignored rather than dereferenced. Normally the editor
         # lists are cleared during rebuild; this is a final guard for queued Qt
         # deferred-delete events on Save/Discard paths.
+        if _is_line_order_finding(self.current_edit_finding or {}):
+            line_order_corrections = [
+                item for item in getattr(self, "line_order_corrections", [])
+                if len(item) >= 5
+                and self._safe_widget_text(item[1], "text") is not None
+                and self._safe_widget_text(item[2], "currentText") is not None
+            ]
+            if line_order_corrections:
+                self.line_order_corrections = line_order_corrections
+                return bool(self._action_apply_line_order_corrections(
+                    return_to_summary=return_to_summary))
+
         desc_edits = [
             item for item in getattr(self, "desc_edits", [])
             if len(item) >= 2 and self._safe_widget_text(item[1], "text") is not None
@@ -2680,6 +2755,7 @@ class BaseQAWorkbenchWindow(QMainWindow):
             cur_finding["stack_action_drafts"] = {}
             cur_finding["description_drafts"] = {}
             cur_finding["separator_drafts"] = {}
+            cur_finding["line_order_drafts"] = {}
         ignored_pids = list(dict.fromkeys(ignored_points or []))
         if cur_finding and ignored_pids:
             cur_finding.setdefault("ignored_pids", set()).update(ignored_pids)
@@ -3181,6 +3257,7 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
         else:
             self.w_close_tol_bar.hide()
 
+            is_line_order_issue = _is_line_order_finding(finding)
             pids = finding.get("pids", [])
             pts = [pr.points[pid] for pid in pids if pid in pr.points]
 
@@ -3193,11 +3270,11 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
             lay_keyin = QVBoxLayout(grp_keyin)
             lay_keyin.setSpacing(6)
 
-            if flag == "LineOrderError":
+            if is_line_order_issue:
                 description_hint = (
                     "Only these same-code pairs are flagged: Start Curve before Start Line, End Line before End Curve, "
-                    "and Close before End Curve. Use Auto Fix when available or edit Fixed; different code sections "
-                    "are never compared, and edits stay staged until Apply or Save."
+                    "and Close before End Curve. Correct is selected by default; choose Skip or Ignore per point as "
+                    "needed. Different code sections are never compared, and choices stay staged until Apply or Save."
                 )
             else:
                 description_hint = (
@@ -3242,13 +3319,18 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
                 row_h.addWidget(lbl_orig, 1)
                 lay_p.addLayout(row_h)
 
-                # Keep the source description in Fixed until the user explicitly chooses
-                # Auto Fix; the proposal remains visible beside this point's key-in box.
-                # A saved draft wins so navigating away and back preserves user edits.
+                # Unknown-code fixes remain opt-in; line-order findings instead default their
+                # per-point action to Correct and preload the safe command-order proposal.
+                # Saved drafts win so navigating away and back preserves user edits.
                 description_draft = finding.get("description_drafts", {}).get(p.id)
+                line_order_draft = finding.get("line_order_drafts", {}).get(p.id, {})
                 is_unknown, autofix_guess = self._autofix_guess_for_description(p.desc)
-                is_line_order_fix = False
-                if flag == "LineOrderError" and not is_unknown:
+                order_guess = None
+                if is_line_order_issue:
+                    # This finding's proposal is a permutation of semantic Field Book commands;
+                    # do not substitute a separate unknown-code guess here.
+                    is_unknown = False
+                    autofix_guess = None
                     try:
                         from ..fieldwork.config import get_command_map
                         commands = get_command_map(
@@ -3256,15 +3338,32 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
                         order_guess = PLC.fix_line_command_order(p.desc or "", commands=commands)
                         if order_guess.strip() != str(p.desc or "").strip():
                             autofix_guess = order_guess
-                            is_line_order_fix = True
                     except Exception:
                         pass
-                initial_desc = p.desc if description_draft is None else description_draft
+                    line_order_action = str(line_order_draft.get("action", "Correct"))
+                    if line_order_action not in {"Correct", "Skip", "Ignore"}:
+                        line_order_action = "Correct"
+                    saved_fixed = line_order_draft.get("fixed")
+                    if saved_fixed is not None:
+                        initial_desc = saved_fixed
+                    elif description_draft is not None:
+                        initial_desc = description_draft
+                    elif line_order_action == "Correct" and autofix_guess:
+                        initial_desc = autofix_guess
+                    else:
+                        initial_desc = p.desc
+                else:
+                    line_order_action = "Correct"
+                    initial_desc = p.desc if description_draft is None else description_draft
                 ed = QLineEdit(str(initial_desc or ""))
-                if is_unknown or is_line_order_fix:
+                if is_unknown or is_line_order_issue:
                     suggestion_kind = "Proposed autofix" if is_unknown else "Proposed order correction"
-                    suggestion_text = (f"{suggestion_kind}: {autofix_guess}" if autofix_guess else
-                                       "Proposed autofix: No safe suggestion; enter the corrected code manually.")
+                    if is_line_order_issue:
+                        suggestion_text = (f"{suggestion_kind}: {autofix_guess}" if autofix_guess else
+                                           "No safe order correction is available; edit Fixed manually, Skip, or Ignore.")
+                    else:
+                        suggestion_text = (f"{suggestion_kind}: {autofix_guess}" if autofix_guess else
+                                           "Proposed autofix: No safe suggestion; enter the corrected code manually.")
                     lbl_suggestion = QLabel(suggestion_text)
                     lbl_suggestion.setObjectName("autofixSuggestion")
                     lbl_suggestion.setTextFormat(Qt.PlainText)
@@ -3281,7 +3380,23 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
                 row_ed = QHBoxLayout()
                 row_ed.addWidget(QLabel("<b>Fixed:</b>"))
                 row_ed.addWidget(ed, 1)
-                if is_unknown or is_line_order_fix:
+                if is_line_order_issue:
+                    row_ed.addWidget(QLabel("<b>Action:</b>"))
+                    cb_order_action = QComboBox(w_pt_box)
+                    cb_order_action.addItems(["Correct", "Skip", "Ignore"])
+                    cb_order_action.setObjectName(f"lineOrderAction_{p.id}")
+                    cb_order_action.setToolTip(
+                        "Correct stages the proposed order; Skip leaves this point active; Ignore suppresses "
+                        "this point's line-order finding for the current review session.")
+                    cb_order_action.setCurrentText(line_order_action)
+                    row_ed.addWidget(cb_order_action)
+                    self.line_order_corrections.append(
+                        (p, ed, cb_order_action, str(p.desc or ""), str(order_guess or "")))
+                    cb_order_action.currentTextChanged.connect(
+                        lambda _action, point=p, editor=ed, combo=cb_order_action, suggestion=order_guess:
+                            self._on_line_order_action_changed(point, editor, combo, suggestion)
+                    )
+                elif is_unknown:
                     btn_autofix = QPushButton("Auto Fix")
                     btn_autofix.setEnabled(autofix_guess is not None)
                     btn_autofix.setToolTip(
@@ -4138,6 +4253,104 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
         descs_str = ", ".join(f"Pt #{p.number} -> '{txt}'" for p, txt, _ in changes)
         self._apply_fix(f"Updated description(s): {descs_str}", do_it,
                         resolved_points=pids, stay_on_edit_page=not return_to_summary)
+        return True
+
+    def _action_apply_line_order_corrections(self, *, return_to_summary: bool = False) -> bool:
+        """Apply each line-order row's staged Correct/Skip/Ignore choice."""
+        if not getattr(self, "line_order_corrections", []):
+            return False
+
+        to_correct: list[tuple[SurveyPoint, str, QLineEdit]] = []
+        to_ignore: list[SurveyPoint] = []
+        to_skip: list[tuple[SurveyPoint, str, str]] = []
+        for item in self.line_order_corrections:
+            if len(item) < 5:
+                continue
+            point, editor, combo, original, _suggestion = item[:5]
+            action = self._safe_widget_text(combo, "currentText")
+            fixed = self._safe_widget_text(editor, "text")
+            if action is None or fixed is None:
+                continue
+            fixed = fixed.strip()
+            if action == "Correct" and fixed != str(point.desc or "").strip():
+                to_correct.append((point, fixed, editor))
+            elif action == "Ignore":
+                to_ignore.append(point)
+            else:
+                to_skip.append((point, str(original or ""), fixed))
+
+        resolved_points = [point.id for point, _fixed, _editor in to_correct]
+        resolved_points.extend(point.id for point in to_ignore)
+        if not resolved_points:
+            return False
+
+        order_proposals = {
+            item[0].id: str(item[4] or "").strip()
+            for item in self.line_order_corrections if len(item) >= 5
+        }
+        invalid_entries = []
+        for point, fixed, editor in to_correct:
+            # The generated proposal only permutes known line-command tokens. Preserve that safe
+            # order-only repair even if a separate unknown-code finding exists on the point.
+            proposal = order_proposals.get(point.id)
+            if proposal and fixed == proposal:
+                continue
+            valid, message = self._validate_desc_text(fixed, self.code_set or set())
+            if not valid:
+                invalid_entries.append((point, fixed, message, editor))
+        if invalid_entries:
+            point, fixed, message, editor = invalid_entries[0]
+            editor.setFocus()
+            QMessageBox.critical(
+                self,
+                "Invalid Field Book Code",
+                f"Point #{point.number} has an invalid description:\n\n"
+                f"'{fixed}'\n\n"
+                f"Error: {message}\n\n"
+                "Keyed-in codes must exist in the Field Book so linework and point processing do not fail. "
+                "Please correct the description or choose Skip/Ignore.",
+            )
+            return False
+
+        def do_it():
+            for point, fixed, _editor in to_correct:
+                point.desc = fixed
+
+        summary_parts = []
+        if to_correct:
+            changed = ", ".join(f"Pt #{point.number} -> '{fixed}'" for point, fixed, _ in to_correct)
+            summary_parts.append(f"Corrected line-command order: {changed}")
+        if to_ignore:
+            summary_parts.append(f"Ignored line-order finding for {len(to_ignore)} point(s)")
+        self._apply_fix(
+            "; ".join(summary_parts),
+            do_it,
+            resolved_points=resolved_points,
+            stay_on_edit_page=not return_to_summary,
+            ignored_points=[point.id for point in to_ignore],
+            project_changed=bool(to_correct),
+        )
+        if return_to_summary:
+            return True
+
+        finding = self.current_edit_finding
+        if finding is None:
+            return True
+        remaining_pids = list(finding.get("pids", []) or [])
+        for point, _original, _fixed in to_skip:
+            if point.id in self.state.project.points and point.id not in remaining_pids:
+                remaining_pids.append(point.id)
+        if remaining_pids:
+            finding["pids"] = remaining_pids
+            finding["numbers"] = [
+                str(self.state.project.points[pid].number)
+                for pid in remaining_pids if pid in self.state.project.points
+            ]
+            finding["line_order_drafts"] = {
+                point.id: {"action": "Skip", "fixed": fixed}
+                for point, _original, fixed in to_skip
+            }
+            self._open_inline_editor(finding, start_session=False)
         return True
 
     def _action_apply_separator_corrections(self, *, return_to_summary: bool = False) -> bool:
