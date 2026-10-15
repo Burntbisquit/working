@@ -101,11 +101,92 @@ class FeatureCode:
                    bool(d.get("ground", True)))
 
 
+class _CodeDict(dict):
+    """Feature-code mapping that caches its casefolded key set until mutated."""
+
+    __slots__ = ("_casefolded", "_sorted_json_cache")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._casefolded: frozenset[str] | None = None
+        self._sorted_json_cache: tuple[tuple, str] | None = None
+
+    def __getstate__(self):
+        return None
+
+    def __setstate__(self, _state):
+        self._casefolded = None
+        self._sorted_json_cache = None
+
+    def _invalidate(self):
+        self._casefolded = None
+        self._sorted_json_cache = None
+
+    def __setitem__(self, key, value):
+        self._invalidate()
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self._invalidate()
+        super().__delitem__(key)
+
+    def pop(self, *args):
+        self._invalidate()
+        return super().pop(*args)
+
+    def popitem(self):
+        self._invalidate()
+        return super().popitem()
+
+    def clear(self):
+        self._invalidate()
+        super().clear()
+
+    def update(self, *args, **kwargs):
+        self._invalidate()
+        super().update(*args, **kwargs)
+
+    def setdefault(self, key, default=None):
+        self._invalidate()
+        return super().setdefault(key, default)
+
+    def casefolded_set(self) -> frozenset[str]:
+        cached = getattr(self, "_casefolded", None)
+        if cached is None:
+            cached = frozenset(str(code).casefold() for code in self if str(code))
+            self._casefolded = cached
+        return cached
+
+
 class FeatureCodeTable:
     def __init__(self, codes=None):
-        self.codes: dict[str, FeatureCode] = {}
+        self.codes: dict[str, FeatureCode] = _CodeDict()
         for c in codes or []:
             self.codes[c.code.upper()] = c
+
+    def casefolded_set(self) -> frozenset[str]:
+        if hasattr(self.codes, "casefolded_set"):
+            return self.codes.casefolded_set()
+        return frozenset(str(code).casefold() for code in self.codes if str(code))
+
+    def sorted_codes_json(self) -> str:
+        import json
+        snap = tuple(
+            (k, v.code, v.name, v.kind, v.layer, v.symbol, v.color, v.linetype, v.breakline, v.ground)
+            for k, v in self.codes.items()
+        )
+        cache = getattr(self.codes, "_sorted_json_cache", None)
+        if cache is not None and cache[0] == snap:
+            return cache[1]
+        codes = sorted(
+            self.to_list(),
+            key=lambda item: (str(item.get("code", "")).casefold(), str(item.get("code", ""))),
+        )
+        encoded = json.dumps(codes, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False, default=str, allow_nan=True)
+        if hasattr(self.codes, "_sorted_json_cache"):
+            self.codes._sorted_json_cache = (snap, encoded)
+        return encoded
 
     def get(self, code: str) -> FeatureCode | None:
         return self.codes.get((code or "").upper())
@@ -163,11 +244,14 @@ class ParsedDesc:
     note: str = ""
 
 
+_EMPTY_CODES: frozenset[str] = frozenset()
+
+
 @functools.lru_cache(maxsize=65536)
-def _parse_description_cached(desc: str, command_tokens: tuple[str, ...], known_codes: tuple[str, ...]) -> ParsedDesc:
+def _parse_description_cached(desc: str, command_tokens: tuple[str, ...], known_codes: frozenset[str]) -> ParsedDesc:
     commands = dict(zip(COMMAND_MEANINGS, command_tokens))
     token_meanings = command_meanings(commands)
-    known = set(known_codes)
+    known = known_codes
 
     description_part = desc
     description_separator = commands.get("description", "")
@@ -246,7 +330,14 @@ def parse_description(desc: str, commands=None, known_codes=None) -> ParsedDesc:
     """
     semantic_tokens = command_map(commands)
     command_values = tuple(semantic_tokens[meaning] for meaning in COMMAND_MEANINGS)
-    normalized_codes = tuple(sorted({str(code).casefold() for code in (known_codes or ()) if str(code)}))
+    if not known_codes:
+        normalized_codes = _EMPTY_CODES
+    elif hasattr(known_codes, "casefolded_set"):
+        normalized_codes = known_codes.casefolded_set()
+    elif isinstance(known_codes, frozenset):
+        normalized_codes = known_codes
+    else:
+        normalized_codes = frozenset(str(code).casefold() for code in known_codes if str(code))
     return _parse_description_cached(str(desc or ""), command_values, normalized_codes)
 
 def _fc(code, name, kind, layer, symbol="cross", color=(255, 255, 255), linetype="CONTINUOUS",
@@ -355,7 +446,8 @@ def build_linework(points, table: FeatureCodeTable, order: str = "file", command
 
     for point in pts:
         parsed = parse_description(point.desc, commands=semantic_tokens, known_codes=table.codes)
-        feature_code, string_id = table.resolve_parts(point.desc, commands=semantic_tokens)
+        feature_code = table.codes.get(parsed.code) if parsed.code else None
+        string_id = parsed.string
         if feature_code is None or feature_code.kind == "point":
             continue
         key = (feature_code.code, string_id)

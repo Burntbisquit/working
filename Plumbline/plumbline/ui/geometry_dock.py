@@ -81,6 +81,7 @@ class GeometryDock(QWidget):
 
     def refresh(self, keep_selection=False):
         selected_id = self.current_segment.entity_id if keep_selection and self.current_segment else None
+        selected_seg_id = self.current_segment.seg_id if keep_selection and self.current_segment else None
         self._updating = True
         try:
             self._segments = build_segments(self.state.project)
@@ -93,6 +94,11 @@ class GeometryDock(QWidget):
             if selected_id is not None:
                 for row, segment in enumerate(self._segments):
                     if segment.entity_id == selected_id:
+                        self.segments.selectRow(row)
+                        break
+            if self.segments.currentRow() < 0 and selected_seg_id is not None:
+                for row, segment in enumerate(self._segments):
+                    if segment.seg_id == selected_seg_id:
                         self.segments.selectRow(row)
                         break
             if self.segments.currentRow() < 0 and self._segments:

@@ -458,6 +458,11 @@ def _validate_line_command_order(working_rows, f2f_set, settings=None, fieldbook
     except Exception:
         from ..core.fieldbook_syntax import command_map
         semantic_tokens = command_map(commands)
+    if command_set is None:
+        try:
+            command_set = get_command_set(fieldbook_path, semantic_tokens)
+        except Exception:
+            command_set = COMMAND_SET
     meanings = command_meanings(semantic_tokens)
 
     from collections import defaultdict
@@ -508,41 +513,42 @@ def _validate_line_command_order(working_rows, f2f_set, settings=None, fieldbook
         # its commands are classified as orphans, but that must not hide an ordering error such
         # as ZZ PC ST. Keep the fallback inside the code portion and split multicode groups first,
         # so note text and neighboring code sections cannot supply the missing commands.
-        code_part = parsed.get("code_part", "")
-        multicode = semantic_tokens.get("multicode", "")
-        code_segments = split_at_separator(code_part, multicode, maxsplit=0) if multicode else [code_part]
-        for segment in code_segments:
-            segment_tokens = _extract_semantic_tokens(
-                segment, f2f_set, command_set or get_command_set(fieldbook_path, semantic_tokens),
-                semantic_tokens)
-            segment_classified = _classify_tokens_sequential(
-                segment_tokens, f2f_set, command_set=command_set, rules=rules,
-                commands=semantic_tokens)
-            unknown_commands = defaultdict(list)
-            unknown_code_raw = {}
-            active_unknown_code = None
-            for item_index, item in enumerate(segment_classified):
-                if item.get("type") == "code":
-                    active_unknown_code = (item_index if item.get("status") == "unknown" else None)
-                    if active_unknown_code is not None:
-                        unknown_code_raw[active_unknown_code] = item.get("raw", "")
-                    continue
-                if item.get("type") != "command" or active_unknown_code is None:
-                    continue
-                meaning = item.get("meaning") or meanings.get(item.get("norm", "").casefold(), "")
-                if meaning in line_meanings:
-                    unknown_commands[active_unknown_code].append((meaning, item.get("raw", "")))
+        if (any(item.get("status") == "unknown" for item in classified)
+                and any(item.get("type") == "command" for item in classified)):
+            code_part = parsed.get("code_part", "")
+            multicode = semantic_tokens.get("multicode", "")
+            code_segments = split_at_separator(code_part, multicode, maxsplit=0) if multicode else [code_part]
+            for segment in code_segments:
+                segment_tokens = _extract_semantic_tokens(
+                    segment, f2f_set, command_set, semantic_tokens)
+                segment_classified = _classify_tokens_sequential(
+                    segment_tokens, f2f_set, command_set=command_set, rules=rules,
+                    commands=semantic_tokens)
+                unknown_commands = defaultdict(list)
+                unknown_code_raw = {}
+                active_unknown_code = None
+                for item_index, item in enumerate(segment_classified):
+                    if item.get("type") == "code":
+                        active_unknown_code = (item_index if item.get("status") == "unknown" else None)
+                        if active_unknown_code is not None:
+                            unknown_code_raw[active_unknown_code] = item.get("raw", "")
+                        continue
+                    if item.get("type") != "command" or active_unknown_code is None:
+                        continue
+                    meaning = item.get("meaning") or meanings.get(item.get("norm", "").casefold(), "")
+                    if meaning in line_meanings:
+                        unknown_commands[active_unknown_code].append((meaning, item.get("raw", "")))
 
-            for code_index, events in unknown_commands.items():
-                violation = _first_line_command_order_violation(
-                    [meaning for meaning, _token in events], settings)
-                if violation is None:
-                    continue
-                bad_index, reason = violation
-                oid_flags[oid].append("LineOrderError")
-                oid_details[oid].append(
-                    f"{reason} at '{events[bad_index][1]}' in unrecognized code section "
-                    f"'{unknown_code_raw[code_index]}' — '{raw_desc}'")
+                for code_index, events in unknown_commands.items():
+                    violation = _first_line_command_order_violation(
+                        [meaning for meaning, _token in events], settings)
+                    if violation is None:
+                        continue
+                    bad_index, reason = violation
+                    oid_flags[oid].append("LineOrderError")
+                    oid_details[oid].append(
+                        f"{reason} at '{events[bad_index][1]}' in unrecognized code section "
+                        f"'{unknown_code_raw[code_index]}' — '{raw_desc}'")
 
     return dict(oid_flags)
 

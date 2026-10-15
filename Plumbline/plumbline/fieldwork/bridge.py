@@ -392,6 +392,10 @@ def _point_is_deleted(point) -> bool:
 def describe_flags(rows, f2f=None, fieldbook_path=None) -> dict[int, dict]:
     """Parse active descriptions and report the ones with flags, keyed by row OID."""
     out = {}
+    commands = F.get_command_map(fieldbook_path) if fieldbook_path else None
+    command_set = F.get_command_set(fieldbook_path, commands) if fieldbook_path else None
+    rules = F.get_correction_rules(fieldbook_path) if fieldbook_path else []
+    f2f_codes = f2f or set()
     for r in rows:
         if not row_is_usable(r) or _row_is_removed(r):
             continue
@@ -400,7 +404,10 @@ def describe_flags(rows, f2f=None, fieldbook_path=None) -> dict[int, dict]:
         # classify non-empty text as UnknownCode, but still surface genuinely blank rows.
         if not f2f and raw_description.strip():
             continue
-        parsed = P.parse_desc_field(raw_description, f2f or set(), fieldbook_path=fieldbook_path)
+        parsed = P.parse_desc_field(
+            raw_description, f2f_codes, fieldbook_path=fieldbook_path,
+            command_set=command_set, rules=rules, commands=commands,
+        )
         if parsed.get("flags"):
             out[int(r[OID]) if str(r[OID]).strip().isdigit() else r[OID]] = parsed
     return out

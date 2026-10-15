@@ -100,6 +100,12 @@ def detect_line_errors(working_rows, fieldbook_path=None, f2f_set=None, command_
     semantic_tokens = _command_map(fieldbook_path, commands)
     token_meanings = command_meanings(semantic_tokens)
     cs = _command_set_for(fieldbook_path, command_set, semantic_tokens)
+    if rules is None and fieldbook_path:
+        try:
+            from .config import get_correction_rules
+            rules = get_correction_rules(fieldbook_path)
+        except Exception:
+            rules = []
     line_meanings = set(RANK)
 
     oid_list = []

@@ -87,13 +87,16 @@ def run_checks(project, z_tol: float = 0.05, xy_tol: float = 0.01, spike_k: floa
     # 4. unknown feature codes
     unknown: dict[str, list] = {}
     commands = project.settings.get("f2f_commands")
+    resolved_codes = []
     for p in pts:
+        pd = parse_description(p.desc, commands=commands, known_codes=project.codes.codes)
+        fc = project.codes.get(pd.code) if pd.code else None
+        resolved_codes.append(fc)
         # A point explicitly removed by a fieldwork import/legacy project is not an
         # active description error, even if it remains in the serialized point store.
         if _is_deleted_point(p):
             continue
-        pd = parse_description(p.desc, commands=commands, known_codes=project.codes.codes)
-        if pd.code and project.codes.get(pd.code) is None:
+        if pd.code and fc is None:
             unknown.setdefault(pd.code, []).append(p.id)
     if unknown:
         top = ", ".join(f"{c} ({len(v)})" for c, v in sorted(unknown.items(), key=lambda kv: -len(kv[1]))[:8])
@@ -126,10 +129,7 @@ def run_checks(project, z_tol: float = 0.05, xy_tol: float = 0.01, spike_k: floa
     #    The prediction is the MEDIAN of the planes through every triple of neighbours, so one bad shot
     #    next door cannot drag its neighbours into the report (a least-squares plane would).
     ok = np.isfinite(xyz[:, 2])
-    ground = np.array([(project.codes.get(parse_description(
-        p.desc, commands=commands, known_codes=project.codes.codes).code) is None or
-        project.codes.get(parse_description(
-            p.desc, commands=commands, known_codes=project.codes.codes).code).ground) for p in pts])
+    ground = np.array([(fc is None or fc.ground) for fc in resolved_codes])
     use = ok & ground
     if use.sum() >= neighbours + 2:
         if spike_min is None:

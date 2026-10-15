@@ -50,3 +50,55 @@ def test_segment_rows_use_linked_point_properties_and_measure_to_next():
     assert rows[0]["number"] == "1"
     assert rows[0]["to_next"] == pytest.approx(5.0)
     assert rows[1]["to_next"] is None
+
+
+def test_geometry_dock_retains_selected_segment_after_linework_rebuild():
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+    from plumbline.core.featurecodes import default_codes
+    from plumbline.ui.app_state import AppState
+    from plumbline.ui.geometry_dock import GeometryDock
+
+    _app = QApplication.instance() or QApplication([])
+    project = Project("Dock Selection")
+    project.codes = default_codes()
+    project.add_point(0, 0, 10, number="1", desc="EP1 ST")
+    project.add_point(10, 0, 10, number="2", desc="EP1 END")
+    project.add_point(0, 5, 10, number="3", desc="SW1 ST")
+    project.add_point(10, 5, 10, number="4", desc="SW1 END")
+    project.process_linework(order="number")
+
+    state = AppState(project)
+    dock = GeometryDock(state)
+    dock.segments.selectRow(1)
+    assert dock.current_segment is not None
+    assert dock.current_segment.seg_id == "SW1-01"
+    old_entity_id = dock.current_segment.entity_id
+
+    # Editing a point in the Geometry panel triggers process_linework(order="number"),
+    # which replaces derived polylines with new entity IDs while keeping seg_id stable.
+    dock.points.item(0, 4).setText("1.5000")
+    assert dock.current_segment is not None
+    assert dock.current_segment.seg_id == "SW1-01"
+    assert dock.current_segment.entity_id != old_entity_id
+
+
+def test_segments_resolve_legacy_point_number_links_when_point_ids_are_absent():
+    project = Project("Legacy linework")
+    p1 = project.add_point(0, 0, 100, number="10", desc="EG ST")
+    p2 = project.add_point(5, 0, 100, number="20", desc="EG END")
+    project.add_polyline(
+        [[p1.x, p1.y, p1.z], [p2.x, p2.y, p2.z]],
+        "ROAD-GRAVEL",
+        attrs={"code": "EG", "string": "", "points": ["10", "20"]},
+        derived="linework",
+        kind="breakline",
+    )
+
+    segments = build_segments(project)
+    assert len(segments) == 1
+    assert segments[0].linked
+    assert segments[0].point_ids == (p1.id, p2.id)
+    assert segments[0].point_numbers == ("10", "20")
+
+

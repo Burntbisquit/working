@@ -17,14 +17,15 @@ import sys
 from time import perf_counter_ns
 from typing import Callable, TYPE_CHECKING
 
-from .geometry_segments import build_segments
+from .featurecodes import _parse_description_cached, build_linework
+from .geometry_segments import build_segments, segment_point_rows
 from .qa import run_checks
 from .spatial import SpatialIndex
 
 if TYPE_CHECKING:  # pragma: no cover
     from .project import Project
 
-SUITE_VERSION = "1"
+SUITE_VERSION = "2"
 PROFILES = {
     "Quick": {"repeats": 1, "qa": False},
     "Standard": {"repeats": 3, "qa": True},
@@ -88,6 +89,8 @@ class PerformanceReport:
             f"- Text: {project.get('texts', 0):,}",
             f"- Surfaces: {project.get('surfaces', 0):,}",
             f"- Layers: {project.get('layers', 0):,}",
+            f"- Feature codes: {project.get('codes', 0):,}",
+            f"- Linework processed: {'Yes' if project.get('linework_processed') else 'No'}",
             "",
             "## Timings",
             "",
@@ -150,10 +153,18 @@ def machine_fingerprint() -> dict:
     }
 
 
-def _measure(operation: str, function: Callable[[], object], iterations: int, detail: Callable[[object], str] | None = None) -> Measurement:
+def _measure(
+    operation: str,
+    function: Callable[[], object],
+    iterations: int,
+    detail: Callable[[object], str] | None = None,
+    before_each: Callable[[], None] | None = None,
+) -> Measurement:
     elapsed = []
     result = None
     for _ in range(iterations):
+        if before_each is not None:
+            before_each()
         started = perf_counter_ns()
         result = function()
         elapsed.append((perf_counter_ns() - started) / 1_000_000.0)
@@ -161,6 +172,13 @@ def _measure(operation: str, function: Callable[[], object], iterations: int, de
         operation=operation, iterations=iterations, total_ms=sum(elapsed), mean_ms=sum(elapsed) / len(elapsed),
         best_ms=min(elapsed), worst_ms=max(elapsed), detail=detail(result) if detail else "",
     )
+
+
+def _segment_inventory_detail(project: Project, result: list) -> str:
+    if not result and project.points:
+        return "0 segment(s) (run Process Linework to generate polylines)"
+    linked = sum(1 for seg in result if seg.linked)
+    return f"{len(result):,} segment(s) ({linked:,} linked)"
 
 
 def benchmark_project(project: Project, profile: str = "Standard") -> PerformanceReport:
@@ -178,22 +196,73 @@ def benchmark_project(project: Project, profile: str = "Standard") -> Performanc
     # Project.extents() uses a legitimate performance cache. Benchmarking must not
     # leave even that cache changed, so a user can run it while reviewing a job.
     point_array_cache = getattr(project, "_pa_cache", None)
+    commands = (project.settings or {}).get("f2f_commands")
+
+    def clear_pa_cache() -> None:
+        project._pa_cache = None
+
     try:
+        segments_snapshot = build_segments(project)
         metrics = [
-            _measure("Project extents", project.extents, repeats),
+            _measure("Project extents", project.extents, repeats, before_each=clear_pa_cache),
             _measure("Linework input fingerprint", lambda: project.linework_input_signature(order="number"), repeats),
-            _measure("Geometry segment inventory", lambda: build_segments(project), repeats,
-                     lambda result: f"{len(result):,} segment(s)"),
-            _measure("Spatial index build (cold)", lambda: SpatialIndex(project), repeats,
-                     lambda result: f"{len(result.pt_ids):,} points; {len(result.segA):,} drawable segment(s)"),
+            _measure(
+                "Linework build (number order)",
+                lambda: build_linework(project.points.values(), project.codes, order="number", commands=commands),
+                repeats,
+                lambda result: f"{len(result):,} string(s) from {len(project.points):,} points; {len(project.codes):,} code(s)",
+            ),
+            _measure(
+                "Geometry segment inventory",
+                lambda: build_segments(project),
+                repeats,
+                lambda result: _segment_inventory_detail(project, result),
+            ),
+            _measure(
+                "Geometry segment point rows",
+                lambda: [segment_point_rows(project, seg) for seg in segments_snapshot],
+                repeats,
+                lambda result: f"{sum(len(rows) for rows in result):,} vertex row(s) across {len(segments_snapshot):,} segment(s)",
+            ),
+            _measure(
+                "Spatial index build (cold)",
+                lambda: SpatialIndex(project),
+                repeats,
+                lambda result: f"{len(result.pt_ids):,} points; {len(result.segA):,} drawable segment(s)",
+                before_each=clear_pa_cache,
+            ),
         ]
         if spec["qa"]:
-            metrics.append(_measure("Point QA checks", lambda: run_checks(project), repeats,
-                                    lambda result: f"{len(result):,} finding(s)"))
+            if hasattr(project.codes.codes, "_invalidate"):
+                project.codes.codes._invalidate()
+            _parse_description_cached.cache_clear()
+            metrics.append(_measure(
+                "Point QA checks",
+                lambda: run_checks(project),
+                repeats,
+                lambda result: f"{len(result):,} finding(s); {len(project.codes):,} code(s)",
+            ))
+            from ..fieldwork import bridge as FB
+            f2f_codes = project.codes.casefolded_set() if hasattr(project.codes, "casefolded_set") else {
+                c.code.casefold() for c in project.codes
+            }
+            fb_path = (project.settings or {}).get("fieldbook_file") or None
+            metrics.append(_measure(
+                "Fieldwork line-sequence checks",
+                lambda: FB.check_linework_project(project, f2f=f2f_codes, fieldbook_path=fb_path),
+                repeats,
+                lambda result: f"{len(result.get('line_issues', ())):,} line issue(s)",
+            ))
         return PerformanceReport(
             created_utc=datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
             suite_version=SUITE_VERSION, profile=profile, machine=machine_fingerprint(),
-            project={"name": project.name, **project.summary()}, measurements=tuple(metrics),
+            project={
+                "name": project.name,
+                **project.summary(),
+                "codes": len(project.codes),
+                "linework_processed": project.linework_is_processed(),
+            },
+            measurements=tuple(metrics),
         )
     finally:
         project._pa_cache = point_array_cache

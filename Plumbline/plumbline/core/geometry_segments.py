@@ -63,17 +63,21 @@ def _lengths(vertices: np.ndarray, closed: bool) -> tuple[float, float]:
     return length_2d, length_3d
 
 
-def _coerce_point_ids(entity: Polyline) -> tuple[int | None, ...]:
-    raw = (entity.attrs or {}).get("point_ids", [])
-    if not isinstance(raw, (list, tuple)) or len(raw) != len(entity.verts):
-        return tuple(None for _ in entity.verts)
-    result = []
-    for value in raw:
-        try:
-            result.append(int(value) if value is not None else None)
-        except (TypeError, ValueError):
-            result.append(None)
-    return tuple(result)
+def _coerce_point_ids(entity: Polyline, by_number: dict[str, int] | None = None) -> tuple[int | None, ...]:
+    attrs = entity.attrs or {}
+    raw = attrs.get("point_ids")
+    if isinstance(raw, (list, tuple)) and len(raw) == len(entity.verts):
+        result = []
+        for value in raw:
+            try:
+                result.append(int(value) if value is not None else None)
+            except (TypeError, ValueError):
+                result.append(None)
+        return tuple(result)
+    legacy = attrs.get("points")
+    if by_number and isinstance(legacy, (list, tuple)) and len(legacy) == len(entity.verts):
+        return tuple(by_number.get(str(num)) if num not in (None, "") else None for num in legacy)
+    return tuple(None for _ in entity.verts)
 
 
 def build_segments(project: Project) -> list[Segment]:
@@ -84,13 +88,18 @@ def build_segments(project: Project) -> list[Segment]:
     id.  No project state is changed.
     """
     rows = []
+    by_number: dict[str, int] | None = None
     for entity in project.entities.values():
         if not isinstance(entity, Polyline) or len(entity.verts) < 1:
             continue
         attrs = entity.attrs or {}
+        if "point_ids" not in attrs and "points" in attrs and by_number is None:
+            by_number = {}
+            for point in project.points.values():
+                by_number.setdefault(str(point.number), point.id)
         code = str(attrs.get("code") or entity.kind or "LINE").strip().upper()
         string = str(attrs.get("string") or "").strip()
-        point_ids = _coerce_point_ids(entity)
+        point_ids = _coerce_point_ids(entity, by_number)
         numbers = tuple(str(project.points[p].number) if p in project.points else ""
                         for p in point_ids)
         first_number = next((number for number in numbers if number), "")
