@@ -279,6 +279,11 @@ class SelectTool(Tool):
         self._grip = None
         self._grip_pos = None
         self.hover = None
+        self.linked_edit_mode = False
+
+    def set_linked_edit_mode(self, enabled: bool):
+        """Enable the explicit geometry-panel mode for point-driven linework."""
+        self.linked_edit_mode = bool(enabled)
 
     @property
     def wants_snap(self):
@@ -289,7 +294,8 @@ class SelectTool(Tool):
         return bool(g and hit.kind == "node" and hit.ref and len(hit.ref) > 2 and hit.ref[1] == g[0] and hit.ref[2] == g[1])
 
     def hint(self):
-        return "Click to select - drag right for window, left for crossing - Shift adds, Ctrl toggles - drag a vertex grip to edit - Del deletes"
+        suffix = " Linked linework edit mode is ON." if self.linked_edit_mode else " Linked linework is locked; enable it in Geometry."
+        return "Click to select - drag right for window, left for crossing - Shift adds, Ctrl toggles - drag a vertex grip to edit - Del deletes." + suffix
 
     def _grips(self):
         st = self.state
@@ -341,11 +347,32 @@ class SelectTool(Tool):
         if grip is not None and self._drag:
             eid, i = grip
             hit = self.c.snap_hit
-            with self.state.edit("Move vertex"):
+            entity = self.state.project.entities.get(eid)
+            linked_ids = (entity.attrs or {}).get("point_ids", []) if isinstance(entity, Polyline) else []
+            linked_point_id = linked_ids[i] if isinstance(linked_ids, (list, tuple)) and i < len(linked_ids) else None
+            is_linked_linework = bool(isinstance(entity, Polyline) and entity.derived == "linework" and linked_point_id is not None)
+            if is_linked_linework and not self.linked_edit_mode:
+                self.say("Point-driven linework is locked. Enable Edit linked linework in the Geometry panel.")
+                self._rect = None
+                return
+            with self.state.edit("Move linked field point" if is_linked_linework else "Move vertex"):
                 e = self.state.project.entities[eid]
-                e.verts[i, 0], e.verts[i, 1] = x, y
-                if hit is not None and _finite(hit.z):
-                    e.verts[i, 2] = hit.z
+                if is_linked_linework:
+                    point = self.state.project.points.get(int(linked_point_id))
+                    if point is None:
+                        self.say("This linework vertex has no survey-point link and remains locked.")
+                        self._rect = None
+                        return
+                    point.x, point.y = x, y
+                    if hit is not None and _finite(hit.z):
+                        point.z = hit.z
+                    # Rebuild every code string from the survey points.  This is what makes a
+                    # shared point move every attached string instead of leaving stale geometry.
+                    self.state.project.process_linework(order="number")
+                else:
+                    e.verts[i, 0], e.verts[i, 1] = x, y
+                    if hit is not None and _finite(hit.z):
+                        e.verts[i, 2] = hit.z
             self._rect = None
             return
         if self._drag:

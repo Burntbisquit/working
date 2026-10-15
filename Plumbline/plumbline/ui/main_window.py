@@ -39,6 +39,7 @@ from .dialogs import (AboutDialog, FeatureCodesDialog, HelpDialog, PluginsDialog
                       TransformDialog, TraverseDialog, WelcomeDialog)
 from .docks import ConsoleDock, FieldBookDock, LayersDock, MessagesDock, PointsDock, PropertiesDock, SurfacesDock
 from .groups_dock import GroupsDock
+from .geometry_dock import GeometryDock
 from .export_dialogs import export_dxf, export_gis, export_kml, export_landxml, export_points_csv
 from .f2f_dialog import ConvertFieldToFinishDialog
 from .import_export import (IMPORT_FILTER, POINTS_FILTER, ImportPlan, Importer, ReferenceFolderDialog,
@@ -254,6 +255,7 @@ class MainWindow(QMainWindow):
         self.surfaces = SurfacesDock(st)
         self.imagery = ImageryDock(st, cv)
         self.fieldbook_dock = FieldBookDock(st)
+        self.geometry = GeometryDock(st)
         self.props = PropertiesDock(st)
         self.points = PointsDock(st)
         self.messages = MessagesDock(st)
@@ -266,7 +268,8 @@ class MainWindow(QMainWindow):
         self.d_groups = self._dock("Groups", self.groups, Qt.LeftDockWidgetArea, "groups")
         self.d_pts = self._dock("Points", self.points, Qt.LeftDockWidgetArea, "points")
 
-        # Right dock area: Properties, Field Book
+        # Right dock area: Geometry, Properties, Field Book
+        self.d_geometry = self._dock("Geometry", self.geometry, Qt.RightDockWidgetArea, "geometry")
         self.d_props = self._dock("Properties", self.props, Qt.RightDockWidgetArea, "props")
         self.d_fieldbook = self._dock("Field Book", self.fieldbook_dock, Qt.RightDockWidgetArea, "fieldbook")
 
@@ -280,8 +283,9 @@ class MainWindow(QMainWindow):
         self.tabifyDockWidget(self.d_groups, self.d_pts)
         self.d_layers.raise_()
 
+        self.tabifyDockWidget(self.d_geometry, self.d_props)
         self.tabifyDockWidget(self.d_props, self.d_fieldbook)
-        self.d_props.raise_()
+        self.d_geometry.raise_()
 
         self.tabifyDockWidget(self.d_msg, self.d_con)
         self.d_msg.raise_()
@@ -299,6 +303,7 @@ class MainWindow(QMainWindow):
         self.d_depth.hide()
         self.depth.pick_line_requested.connect(lambda: self.set_tool("depth_line"))
         self.depth.view.changed.connect(cv.update)
+        self.geometry.edit_mode_changed.connect(lambda enabled: self.tools["select"].set_linked_edit_mode(enabled))
 
     def _act(self, text, slot=None, shortcut=None, icon=None, checkable=False, tip=None, checked=False):
         a = QAction(text, self)
@@ -518,8 +523,8 @@ class MainWindow(QMainWindow):
         mtb.addAction(self.tb_survey.toggleViewAction())
         mtb.addAction(self.tb_draw_controls.toggleViewAction())
         md = add_menu("&Panels", m)
-        for d in (self.d_layers, self.d_surf, self.d_img, self.d_groups, self.d_pts, self.d_props, self.d_fieldbook,
-                  self.d_msg, self.d_con, self.d_3d, self.d_depth):
+        for d in (self.d_layers, self.d_surf, self.d_img, self.d_groups, self.d_pts, self.d_geometry, self.d_props,
+                  self.d_fieldbook, self.d_msg, self.d_con, self.d_3d, self.d_depth):
             md.addAction(d.toggleViewAction())
         md.addSeparator()
         md.addMenu(self.points.col_menu)          # the point list's own columns live here too

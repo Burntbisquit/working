@@ -201,6 +201,11 @@ def detect_line_errors(working_rows, fieldbook_path=None, f2f_set=None, command_
             add_order_issue()
             return out
 
+        # A plain matching code is still a line vertex once this code instance carries
+        # line commands anywhere in the book.  That matters after END: the next plain
+        # matching point is the start of a new, incorrectly commanded segment, not a
+        # harmless unrelated shot.
+        saw_terminal = False
         for oid, line_commands, raw, _code in points:
             if "start_line" in line_commands:
                 if in_line and current_segment:
@@ -218,9 +223,14 @@ def detect_line_errors(working_rows, fieldbook_path=None, f2f_set=None, command_
                     segments.append(current_segment)
                     current_segment = []
                     in_line = False
-            elif line_commands:
+                    saw_terminal = True
+            else:
+                # First occurrence without ST, or a point after END/X whose next
+                # matching code forgot ST.  The proposed repair belongs on this
+                # matching vertex, never on an intervening cross-section shot.
+                relation = "after End Line/Close" if saw_terminal else "as its first line vertex"
                 add("Missing ST", oid,
-                    f"Line {code_raw} has {line_commands} at OID {oid} ({raw}) without a prior Start Line",
+                    f"Line {code_raw} appears {relation} at OID {oid} ({raw}) without Start Line",
                     f"Add Start Line to OID {oid}")
                 in_line = True
                 current_segment = [(oid, line_commands, raw)]
@@ -228,6 +238,7 @@ def detect_line_errors(working_rows, fieldbook_path=None, f2f_set=None, command_
                     segments.append(current_segment)
                     current_segment = []
                     in_line = False
+                    saw_terminal = True
         if current_segment:
             add("Missing END", current_segment[-1][0],
                 f"Line {code_raw} segment starting at OID {current_segment[0][0]} never received "

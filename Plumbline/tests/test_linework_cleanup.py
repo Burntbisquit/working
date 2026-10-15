@@ -119,6 +119,19 @@ def test_custom_fieldbook_meanings_and_alphanumeric_separators_are_used():
     assert parsed["free_desc"] == "noteworthy"
 
 
+def test_initial_plain_line_vertex_requires_start_line_once_the_code_is_a_line():
+    issues = LC.detect_line_errors(rows("TOC", "TOC END"), f2f_set=F2F)
+    starts = [issue for issue in issues if issue["issue_type"] == "Missing ST"]
+    assert [issue["oid"] for issue in starts] == ["1"]
+
+
+def test_missing_start_after_an_end_is_put_on_the_next_matching_line_point_not_an_interleaved_shot():
+    issues = LC.detect_line_errors(
+        rows("TOC ST", "GS", "TOC END", "GS", "TOC", "TOC END"), f2f_set=F2F)
+    starts = [issue for issue in issues if issue["issue_type"] == "Missing ST"]
+    assert [(issue["oid"], "after End Line/Close" in issue["detail"]) for issue in starts] == [("5", True)]
+
+
 def test_a_second_segment_starting_before_the_first_one_ends_is_a_missing_end_not_line_order():
     issues = LC.detect_line_errors(rows("TOC ST", "TOC ST", "TOC END"), f2f_set=F2F)
     assert "Missing END" in kinds(issues)
