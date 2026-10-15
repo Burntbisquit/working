@@ -82,11 +82,11 @@ def read_carlson_fieldbook(file_path: Path):
     return fieldbook_headers, fieldbook_rows, unknown_entity_codes
 
 
-def write_fwb_file(dest_path: Path, headers, rows, rules=None, commands=None):
+def write_fwb_file(dest_path: Path, headers, rows, rules=None, commands=None, extra_fields=None):
     """Write a headered .fwb CSV (never sorted, UTF-8). Returns True/False.
-    If rules/commands provided, they are appended as JSON comment block so they stay with the fieldbook file (single-file, commands first/r_rules last).
-    rules: list of [common_error, fix] pairs
-    commands: ordered Field Book tokens or a semantic meaning-to-token mapping
+
+    ``commands`` may be an ordered token list or a meaning-to-token mapping. Unknown
+    ``#EXTRA_JSON`` keys are kept when editing an existing book via ``write_fwb_extra``.
     """
     import json
     try:
@@ -94,27 +94,22 @@ def write_fwb_file(dest_path: Path, headers, rows, rules=None, commands=None):
             writer = csv.writer(f)
             writer.writerow(headers)
             writer.writerows(rows)
-            # Append extra as comment lines for single-file storage — commands first (fixed, doesn't grow), rules last (grows, append)
-            extras = {}
+            extras = dict(extra_fields or {})
             if commands is not None:
                 extras["commands"] = commands
             if rules is not None:
                 extras["rules"] = rules
             if extras:
-                # Write as comment line so csv reader can skip but we can parse — single-file, no sidecar
                 f.write(f"#EXTRA_JSON {json.dumps(extras, ensure_ascii=False)}\n")
     except OSError as e:
         print(f"Write .fwb failed {dest_path}: {e}")
         return False
     return True
 
-def read_fwb_extra(file_path: Path):
-    """Read extra rules/commands stored in .fwb file or sidecar .meta.json.
-    Returns dict with keys 'rules', 'commands' or {} if none.
-    """
-    import json, os
+def _read_fwb_extra_raw(file_path: Path):
+    """Read the un-normalized metadata so edits do not discard future/office-specific keys."""
+    import json
     extras = {}
-    # Try sidecar first (legacy — not written anymore, but still read if present)
     try:
         sidecar = Path(str(file_path) + ".meta.json")
         if sidecar.exists():
@@ -124,45 +119,70 @@ def read_fwb_extra(file_path: Path):
                     extras.update(data)
     except Exception:
         pass
-    # Try embedded comment in .fwb
     try:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        with open(file_path, "r", encoding="utf-8-sig", errors="ignore") as f:
             for line in f:
-                line=line.strip()
+                line = line.strip()
                 if line.startswith("#EXTRA_JSON"):
                     try:
-                        j = line[len("#EXTRA_JSON"):].strip()
-                        data = json.loads(j)
+                        data = json.loads(line[len("#EXTRA_JSON"):].strip())
                         if isinstance(data, dict):
-                            # Embedded takes precedence or merges
-                            extras.update(data)
+                            extras.update(data)  # embedded metadata takes precedence
                     except Exception:
                         pass
                 elif line.startswith("#RULES_JSON"):
                     try:
-                        j = line[len("#RULES_JSON"):].strip()
-                        data = json.loads(j)
-                        extras["rules"] = data
+                        extras["rules"] = json.loads(line[len("#RULES_JSON"):].strip())
+                    except Exception:
+                        pass
+                elif line.startswith("#COMMANDS_JSON"):
+                    try:
+                        extras["commands"] = json.loads(line[len("#COMMANDS_JSON"):].strip())
                     except Exception:
                         pass
     except Exception:
         pass
     return extras
 
-def write_fwb_extra(file_path: Path, rules=None, commands=None):
-    """Update extra in existing .fwb without rewriting all rows if possible.
-    Reads existing headers/rows, then rewrites with new extras.
+def read_fwb_extra(file_path: Path):
+    """Read active Field Book command meanings and correction rules from ``#EXTRA_JSON``.
+
+    Earlier files used ``commands``/``rules``; accept the longer descriptive keys too,
+    including a meaning-to-token command map, while returning the canonical keys used by
+    the parser and dialogs.
     """
+    from ..core.fieldbook_syntax import DEFAULT_COMMAND_TOKENS
+    raw = _read_fwb_extra_raw(Path(file_path))
+    commands = raw.get("commands")
+    if commands is None:
+        for alias in ("commands_meanings", "command_meanings", "meanings"):
+            if raw.get(alias) is not None:
+                commands = raw[alias]
+                break
+    rules = raw.get("rules")
+    if rules is None:
+        rules = raw.get("correction_rules", raw.get("correctionRules", []))
+    return {**raw,
+            "commands": commands if commands is not None else list(DEFAULT_COMMAND_TOKENS),
+            "rules": rules if isinstance(rules, list) else []}
+
+def write_fwb_extra(file_path: Path, rules=None, commands=None):
+    """Update embedded Field Book metadata and preserve all code rows and unknown JSON keys."""
     headers, rows = read_fwb_file(file_path)
     if headers is None:
         return False
-    # Preserve existing extras not being overwritten?
-    existing = read_fwb_extra(file_path)
-    if rules is None and "rules" in existing:
-        rules = existing["rules"]
-    if commands is None and "commands" in existing:
-        commands = existing["commands"]
-    return write_fwb_file(file_path, headers, rows, rules=rules, commands=commands)
+    raw = _read_fwb_extra_raw(Path(file_path))
+    current = read_fwb_extra(Path(file_path))
+    if rules is None:
+        rules = current.get("rules", [])
+    if commands is None:
+        commands = current.get("commands")
+    extras = dict(raw)
+    # Remove stale aliases so the canonical values cannot be shadowed by old metadata.
+    for alias in ("commands_meanings", "command_meanings", "meanings", "correction_rules", "correctionRules"):
+        extras.pop(alias, None)
+    return write_fwb_file(file_path, headers, rows, rules=rules, commands=commands,
+                          extra_fields=extras)
 
 
 def read_fwb_file(file_path: Path):

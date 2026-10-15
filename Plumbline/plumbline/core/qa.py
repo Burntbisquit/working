@@ -19,6 +19,17 @@ class Issue:
     point_ids: list = field(default_factory=list)
 
 
+def _is_deleted_point(point) -> bool:
+    """Recognize legacy/import deletion markers without treating them as live survey data."""
+    attrs = getattr(point, "attrs", None) or {}
+    if not isinstance(attrs, dict):
+        return False
+    if any(attrs.get(key) is True for key in ("deleted", "is_deleted", "qa_deleted")):
+        return True
+    return any(str(attrs.get(key, "")).strip().casefold() in {"deleted", "removed"}
+               for key in ("status", "fieldwork_status", "qa_status"))
+
+
 def run_checks(project, z_tol: float = 0.05, xy_tol: float = 0.01, spike_k: float = 6.0,
                spike_min: float | None = None, neighbours: int = 8) -> list[Issue]:
     issues: list[Issue] = []
@@ -77,6 +88,10 @@ def run_checks(project, z_tol: float = 0.05, xy_tol: float = 0.01, spike_k: floa
     unknown: dict[str, list] = {}
     commands = project.settings.get("f2f_commands")
     for p in pts:
+        # A point explicitly removed by a fieldwork import/legacy project is not an
+        # active description error, even if it remains in the serialized point store.
+        if _is_deleted_point(p):
+            continue
         pd = parse_description(p.desc, commands=commands, known_codes=project.codes.codes)
         if pd.code and project.codes.get(pd.code) is None:
             unknown.setdefault(pd.code, []).append(p.id)
@@ -84,9 +99,6 @@ def run_checks(project, z_tol: float = 0.05, xy_tol: float = 0.01, spike_k: floa
         top = ", ".join(f"{c} ({len(v)})" for c, v in sorted(unknown.items(), key=lambda kv: -len(kv[1]))[:8])
         issues.append(Issue("info", "unknown-code", f"{len(unknown)} description code(s) are not in the feature-code table: {top}.",
                             [i for v in unknown.values() for i in v]))
-    nodesc = [p.id for p in pts if not p.desc.strip()]
-    if nodesc:
-        issues.append(Issue("info", "no-description", f"{len(nodesc)} point(s) have no description.", nodesc))
 
     # 5. outside the CRS area of use (usually the wrong CRS or swapped N/E)
     try:

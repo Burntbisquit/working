@@ -96,7 +96,6 @@ def main(argv=None) -> int:
     nw.add_argument("--folder", default=".", help="parent folder (default: current directory)")
     nw.add_argument("--weeks", type=int, default=None,
                     help="ignored (Field Data/ is created empty - name the folders inside it your way)")
-    nw.add_argument("--minimal", action="store_true", help="use the minimal two-folder layout")
     nw.add_argument("--epsg", type=int, default=0, help="coordinate system EPSG (0 = unassigned, the default)")
     fw = sub.add_parser("fieldwork", help="run the field-data checks over a .fwk and print the findings")
     fw.add_argument("file", help="consolidated field data (.fwk) or a point CSV")
@@ -240,9 +239,8 @@ def _new_job(a) -> int:
     from .core import jobtemplate as JT
     from .core.crs import ProjectCRS
     crs = ProjectCRS.from_epsg(a.epsg) if a.epsg else ProjectCRS.unassigned("ftUS")
-    template = JT.MINIMAL_TEMPLATE if a.minimal else JT.JOB_TEMPLATE
     try:
-        out = JT.create_job(a.folder, a.name, template=template,
+        out = JT.create_job(a.folder, a.name, template=JT.JOB_TEMPLATE,
                             crs_label=crs.label, crs_record=crs.to_dict(),
                             progress=lambda f, m: print(f"  [{f:4.0%}] {m}"))
     except FileExistsError as exc:

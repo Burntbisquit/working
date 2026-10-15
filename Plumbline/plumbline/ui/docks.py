@@ -949,6 +949,26 @@ class PropertiesDock(QWidget):
             b = QPushButton("Apply changes")
             f.addRow("", b)
 
+            b_geometry = QPushButton("Edit Line Geometry (Staged)...")
+            b_geometry.setToolTip("Preview vertex and curve edits; Apply creates one undoable project change")
+            def edit_geometry(checked=False, ent=e):
+                from .linework_editor_dialog import LineEditorDialog
+                LineEditorDialog(self.state, ent, self).exec()
+            b_geometry.clicked.connect(edit_geometry)
+            f.addRow("", b_geometry)
+
+            selected_lines = [self.state.project.entities[entity_id]
+                              for entity_id in sorted(self.state.sel_entities)
+                              if isinstance(self.state.project.entities.get(entity_id), Polyline)]
+            if len(selected_lines) > 1:
+                b_join = QPushButton(f"Join {len(selected_lines)} Selected Lines...")
+                b_join.setToolTip("Draft the join, inspect a preview, then accept as one undoable edit")
+                def join_selected(checked=False, lines=selected_lines):
+                    from .linework_editor_dialog import JoinLinesDialog
+                    JoinLinesDialog(self.state, lines, self).exec()
+                b_join.clicked.connect(join_selected)
+                f.addRow("", b_join)
+
             if e.derived.startswith("linework") or (e.attrs or {}).get("points"):
                 b_recode = QPushButton("Edit Linework Coding (Recode Points)...")
                 b_recode.setToolTip("Inspect and modify the point descriptions defining this figure")

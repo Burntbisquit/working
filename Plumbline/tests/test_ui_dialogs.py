@@ -3,7 +3,8 @@ import math
 
 import pytest
 pytest.importorskip("PySide6")
-from PySide6.QtWidgets import QDockWidget, QFileDialog, QInputDialog, QMenu, QTableWidgetItem, QToolBar
+from PySide6.QtWidgets import (QDialog, QDockWidget, QFileDialog, QInputDialog, QMenu, QMessageBox,
+                               QPushButton, QTableWidgetItem, QToolBar)
 
 from plumbline.core import crs as C
 from plumbline.core.project import Project
@@ -11,29 +12,120 @@ from plumbline.core.settings import settings
 from test_ui import app, auto, pump, win  # noqa: F401  (fixtures)
 
 
-def test_settings_dialog_applies_theme_and_values(win, app, auto):
+def test_settings_dialog_applies_theme_and_values(win, app, auto, tmp_path):
     from plumbline.ui import theme
     from plumbline.ui.dialogs import SettingsDialog
+    old_project_folder = settings().get("default_project_folder", "")
     win.settings_dialog()                                             # accepted unchanged: nothing breaks
     d = SettingsDialog(win)
     d.cmb_theme.setCurrentIndex(d.cmb_theme.findData("light"))
     d.cmb_order.setCurrentIndex(d.cmb_order.findData("XY"))
     d.sp_snap.setValue(20)
+    project_folder = str(tmp_path / "Projects")
+    d.ed_project_folder.setText(project_folder)
+    assert d.chk_require_fieldbook.isChecked()
+    d.chk_require_fieldbook.setChecked(False)
     d.apply()
     s = settings()
     assert s.get("theme") == "light" and s.get("coord_order") == "XY" and s.get("snap_px") == 20
+    assert s.get("require_fieldbook_for_processing") is False
+    assert s.get("default_project_folder") == project_folder
     win._apply_theme()
     assert theme.current() == "light"
     win.points.reload()
     assert win.points.model.headers()[1] == "Easting"                  # typed / displayed order follows the setting
     win.canvas.render_image(300)
     s.set("coord_order", "NE")
+    s.set("require_fieldbook_for_processing", True)
+    s.set("default_project_folder", old_project_folder)
     win.toggle_theme()                                                # back to dark
 
 
 # ------------------------------------------------------------------ where things live in the menus
 def _top_menus(win):
     return {m.title(): m for m in getattr(win, "_top_menus", [])} or {a.text(): a.menu() for a in win.menuBar().actions() if a.menu() is not None}
+
+
+def test_file_coordinate_systems_has_only_the_four_requested_actions_and_set_is_metadata_only(win, app, auto):
+    from plumbline.core import filecrs as FCRC, provenance as PROV
+    from plumbline.core.crs import ProjectCRS
+    from plumbline.ui.filecrs_dialog import FileCoordinateSystemsDialog
+
+    project = Project("File CRS dialog", ProjectCRS.from_epsg(32615))
+    point = project.add_point(500_000.0, 3_600_000.0, 12.0, number="1")
+    PROV.stamp([point], file="survey.csv")
+    initial = FCRC.make(key="EPSG:32614", label="Original import source")
+    initial["source_crs"] = {"key": "EPSG:32613", "label": "Earlier source"}
+    FCRC.record(project, "survey.csv", initial)
+    win.state.set_project(project)
+
+    dialog = FileCoordinateSystemsDialog(win.state, win)
+    buttons = [button.text() for button in dialog.findChildren(QPushButton)]
+    assert buttons == ["Set to Project", "Reproject", "Ground / Grid SAF", "Cancel"]
+    dialog.tbl.selectRow(0)
+    old_xy = (point.x, point.y)
+    dialog.b_set.click()
+
+    rec = FCRC.for_file(project, "survey.csv")
+    assert (point.x, point.y) == old_xy
+    assert rec["method"] == "project" and rec["key"] == project.crs.authority
+    assert rec["source_crs"] == initial["source_crs"]
+    assert win.state.undo_stack[-1][0] == "Set survey.csv to project system"
+    dialog.b_cancel.click()
+    assert dialog.result() == QDialog.Rejected
+
+
+def test_file_reproject_dialog_uses_corrected_source_project_target_and_safs(win, app, auto, monkeypatch):
+    import numpy as np
+    from pyproj import Transformer
+
+    from plumbline.core import filecrs as FCRC, provenance as PROV
+    from plumbline.core.crs import GroundScale, ProjectCRS
+    from plumbline.ui.filecrs_dialog import FileCoordinateSystemsDialog, _PickCRS
+
+    source_ground = GroundScale(enabled=True, base_x=500_000.0, base_y=0.0, saf=1.00015)
+    target_ground = GroundScale(enabled=True, base_x=200_000.0, base_y=0.0, saf=1.00008)
+    source = ProjectCRS.from_epsg(32614, ground=source_ground)
+    target = ProjectCRS.from_epsg(32615, ground=target_ground)
+    project = Project("File CRS reprojection", target)
+    to_source = Transformer.from_crs(4326, source.crs, always_xy=True)
+    x, y = to_source.transform(-96.1, 32.8)
+    point = project.add_point(x, y, 123.0, number="101")
+    PROV.stamp([point], file="control.csv")
+    FCRC.record(project, "control.csv", FCRC.make_from_project(project, method="project"))
+    win.state.set_project(project)
+
+    expected_x, expected_y = source.transform_to(target)(np.array([x]), np.array([y]))
+
+    def choose_corrected_source(dialog):
+        dialog.picker.select_key("EPSG:32614")
+        dialog.extra.chk_ground.setChecked(True)
+        dialog.extra.sp_by.setValue(0.0)
+        dialog.extra.sp_bx.setValue(500_000.0)
+        dialog.extra.sp_cf.setValue(1.00015)
+
+    monkeypatch.setattr(_PickCRS, "_test_hook", choose_corrected_source, raising=False)
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.Yes))
+    dialog = FileCoordinateSystemsDialog(win.state, win)
+    dialog.tbl.selectRow(0)
+    dialog.reproject()
+
+    assert (point.x, point.y) == pytest.approx((float(expected_x[0]), float(expected_y[0])), abs=1e-4)
+    assert point.z == 123.0
+    rec = FCRC.for_file(project, "control.csv")
+    assert rec["method"] == "reprojected"
+    assert rec["key"] == target.authority
+    assert rec["source_crs"]["key"] == "EPSG:32614"
+    assert rec["source_crs"]["saf"] == pytest.approx(1.00015)
+    assert win.state.undo_stack[-1][0] == "Reproject control.csv to project system"
+
+
+def test_coordinate_tools_are_in_survey_and_the_coordinates_menu_is_gone(win, app, auto):
+    top = _top_menus(win)
+    assert "&Coordinates" not in top
+    survey = [a.text() for a in top["&Survey"].actions() if a.text()]
+    assert "&Project Coordinate System..." in survey
+    assert "Coordinate &Calculator..." in survey
 
 
 def test_the_tools_menu_is_gone_and_its_items_moved_where_they_belong(win, app, auto):
@@ -240,66 +332,56 @@ def test_welcome_help_about_plugins_dialogs_open(win, app, auto):
     win.show_welcome()                                                 # exec auto-accepts, choice "none"
 
 
-def test_new_project_dialog_unassigned_texas_and_full_search(win, app, auto):
+def test_new_project_dialog_defers_crs_to_the_project_crs_step(win, app, auto, tmp_path, monkeypatch):
     from plumbline.ui.new_project import NewProjectDialog
-    # 1. the default: no coordinate system, units chosen, and a flag when something needs a CRS
-    d = NewProjectDialog(win)
-    assert d.r_unassigned.isChecked() and not d.setup_job is None
-    assert d.extra.isHidden() and d.lbl_heights.isHidden()
-    assert d.extra.chk_ground.isHidden() and d.extra.ground_hint.isHidden()
-    assert all(d.extra.ground_form.isRowVisible(w) is False
-               for w in (d.extra.sp_by, d.extra.sp_bx, d.extra.sp_cf))
-    d.ed_name.setText("Job 42")
-    d.cmb_unit.setCurrentIndex(d.cmb_unit.findData("m"))
-    d.setup.chk.setChecked(False)                                      # do not build a job folder on disk
-    d._accept()
-    assert d.crs.is_unassigned and d.crs.unit == "m" and d.project_name == "Job 42"
-    # ...and that an unassigned project draws fine but refuses anything geodetic, by name
-    scratch = Project("unassigned", d.crs)
+
+    parent_folder = str(tmp_path / "Project folders")
+    monkeypatch.setitem(settings()._data, "default_project_folder", parent_folder)
+    dialog = NewProjectDialog(win)
+    assert dialog.setup_parent_folder == parent_folder
+    assert dialog.setup_job is True
+    assert not hasattr(dialog, "r_unassigned")
+    assert not hasattr(dialog, "cmb_texas")
+    assert not hasattr(dialog, "picker")
+    assert all(name in dialog.setup.lbl_preview.text() for name in
+               ("Field Data", "Field Book", "Control", "Drawings", "Surfaces", "Imagery", "Reports"))
+
+    dialog.ed_name.setText("Job 42")
+    assert "Job Setup.txt" in dialog.setup.lbl_preview.text()
+    assert "All subfolders start empty" in dialog.setup.lbl_preview.text()
+    dialog._accept()
+    assert dialog.project_name == "Job 42"
+    assert dialog.crs.is_unassigned and dialog.crs.unit == "ftUS"
+    assert "Project Coordinate System" in dialog.crs_step_note.text()
+
+    # Unassigned geometry still works; only geodetic operations wait for the next CRS step.
+    scratch = Project("unassigned", dialog.crs)
     scratch.add_point(0.0, 0.0, 1.0, number="1", desc="GS")
     assert scratch.extents() is not None
     with pytest.raises(C.LocalCRSError) as err:
         scratch.crs.to_lonlat(0.0, 0.0)
     assert "UNASSIGNED" in str(err.value) and "Select CRS" in str(err.value)
 
-    # 2. the Texas list carries the 2011 US survey feet zones, and defaults to 6584
-    from plumbline.core import crs as CC
-    d2 = NewProjectDialog(win)
-    keys = [d2.cmb_texas.itemData(i) for i in range(d2.cmb_texas.count())]
-    assert len(keys) == 5
-    for want in (6584, 6582, 6578, 6588, 6586):
-        assert want in keys, f"{want} missing from the Texas list"
-    assert keys[0] == 6584 and d2.cmb_texas.currentData() == 6584
-    d2.r_crs.setChecked(True)
-    assert not d2.extra.isHidden() and not d2.lbl_heights.isHidden()
-    assert not d2.extra.chk_ground.isHidden() and d2.extra.ground_form.isRowVisible(d2.extra.sp_cf)
-    d2.setup.chk.setChecked(False)
-    d2._accept()
-    assert d2.crs.authority == "EPSG:6584" and d2.crs.unit == "ftUS"
-    assert d2.crs.unit_factor == pytest.approx(1200 / 3937)
 
-    # 3. and other systems (like the metre twin) are searched via the full register
-    d3 = NewProjectDialog(win)
-    d3.r_other.setChecked(True)
-    d3.picker.select_key("EPSG:6583")
-    d3.setup.chk.setChecked(False)
-    d3._accept()
-    assert d3.crs.authority == "EPSG:6583" and d3.crs.unit == "m"
+def test_save_as_dialog_shows_the_fixed_standard_folder_tree(win, app):
+    from plumbline.ui.project_package_dialog import ProjectPackageDialog
 
-    # 4. a legacy code chosen deliberately is KEPT - modern records are still on the older
-    #    realisations, so 2276 means 2276.  The 2011 equivalent is offered, in one click,
-    #    on the coordinate-system dialog (never applied behind the user's back).
-    d4 = NewProjectDialog(win)
-    d4.setup.chk.setChecked(False)
-    d4.r_other.setChecked(True)
-    assert not d4.extra.isHidden() and not d4.lbl_heights.isHidden()
-    d4.picker.select_key("EPSG:2276")
-    d4._accept()
-    assert d4.crs.authority == "EPSG:2276" and d4.crs.is_legacy_zone
-    assert d4.crs.legacy_replacement() == 6584
+    dlg = ProjectPackageDialog(win, name="Job 42", parent_folder="/tmp")
+    preview = dlg.lbl_folders.text()
+    for folder in ("Field Data", "Field Book", "Control", "Drawings", "Surfaces", "Imagery", "Reports"):
+        assert f"{folder}/" in preview
 
-    win.new_project()                                                  # nothing chosen -> friendly error, project unchanged
-    assert win.state.project.name.startswith("Sample")
+
+def test_job_setup_uses_the_configured_default_project_parent(app, tmp_path, monkeypatch):
+    from plumbline.core.settings import settings
+    from plumbline.ui.job_setup import JobSetupPanel
+
+    parent_folder = str(tmp_path / "Survey Jobs")
+    monkeypatch.setitem(settings()._data, "default_project_folder", parent_folder)
+    panel = JobSetupPanel()
+    panel.set_job_name("Job 42")
+    assert panel.parent_folder == parent_folder
+    assert panel.folder_path() == tmp_path / "Survey Jobs" / "Job 42"
 
 
 def test_find_select_all_zoom_and_layer_creation(win, app, auto, monkeypatch):
@@ -323,6 +405,7 @@ def test_find_select_all_zoom_and_layer_creation(win, app, auto, monkeypatch):
 
 
 def test_png_export_and_reports_open(win, app, auto, monkeypatch, tmp_path):
+    monkeypatch.setattr(win, "_ensure_fieldbook_for_processing", lambda **_kwargs: True)
     out = tmp_path / "view.png"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(out), "")))
     win.export_png()
@@ -342,6 +425,51 @@ def test_png_export_and_reports_open(win, app, auto, monkeypatch, tmp_path):
     win.state.clear_selection()
     win.report_polylines()                                            # nothing selected -> message, not a crash
     assert len(shown) == 5
+
+
+def test_local_imagery_import_is_copied_into_the_project_and_survives_a_move(win, app, tmp_path):
+    import json
+    import shutil
+    from pathlib import Path
+
+    from PIL import Image
+
+    project_root = tmp_path / "Portable Job"
+    project_root.mkdir()
+    project_file = project_root / "Portable Job.plb"
+    project = win.state.project
+    project.save(project_file)
+
+    source_root = tmp_path / "Original imagery"
+    source_root.mkdir()
+    image = source_root / "aerial.png"
+    Image.new("RGB", (4, 4), (20, 100, 30)).save(image)
+    image.with_suffix(".pgw").write_text(chr(10).join(("1", "0", "0", "-1", "100.5", "200.5")) + chr(10), encoding="ascii")
+    image.with_suffix(".prj").write_text("test projection sidecar", encoding="utf-8")
+
+    assert win.create_imagery_layer({"kind": "file", "name": "Local aerial", "source": {
+        "path": str(image), "corners": [[100, 200], [104, 200], [100, 196]],
+        "crs": None, "attribution": ""}})
+    layer = next(layer for layer in project.imagery.values() if layer.name == "Local aerial")
+    staged = Path(layer.source["path"])
+    assert staged.parent == project_root / "Imagery"
+    assert staged.read_bytes() == image.read_bytes()
+    assert staged.with_suffix(".pgw").is_file() and staged.with_suffix(".prj").is_file()
+    assert image.is_file()  # the import leaves the source untouched
+
+    project.save()
+    saved = json.loads(project_file.read_text(encoding="utf-8"))
+    stored_layer = next(layer for layer in saved["imagery"] if layer["name"] == "Local aerial")
+    assert stored_layer["source"]["path"] == "Imagery/aerial.png"
+
+    moved_root = tmp_path / "Moved" / project_root.name
+    moved_root.parent.mkdir()
+    shutil.move(str(project_root), moved_root)
+    moved_project = Project.load(moved_root / project_file.name)
+    moved_image = Path(next(layer for layer in moved_project.imagery.values()
+                            if layer.name == "Local aerial").source["path"])
+    assert moved_image == moved_root / "Imagery" / "aerial.png"
+    assert moved_image.with_suffix(".pgw").is_file() and moved_image.with_suffix(".prj").is_file()
 
 
 def test_the_imagery_panel_has_no_check_controls_and_notes_checks_from_older_files(win, app, auto):

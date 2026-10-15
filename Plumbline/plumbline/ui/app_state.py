@@ -30,6 +30,9 @@ class AppState(QObject):
             self.project = project.project
         else:
             self.project = project or Project("Untitled")
+        # MainWindow installs a Save As callback.  Keeping it optional leaves the
+        # Qt-free state usable by scripts and unit tests that explicitly manage paths.
+        self._save_untitled_before_edit = None
         self.sel_points: set[int] = set()
         self.sel_entities: set[int] = set()
         self.undo_stack: list[tuple[str, bytes]] = []
@@ -82,12 +85,30 @@ class AppState(QObject):
     def edit(self, label: str = "Edit", kinds=("all",), discard_if_unchanged: bool = False):
         """Run a block that modifies the project as ONE undoable step; rolls back if it raises.
 
-        Nested edits (e.g. a plugin calling api.edit() inside a command that is already wrapped) collapse into the outer one.
+        In the GUI, the initial generic ``Untitled`` project must be saved as a package
+        before an edit can stick.  If the user cancels Save As, the action is rolled back
+        and the state stays clean. Nested edits collapse into their outer transaction.
         """
         if self._depth > 0:
             yield self.project
             return
+
+        dirty_before = self.dirty
         before = self.project.snapshot()
+        cancelled_for_save = False
+        if (not self.project.path and str(self.project.name or "").strip().casefold() in {"", "untitled"}
+                and callable(self._save_untitled_before_edit)):
+            try:
+                saved = bool(self._save_untitled_before_edit())
+            except Exception as exc:
+                saved = False
+                self.message.emit("error", f"Could not save the Untitled project before editing: {exc}")
+            cancelled_for_save = not saved or not bool(self.project.path)
+            if not cancelled_for_save:
+                # Save As may rebase package paths and rename the project. Those changes
+                # are the new baseline, not part of the edit's undo record.
+                before = self.project.snapshot()
+
         self._depth += 1
         try:
             yield self.project
@@ -97,6 +118,19 @@ class AppState(QObject):
             self._after_change({"all"}, quiet=True)
             raise
         self._depth -= 1
+
+        if cancelled_for_save:
+            self.project.restore(before)
+            self._prune_selection()
+            self.set_dirty(dirty_before)
+            self._after_change({"all"})
+            self.undo_changed.emit()
+            self.message.emit(
+                "warn",
+                "Save As is required before editing an Untitled project. The attempted change was discarded.",
+            )
+            return
+
         if discard_if_unchanged and self.project.snapshot() == before:
             return
         self.undo_stack.append((label, before))

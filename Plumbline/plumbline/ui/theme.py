@@ -117,7 +117,7 @@ def stylesheet(c: dict) -> str:
     QToolBar::separator {{ background: {c['border']}; width: 1px; margin: 4px 6px; }}
     QToolButton {{ border: 1px solid transparent; border-radius: 5px; padding: 4px; }}
     QToolButton:hover {{ background: {c['hover']}; }}
-    QToolButton:checked {{ background: {c['accent']}; border-color: {c['accent']}; }}
+    QToolButton:checked {{ background: {c['alt']}; border-color: {c['border']}; }}
     QToolButton:pressed {{ background: {c['border']}; }}
     QDockWidget {{ titlebar-close-icon: none; }}
     QDockWidget::title {{ background: {c['alt']}; padding: 6px 8px; border-bottom: 1px solid {c['border']}; font-weight: 600; }}
@@ -130,7 +130,7 @@ def stylesheet(c: dict) -> str:
     QComboBox QAbstractItemView {{ background: {c['base']}; selection-background-color: {c['accent']}; }}
     QPushButton {{ background: {c['button']}; border: 1px solid {c['border']}; border-radius: 5px; padding: 5px 14px; }}
     QPushButton:hover {{ background: {c['hover']}; }}
-    QPushButton:default, QPushButton[accent="true"] {{ background: {c['accent']}; border-color: {c['accent']}; color: {c['accent_text']}; }}
+    QPushButton:default, QPushButton[accent="true"] {{ background: {c['button']}; border-color: {c['border']}; color: {c['text']}; font-weight: 600; }}
     QPushButton:disabled {{ color: {c['dim']}; }}
     QTableView, QTreeView, QListView, QTableWidget, QListWidget, QTreeWidget {{
         background: {c['base']}; alternate-background-color: {c['alt']}; border: 1px solid {c['border']};

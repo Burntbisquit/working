@@ -68,16 +68,37 @@ class FieldBookReportDialog(QDialog):
         QApplication.clipboard().setText(self.text_view.toPlainText())
         QMessageBox.information(self, "Field Book Report", "Report copied to clipboard.")
 
+    def _default_report_path(self) -> str:
+        """Start beside the selected Field Book, using its name for the exported report."""
+        if self.fwb_path:
+            return str(Path(self.fwb_path).expanduser().with_suffix(".txt"))
+        project_path = str(getattr(self.project, "path", "") or "").strip()
+        if project_path:
+            source_path = Path(project_path).expanduser()
+            if source_path.suffix:
+                return str(source_path.with_suffix(".txt"))
+        project_name = Path(str(getattr(self.project, "name", "") or "").strip()).name
+        return f"{project_name or 'Field_Book_Report'}.txt"
+
     def _export_report(self):
-        start = str(self.fwb_path or "")
-        path, filt = QFileDialog.getSaveFileName(self, "Export Field Book Report",
-                                                 start,
-                                                 "Text Report (*.txt);;CSV Table (*.csv);;All Files (*)")
+        path, filt = QFileDialog.getSaveFileName(
+            self, "Export Field Book Report", self._default_report_path(),
+            "Text Report (*.txt);;CSV Table (*.csv);;All Files (*)")
         if not path:
             return
+        selected_filter = str(filt or "").casefold()
+        target_extension = ""
+        if "csv" in selected_filter:
+            target_extension = ".csv"
+        elif "text report" in selected_filter:
+            target_extension = ".txt"
+        if target_extension:
+            target_path = Path(path)
+            if target_path.suffix.casefold() != target_extension:
+                path = str(target_path.with_suffix(target_extension))
         codes = self.project.codes
         codes_items = list(codes.items()) if hasattr(codes, "items") else list(getattr(codes, "codes", {}).items()) if hasattr(codes, "codes") else ([(c.code, c) for c in codes] if isinstance(codes, (list, tuple)) else [])
-        if path.lower().endswith(".csv") or "CSV" in filt:
+        if path.lower().endswith(".csv") or "csv" in selected_filter:
             with open(path, "w", encoding="utf-8", newline="") as fh:
                 w = csv.writer(fh)
                 w.writerow(["Code", "Description", "Kind", "Layer", "Symbol"])
@@ -174,7 +195,8 @@ class FieldBookDialog(QDialog):
         tab_cmds_lay.addWidget(self.table_cmds)
 
         btn_cmd_row = QHBoxLayout()
-        b_edit_cmds = QPushButton("Edit Field Book Commands...")
+        b_edit_cmds = QPushButton("Edit Command Meanings...")
+        b_edit_cmds.setToolTip("Edit the command token assigned to each fixed Field Book meaning; save it with the active book.")
         b_edit_cmds.clicked.connect(self._edit_commands)
         btn_cmd_row.addWidget(b_edit_cmds)
         btn_cmd_row.addStretch(1)
@@ -185,10 +207,10 @@ class FieldBookDialog(QDialog):
         # Tab 3: Correction Rules
         tab_rules = QWidget()
         tab_rules_lay = QVBoxLayout(tab_rules)
-        tab_rules_lay.addWidget(Hint("Correction rules automatically correct common field typing errors to valid Field Book codes."))
+        tab_rules_lay.addWidget(Hint("Correction rules map field typos to valid codes; each Fix is checked against the active Field Book."))
         self.table_rules = QTableWidget()
         self.table_rules.setColumnCount(2)
-        self.table_rules.setHorizontalHeaderLabels(["Common Error", "Fix (Field Book code)"])
+        self.table_rules.setHorizontalHeaderLabels(["Common Error", "Fix"])
         self.table_rules.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table_rules.verticalHeader().setVisible(False)
         self.table_rules.setAlternatingRowColors(True)
@@ -219,14 +241,22 @@ class FieldBookDialog(QDialog):
     def _refresh(self):
         pr = self.project
         fb_path = pr.settings.get("fieldbook_file") or ""
+        if fb_path and Path(fb_path).exists():
+            try:
+                extra = f2f.read_fwb_extra(fb_path)
+                # The selected book is the source of truth for its command meanings and rules.
+                pr.settings["f2f_commands"] = extra.get("commands", list(f2f.DEFAULT_COMMANDS))
+                pr.settings["f2f_rules"] = extra.get("rules", [])
+            except Exception:
+                pass
         n_codes = len(pr.codes)
 
-        if fb_path and Path(fb_path).exists():
+        if fb_path and Path(fb_path).exists() and n_codes > 0:
             self.banner.set(f"Active Field Book: {Path(fb_path).name} ({n_codes:,} codes loaded) — Location: {fb_path}", "ok")
         elif n_codes > 0:
             self.banner.set(f"Feature Codes loaded: {n_codes:,} code(s) active in project.", "info")
         else:
-            self.banner.set("No Field Book loaded for this project. Use Convert or Select to load codes.", "warn")
+            self.banner.set("No Field Book codes loaded. Select or convert a Field Book to populate this project.", "warn")
 
         self._fill_codes()
         self._fill_commands()
@@ -309,10 +339,20 @@ class FieldBookDialog(QDialog):
                     pass
 
     def _edit_rules(self):
-        codes = self.project.codes
-        code_set = set(codes.keys()) if hasattr(codes, "keys") else set(getattr(codes, "codes", {}).keys()) if hasattr(codes, "codes") else {c.code for c in codes if hasattr(c, "code")}
+        fb_path = self.project.settings.get("fieldbook_file") or ""
+        code_set = set()
+        if fb_path and Path(fb_path).exists():
+            try:
+                from ..fieldwork.io_carlson import read_fwb_file
+                _headers, rows = read_fwb_file(Path(fb_path))
+                code_set = {str(row[0]).strip() for row in rows or []
+                            if row and str(row[0]).strip()}
+            except Exception:
+                code_set = set()
         current = self.project.settings.get("f2f_rules") or []
-        dlg = CorrectionRulesDialog(current, code_set=code_set, parent=self)
+        dlg = CorrectionRulesDialog(
+            current, fieldbook_codes=code_set, parent=self,
+            commands=self.project.settings.get("f2f_commands"))
         if dlg.exec() == QDialog.DialogCode.Accepted:
             new_rules = dlg.get_rules()
             with self.state.edit("Edit Correction Rules"):
@@ -327,24 +367,14 @@ class FieldBookDialog(QDialog):
                     pass
 
     def _save_extra_to_fwb(self, fwb_path: Path | str):
-        import json
         path = Path(fwb_path)
         if not path.exists():
-            return
-        lines = []
-        with open(path, "r", encoding="utf-8-sig", errors="ignore") as fh:
-            for line in fh:
-                if not line.strip().startswith("#EXTRA_JSON"):
-                    lines.append(line)
-        extras = {
-            "commands": self.project.settings.get("f2f_commands") or list(f2f.DEFAULT_COMMANDS),
-            "rules": self.project.settings.get("f2f_rules") or [],
-        }
-        with open(path, "w", encoding="utf-8", newline="") as fh:
-            fh.writelines(lines)
-            if lines and not lines[-1].endswith("\n"):
-                fh.write("\n")
-            fh.write(f"#EXTRA_JSON {json.dumps(extras, ensure_ascii=False)}\n")
+            return False
+        return f2f.write_fwb_extra(
+            path,
+            commands=self.project.settings.get("f2f_commands") or list(f2f.DEFAULT_COMMANDS),
+            rules=self.project.settings.get("f2f_rules") or [],
+        )
 
     def action_convert(self):
         """Convert a Carlson F2F CSV or custom code table -> choose name & location -> copy & archive old."""
@@ -367,7 +397,8 @@ class FieldBookDialog(QDialog):
 
         # Allow user to name and place this field book
         job_dir = Path(pr.path).parent if pr.path and Path(pr.path).is_file() else (Path(pr.path) if pr.path else Path("."))
-        default_dest = job_dir / "Field Book" / f"{pr.name or 'New Job'}.fwb"
+        source_stem = Path(path).stem.strip() or pr.name or "New Job"
+        default_dest = job_dir / "Field Book" / f"{source_stem}.fwb"
         dest_path_str, _ = QFileDialog.getSaveFileName(self, "Save Converted Field Book (.fwb)",
                                                        str(default_dest),
                                                        "Field Book (*.fwb);;All Files (*)")

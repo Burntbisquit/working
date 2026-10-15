@@ -113,6 +113,301 @@ def test_theme_toggle_does_not_break(win, app):
     win.toggle_theme()
 
 
+def test_opening_an_unassigned_project_asks_for_crs_before_field_data_route(win, monkeypatch, tmp_path):
+    project_path = tmp_path / "Unassigned.plb"
+    Project("Unassigned").save(project_path)
+    events = []
+    monkeypatch.setattr(win, "_ensure_project_crs", lambda: events.append("CRS") or False)
+    monkeypatch.setattr(win, "_ensure_fieldbook_for_processing",
+                        lambda notify=True: events.append("Field Book") or False)
+    monkeypatch.setattr(win, "_ask_field_data_route",
+                        lambda route: events.append(("route", route)) or 0)
+    monkeypatch.setattr(win, "_complete_import_onboarding",
+                        lambda imported_points=0: events.append(("complete", imported_points)))
+
+    win._open(str(project_path))
+
+    assert events == ["CRS", "Field Book", ("route", "existing"), ("complete", 0)]
+
+
+@pytest.mark.parametrize("choose_control", [True, False])
+def test_open_field_data_route_offers_optional_control_before_importing_points(
+        win, monkeypatch, tmp_path, choose_control):
+    from pathlib import Path
+    from plumbline.ui import main_window as MW
+
+    job_root = tmp_path / "Job"
+    control_dir = job_root / "Control"
+    control_dir.mkdir(parents=True)
+    win.state.project.path = str(job_root / "Job.plb")
+    field_root = tmp_path / "Downloads"
+    field_root.mkdir()
+    control_file = tmp_path / "control.csv"
+    field_file = field_root / "survey.csv"
+    events = []
+
+    class _CheckSubfolders:
+        @staticmethod
+        def isChecked():
+            return False
+
+    class _FolderDialog:
+        def __init__(self, _state, folder, _parent, *, field_data_only=False):
+            assert field_data_only
+            self.folder = folder
+            self.chk_sub = _CheckSubfolders()
+            events.append(("point-picker", folder))
+
+        @staticmethod
+        def exec():
+            return 1
+
+        def selected_files(self):
+            events.append(("selected",))
+            return [field_file]
+
+    monkeypatch.setattr(QMessageBox, "exec",
+                        lambda _self: QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        lambda *_args: str(field_root))
+
+    def choose_file(_parent, caption, start, _filter):
+        events.append(("control-picker", caption, start))
+        return (str(control_file) if choose_control else "", "")
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", choose_file)
+    monkeypatch.setattr(MW, "ReferenceFolderDialog", _FolderDialog)
+
+    def import_file(path, *, default_role=None):
+        events.append(("control-import", Path(path), default_role))
+        return True
+
+    def import_folder(folder, role, recursive, selected_files=None):
+        events.append(("field-import", folder, role, selected_files))
+        return {"files": 1, "points": 2, "duplicates": 0, "skipped": 0,
+                "failed": 0, "unreadable": []}
+
+    monkeypatch.setattr(win.importer, "import_path", import_file)
+    monkeypatch.setattr(win.importer, "import_reference_folder", import_folder)
+
+    assert win._ask_field_data_route("existing") == 2
+    assert events[0][0] == "point-picker"
+    assert events[1] == ("selected",)
+    assert events[2][0] == "control-picker"
+    assert events[2][1] == "Choose Control File (optional)"
+    assert events[2][2] == str(control_dir)
+    if choose_control:
+        assert events[3] == ("control-import", control_file, "control")
+        assert events[4][0] == "field-import"
+        assert win.state.project.settings["control_file"] == str(control_file.resolve())
+    else:
+        assert events[3][0] == "field-import", (
+            "cancelling the optional control picker must continue")
+        assert "control_file" not in win.state.project.settings
+
+
+def test_imagery_import_is_blocked_if_the_project_crs_picker_is_cancelled(win, monkeypatch, tmp_path):
+    project = Project("Unassigned imagery")
+    win.state.set_project(project, dirty=False)
+    prompts = []
+    monkeypatch.setattr(win, "crs_dialog", lambda *args, **kwargs: prompts.append("CRS"))
+
+    assert not win._ensure_project_crs()
+    assert not win.add_imagery_file(str(tmp_path / "not-a-real-image.tif"))
+    assert not win.add_kml_overlay({})
+    assert prompts == ["CRS", "CRS", "CRS"]
+    assert not project.imagery
+
+
+def test_declining_default_imagery_does_not_skip_fix_point_errors_offer(win, auto):
+    project = win.state.project
+    project.imagery.clear()
+    auto["boxes"].clear()
+
+    win._complete_import_onboarding()
+
+    texts = auto["boxes"]
+    imagery_index = next(i for i, text in enumerate(texts) if "Esri World Imagery" in text)
+    fix_index = next(i for i, text in enumerate(texts) if "review the survey points" in text)
+    assert imagery_index < fix_index
+    assert not project.imagery, "the test message-box handler declines both offers"
+
+
+def test_accepting_imagery_defers_fix_point_errors_offer_until_canvas_refresh(win, monkeypatch):
+    project = win.state.project
+    project.imagery.clear()
+    assert not project.crs.is_local
+
+    events = []
+    monkeypatch.setattr(win, "_offer_default_esri_imagery",
+                        lambda: events.append("imagery") or True)
+    monkeypatch.setattr(win, "_offer_fix_point_errors_after_imagery",
+                        lambda: events.append("wait for canvas refresh"))
+    monkeypatch.setattr(win, "_offer_fix_point_errors",
+                        lambda: events.append("show immediately"))
+
+    win._complete_import_onboarding()
+
+    assert events == ["imagery", "wait for canvas refresh"]
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        (QMessageBox.StandardButton.Yes,
+         ["Process Linework", "processed", "Fix Point Errors"]),
+        (QMessageBox.StandardButton.No,
+         ["Process Linework", "Fix Point Errors"]),
+    ],
+)
+def test_open_route_offers_unprocessed_linework_before_point_errors(
+        win, monkeypatch, answer, expected):
+    project = Project("Unprocessed route")
+    project.add_point(10.0, 20.0, 3.0, number="1", desc="EP ST")
+    win.state.set_project(project, dirty=False)
+    events = []
+
+    def answer_linework(box):
+        events.append(box.windowTitle())
+        return answer
+
+    monkeypatch.setattr(QMessageBox, "exec", answer_linework)
+    monkeypatch.setattr(win, "process_linework", lambda: events.append("processed"))
+    monkeypatch.setattr(win, "_offer_fix_point_errors", lambda: events.append("Fix Point Errors"))
+
+    win._complete_import_onboarding()
+
+    assert events == expected
+
+
+def test_open_route_skips_process_linework_offer_when_current_inputs_are_processed(
+        win, monkeypatch):
+    project = Project("Processed route")
+    project.add_point(10.0, 20.0, 3.0, number="1", desc="EP ST")
+    project.process_linework()
+    win.state.set_project(project, dirty=False)
+    prompts = []
+    monkeypatch.setattr(QMessageBox, "exec", lambda box: prompts.append(box.windowTitle()))
+    point_prompt = []
+    monkeypatch.setattr(win, "_offer_fix_point_errors", lambda: point_prompt.append("shown"))
+
+    win._complete_import_onboarding()
+
+    assert prompts == []
+    assert point_prompt == ["shown"]
+
+
+def test_accepting_default_imagery_adds_the_shipped_esri_tile_source(win, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    specs = []
+    monkeypatch.setattr(win, "create_imagery_layer", specs.append)
+    monkeypatch.setattr(QMessageBox, "exec", lambda _self: QMessageBox.StandardButton.Yes)
+
+    assert win._offer_default_esri_imagery()
+    assert specs[0]["kind"] == "tiles"
+    assert specs[0]["name"] == "Esri World Imagery"
+    assert specs[0]["source"]["name"] == "Esri World Imagery"
+
+
+def test_processing_actions_open_fieldbook_and_are_blocked_if_it_stays_unloaded(win, monkeypatch, auto):
+    from plumbline.core.settings import settings
+
+    monkeypatch.setitem(settings()._data, "require_fieldbook_for_processing", True)
+    monkeypatch.setattr(win, "_has_active_fieldbook", lambda: False)
+    opened = []
+    monkeypatch.setattr(win, "open_fieldbook_dialog", lambda: opened.append("Field Book"))
+    processed = []
+    monkeypatch.setattr(win.state.project, "apply_codes_to_points", lambda: processed.append("codes"))
+    monkeypatch.setattr(win.state.project, "process_linework", lambda: processed.append("linework"))
+
+    win.open_fix_point_errors()
+    win.open_fix_linework()
+    win.apply_codes()
+    win.process_linework()
+    win.report_qa()
+    win.open_fieldwork()
+    win.edit_selected_line_geometry()
+
+    assert len(opened) == 7
+    assert processed == []
+    assert getattr(win, "_qa_workbench_window", None) is None
+
+
+def test_disabling_the_fieldbook_requirement_allows_processing(win, monkeypatch):
+    from plumbline.core.settings import settings
+
+    monkeypatch.setitem(settings()._data, "require_fieldbook_for_processing", False)
+    monkeypatch.setattr(win, "_has_active_fieldbook", lambda: False)
+    opened = []
+    monkeypatch.setattr(win, "open_fieldbook_dialog", lambda: opened.append("Field Book"))
+    processed = []
+    monkeypatch.setattr(win.state.project, "process_linework",
+                        lambda: processed.append("linework") or {"strings": 0, "replaced": 0})
+    monkeypatch.setattr(win.state.project, "apply_codes_to_points",
+                        lambda: processed.append("codes") or {"matched": 0, "unknown": {}})
+
+    assert win._ensure_fieldbook_for_processing()
+    win.process_linework()
+    win.apply_codes()
+
+    assert opened == []
+    assert processed == ["linework", "codes"]
+
+
+def test_empty_job_fieldbook_does_not_satisfy_processing_requirement(win, tmp_path):
+    from plumbline.fieldwork.io_carlson import write_fwb_file
+
+    project = win.state.project
+    project.path = str(tmp_path / "job" / "job.plb")
+    book = tmp_path / "job" / "Field Book" / "job.fwb"
+    book.parent.mkdir(parents=True)
+    project.settings["fieldbook_file"] = str(book)
+
+    assert write_fwb_file(book, ["Code", "Description"], [])
+    assert not win._has_active_fieldbook()
+
+    assert write_fwb_file(book, ["Code", "Description"], [["EA", "Asphalt"]])
+    assert win._has_active_fieldbook()
+
+
+def test_button_highlights_use_neutral_theme_colors(win):
+    from plumbline.ui import theme
+
+    for colors in theme.THEMES.values():
+        css = theme.stylesheet(colors)
+        assert (f"QPushButton:default, QPushButton[accent=\"true\"] {{ background: {colors['button']}; "
+                f"border-color: {colors['border']}; color: {colors['text']}; font-weight: 600;") in css
+        assert (f"QToolButton:checked {{ background: {colors['alt']}; "
+                f"border-color: {colors['border']}; }}") in css
+
+
+def test_escape_returns_to_pan_from_toolbar_and_panel_focus(win, app):
+    win.set_tool("polyline")
+    draw_button = win.tb_draw_tools.widgetForAction(win.tool_acts["polyline"])
+    assert draw_button is not None
+    draw_button.setFocus()
+    pump(app)
+    assert QApplication.focusWidget() == draw_button
+    QTest.keyClick(draw_button, Qt.Key_Escape)
+    pump(app)
+    assert win.canvas.tool.name == "pan"
+    assert win.tool_acts["pan"].isChecked()
+    assert win.canvas.cursor().shape() == Qt.OpenHandCursor
+
+    # Dock/panel focus follows the same global Escape shortcut.
+    win.set_tool("select")
+    win.d_pts.show()
+    win.d_pts.raise_()
+    win.points.view.setFocus()
+    pump(app)
+    assert QApplication.focusWidget() == win.points.view
+    QTest.keyClick(win.points.view, Qt.Key_Escape)
+    pump(app)
+    assert win.canvas.tool.name == "pan"
+    assert win.canvas.hasFocus()
+    assert win.canvas.cursor().shape() == Qt.OpenHandCursor
+
+
 # ------------------------------------------------------------------ tools with real mouse events
 def test_draw_polyline_with_clicks_and_undo_redo(win, app):
     pr = win.state.project
@@ -554,7 +849,7 @@ def test_imagery_tiles_render_offline_and_the_panel_has_no_check_controls(win, a
     img = win.canvas.render_image(700)
     assert img.width() == 700
 
-    for gone in ("btn_start", "btn_stop", "btn_report", "btn_csv", "btn_nudge", "btn_del",
+    for gone in ("btn_start", "btn_stop", "btn_report", "btn_csv", "btn_del",
                  "table", "stats", "cmb_which", "ed_filter", "sp_tol", "sp_mpp", "lbl_tol",
                  "_point_ids", "refresh_checks", "refresh_stats", "_apply_nudge", "_export_csv",
                  "start_requested", "stop_requested", "report_requested"):
@@ -562,6 +857,7 @@ def test_imagery_tiles_render_offline_and_the_panel_has_no_check_controls(win, a
     assert [b.text() for b in (win.imagery.btn_add, win.imagery.btn_rm, win.imagery.btn_meta,
                                win.imagery.btn_ge_out, win.imagery.btn_ge_in)] == \
         ["Add...", "Remove", "Look up imagery source at the view centre", "Export KMZ...", "Import pins..."]
+    assert win.imagery.btn_nudge_points.text() == "Nudge by points..."
     assert not pr.checks, "nothing in the interface writes a check record any more"
 
     # the nudge is a display offset; the survey itself never moves
@@ -584,6 +880,39 @@ def test_imagery_tiles_render_offline_and_the_panel_has_no_check_controls(win, a
         pump(app, 2, 40)
     assert _Tiles.hits == hits
     assert len(win.canvas.imagery._pix) > 0
+
+
+def test_imagery_nudge_collects_point_pairs_and_changes_only_the_display_offset(win, app, auto):
+    from plumbline.core.model import ImageryLayer
+
+    pr = win.state.project
+    layer_id = pr.new_id()
+    layer = ImageryLayer(layer_id, "Nudge test", "file", {"path": ""}, nudge=(10.0, -3.0))
+    pr.imagery[layer_id] = layer
+    win.imagery.refresh()
+    win.imagery.lst.setCurrentRow(0)
+    win.d_img.show()
+    point = next(iter(pr.points.values()))
+    original_xy = (point.x, point.y)
+
+    win.imagery.btn_nudge_points.click()
+    tool = win._imagery_nudge_tool
+    assert tool is not None and win.canvas.tool is tool
+    assert win.imagery.btn_nudge_points.text() == "Cancel point nudge"
+
+    # The image feature is 8 units west and 4 north of the target survey point. Click it first,
+    # then click the survey point; aligning the image should add (+8, -4) to its current nudge.
+    click_world(win, point.x - 8.0, point.y + 4.0)
+    click_world(win, point.x, point.y)
+    assert len(tool.pairs) == 1
+    QTest.keyClick(win.canvas, Qt.Key_Return)
+
+    assert layer.nudge == pytest.approx((18.0, -7.0), abs=0.5)
+    assert (point.x, point.y) == original_xy
+    assert win.canvas.tool.name == "pan"
+    assert win._imagery_nudge_tool is None
+    assert win.imagery.btn_nudge_points.text() == "Nudge by points..."
+    assert win.state.undo_stack[-1][0] == "Nudge imagery by 1 point pair(s)"
 
 
 def test_google_earth_pins_come_in_as_reference_points(win, app, auto, tmp_path, monkeypatch):
@@ -641,6 +970,7 @@ def test_save_dirty_open_roundtrip(win, app, auto, tmp_path, monkeypatch):
     st.new_project("blank", C.ProjectCRS.local("m"))
     win.open_project_path(path)
     assert len(win.state.project.points) == n
+    assert any("parent field-work folder" in text for text in auto["boxes"])
 
 
 def test_plugin_menu_runs_command_as_one_undo_step(win, app, auto):

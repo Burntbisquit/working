@@ -723,7 +723,7 @@ class ProjectCRS:
     def _need_geodetic(self, what: str = "this"):
         if self.is_local:
             raise LocalCRSError(f"{what} needs a coordinate system - this project's CRS is UNASSIGNED. "
-                                f"Select CRS first (Coordinates > Project Coordinate System...).")
+                                f"Select CRS first (Survey > Project Coordinate System...).")
 
     def to_dict(self) -> dict:
         try:

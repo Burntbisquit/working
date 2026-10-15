@@ -14,6 +14,7 @@ from plumbline.core.point_linework_coder import (
     swap_parallel_line_codes,
 )
 from plumbline.core.project import Project
+from plumbline.core.featurecodes import default_codes
 from test_ui import app, auto, pump, win
 
 
@@ -43,6 +44,7 @@ def test_find_free_string_id():
 
 def test_merge_and_reclass_strings():
     pr = Project()
+    pr.codes = default_codes()
     p1 = pr.add_point(0, 0, 0, number="1", desc="EP1 ST")
     p2 = pr.add_point(10, 0, 0, number="2", desc="EP1 END")
 
@@ -107,6 +109,18 @@ def test_merge_point_descriptions():
     d3 = merge_point_descriptions(["EP1 ST", "TC1 ST"])
     assert d3 == "EP1 ST - TC1 ST"
 
+    # Identical code/description groups collapse to one code instead of making CODE - CODE.
+    assert merge_point_descriptions(["EP1", "EP1"]) == "EP1"
+    assert merge_point_descriptions(["EP1 ST", "EP1 ST"]) == "EP1 ST"
+    assert merge_point_descriptions(["EP1 - TC1 / asphalt", "EP1 - TC1 / asphalt"]) == \
+        "EP1 - TC1 / asphalt"
+
+    # Distinct descriptions continue to use the active Field Book separators and notes.
+    commands = {"multicode": "PLUS", "description": "NOTE"}
+    assert merge_point_descriptions(
+        ["EP1 NOTE asphalt", "TC1 NOTE concrete"], commands=commands
+    ) == "EP1 PLUS TC1 NOTE asphalt concrete"
+
 
 def test_keep_and_ignore_stack_choices_do_not_submit_a_merge_description(win, app):
     from plumbline.ui.qa_workspace import ClosePointsResolveDialog
@@ -115,6 +129,11 @@ def test_keep_and_ignore_stack_choices_do_not_submit_a_merge_description(win, ap
     p1 = pr.add_point(1.0, 1.0, 10.0, number="1", desc="EP ST")
     p2 = pr.add_point(1.01, 1.01, 11.0, number="2", desc="EP END")
     dialog = ClosePointsResolveDialog(win.state, [p1, p2])
+    available = dialog.screen().availableGeometry()
+    if available.width() > 1000:
+        assert dialog.width() > 780  # The stack editor scales with the monitor instead of opening cramped.
+    assert dialog.width() <= available.width()
+    assert dialog.height() <= available.height()
 
     dialog.combos[0].setCurrentText("Keep Point")
     dialog.combos[1].setCurrentText("Ignore")
@@ -125,6 +144,139 @@ def test_keep_and_ignore_stack_choices_do_not_submit_a_merge_description(win, ap
     assert result["ignore_points"] == [p2]
     assert result["merged_desc"] == ""
     assert not result["average_coords"]
+
+
+def test_fix_point_google_maps_button_opens_at_the_current_point(win, app, monkeypatch):
+    from PySide6.QtGui import QDesktopServices
+    from plumbline.core import maps
+    from plumbline.ui.qa_workspace import FixPointErrorsDialog
+
+    project = win.state.project
+    point = project.add_point(123.4, 567.8, 9.0, number="8901", desc="EP")
+    dialog = FixPointErrorsDialog(win.state, win)
+    opened = []
+    map_args = []
+
+    def fake_maps_link(pr, x, y, scale, satellite=True):
+        map_args.append((pr, x, y, scale, satellite))
+        return "https://www.google.com/maps/test", 32.75, -96.60, 17.5
+
+    monkeypatch.setattr(maps, "maps_link_for_view", fake_maps_link)
+    monkeypatch.setattr(
+        QDesktopServices, "openUrl",
+        staticmethod(lambda url: opened.append(url.toString()) or True),
+    )
+    dialog.state.select(points=[point.id])
+
+    assert dialog.btn_google_maps is not None
+    assert dialog.btn_google_maps.text() == "Google Maps"
+    dialog.btn_google_maps.click()
+    assert opened == ["https://www.google.com/maps/test"]
+    assert map_args == [(project, point.x, point.y, dialog.canvas.view.scale, True)]
+    dialog.close()
+
+
+def test_control_comparison_subview_columns_are_resizable(win, app):
+    from PySide6.QtWidgets import QHeaderView
+    from plumbline.ui.qa_workspace import FixPointErrorsDialog
+
+    project = win.state.project
+    point = project.add_point(250.0, 350.0, 20.0, number="8750", desc="EP")
+    dialog = FixPointErrorsDialog(win.state, win)
+    comparison = {
+        "point_id": point.id,
+        "number": point.number,
+        "field": {"northing": point.y, "easting": point.x, "elevation": point.z},
+        "control": {"northing": point.y + 0.5, "easting": point.x, "elevation": point.z},
+        "delta": {"northing": 0.5, "easting": 0.0, "elevation": 0.0},
+    }
+    finding = {
+        "check": "Control point mismatch", "flag": "ControlMismatch", "level": "warn",
+        "pids": [point.id], "control_comparisons": [comparison],
+        "tolerance": 0.01, "units": "US survey feet", "key": "resizable-control-table",
+    }
+    dialog._open_inline_editor(finding)
+    table = dialog.tbl_control_comparison
+    assert all(table.horizontalHeader().sectionResizeMode(column) == QHeaderView.Interactive
+               for column in range(table.columnCount()))
+    dialog.close()
+
+
+def test_blank_stack_cells_are_locked_and_tab_moves_between_action_combos(win, app, monkeypatch):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QAbstractItemView, QHeaderView
+    from plumbline.fieldwork import bridge as FB
+    from plumbline.ui.qa_workspace import ClosePointsResolveDialog, FixPointErrorsDialog
+
+    project = win.state.project
+    p1 = project.add_point(100, 200, 10, number="8701", desc="EP ST")
+    p2 = project.add_point(100.01, 200.01, 10, number="8702", desc="")
+    p3 = project.add_point(300, 400, 10, number="8703", desc="TC ST")
+    p4 = project.add_point(300.01, 400.01, 10, number="8704", desc="TC")
+    point_groups = [[p1.id, p2.id], [p3.id, p4.id]]
+
+    def fake_check_project(pr, **_kwargs):
+        ids = list(pr.points)
+        row_by_pid = {pid: row for row, pid in enumerate(ids)}
+        return {
+            "findings": [{
+                "check": "look-alike numbers",
+                "flag": "SimilarPointNumbers",
+                "level": "warn",
+                "detail": "Two look-alike number stacks.",
+                "pids": [pid for group in point_groups for pid in group],
+                "rows": [row_by_pid[pid] for group in point_groups for pid in group],
+                "groups": [[row_by_pid[pid] for pid in group] for group in point_groups],
+                "key": "locked-stack-cells-regression",
+            }],
+            "ids": ids, "rows": [], "stats": {}, "flags": {}, "line_issues": [],
+        }
+
+    monkeypatch.setattr(FB, "check_project", fake_check_project)
+    dialog = FixPointErrorsDialog(win.state, win)
+    finding = next(item for item in dialog.active_findings
+                   if item["key"] == "locked-stack-cells-regression")
+    dialog._open_inline_editor(finding)
+    dialog.show()
+    app.processEvents()
+
+    table = dialog.tbl_edit_pts
+    assert all(table.horizontalHeader().sectionResizeMode(column) == QHeaderView.Interactive
+               for column in range(table.columnCount()))
+    blank_stack = table.item(1, 0)
+    blank_action = table.item(1, 6)
+    assert blank_stack is not None and not blank_stack.flags() & Qt.ItemIsSelectable
+    assert not blank_stack.flags() & Qt.ItemIsEditable
+    assert blank_action is not None and not blank_action.flags() & Qt.ItemIsSelectable
+    assert not blank_action.flags() & Qt.ItemIsEditable
+    assert table.item(1, 5) is not None and not table.item(1, 5).flags() & Qt.ItemIsSelectable
+    assert table.editTriggers() == QAbstractItemView.NoEditTriggers
+
+    first_action = table.cellWidget(0, 6)
+    next_action = table.cellWidget(2, 6)
+    table.setCurrentCell(0, 6)
+    first_action.setFocus(Qt.OtherFocusReason)
+    QTest.keyClick(first_action, Qt.Key_Tab)
+    app.processEvents()
+    assert table.currentRow() == 2
+    assert app.focusWidget() is next_action
+
+    # The per-point dialog also has a read-only point listing and one Tab per action row.
+    popup = ClosePointsResolveDialog(win.state, [p1, p2], is_duplicate=True, parent=win)
+    popup.show()
+    app.processEvents()
+    assert all(popup.tbl.horizontalHeader().sectionResizeMode(column) == QHeaderView.Interactive
+               for column in range(popup.tbl.columnCount()))
+    assert popup.tbl.editTriggers() == QAbstractItemView.NoEditTriggers
+    assert not popup.tbl.item(0, 0).flags() & Qt.ItemIsEditable
+    popup.combos[0].setFocus(Qt.OtherFocusReason)
+    QTest.keyClick(popup.combos[0], Qt.Key_Tab)
+    app.processEvents()
+    assert popup.tbl.currentRow() == 1
+    assert app.focusWidget() is popup.combos[1]
+    popup.close()
+    dialog.close()
 
 
 def test_merge_close_keeps_known_elevation_when_other_is_missing(win):
@@ -183,9 +335,16 @@ def test_close_points_resolve_popup_and_merge(win, app, auto):
     assert not dlg.w_close_tol_bar.isHidden()  # Visible when editing close points!
     assert "2 close point groups detected" in dlg.lbl_edit_detail.text()  # Number of groups, no point numbers spam!
 
-    # Verify table has 5 stacked rows with Edit in Col 0
+    # Every stack has an adjacent staged action dropdown and an Edit Stack button under its number.
+    from PySide6.QtWidgets import QComboBox, QPushButton
     assert dlg.tbl_edit_pts.rowCount() == 5
-    assert dlg.tbl_edit_pts.columnCount() == 6
+    assert dlg.tbl_edit_pts.columnCount() == 7
+    assert dlg.tbl_edit_pts.horizontalHeaderItem(0).text() == "Stack"
+    assert dlg.tbl_edit_pts.horizontalHeaderItem(6).text() == "Action"
+    assert len(dlg.stack_action_combos) == 2
+    stack_cell = dlg.tbl_edit_pts.cellWidget(0, 0)
+    assert any(button.text() == "Edit Stack" for button in stack_cell.findChildren(QPushButton))
+    assert isinstance(dlg.tbl_edit_pts.cellWidget(0, 6), QComboBox)
 
     # Verify clicking point 0 selects whole stack 1
     dlg.tbl_edit_pts.selectRow(0)
@@ -236,6 +395,8 @@ def test_close_points_resolve_popup_and_merge(win, app, auto):
 
 # ------------------------------------------------------------------ Fix Point Errors Dialog UI
 def test_fix_point_errors_dialog_opens_and_resolves(win, app, auto):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QPushButton
     from plumbline.ui.qa_workspace import FixPointErrorsDialog
 
     pr = win.state.project
@@ -247,6 +408,31 @@ def test_fix_point_errors_dialog_opens_and_resolves(win, app, auto):
     assert dlg.canvas is not None
     assert dlg.view3d is not None
     assert dlg.stack.count() == 2
+    dlg.show()
+    app.processEvents()
+    assert dlg.isMaximized()
+    assert not dlg.isFullScreen()
+    assert dlg.view3d.auto_fit_vexag is False
+    assert dlg.view3d.cam.vexag == 1.0
+    assert dlg.sp_vexag.value() == 1.0
+    assert dlg.btn_google_maps is not None
+    assert dlg.windowFlags() & Qt.WindowMaximizeButtonHint
+    assert dlg.windowFlags() & Qt.WindowMinimizeButtonHint
+    assert not any(button.text() in {"Windowed", "Full Screen"}
+                   for button in dlg.findChildren(QPushButton))
+    dlg.showNormal()
+    app.processEvents()
+    assert not dlg.isMaximized()
+    assert not dlg.isFullScreen()
+    dlg.hide()
+    dlg.show()
+    app.processEvents()
+    assert not dlg.isMaximized() and not dlg.isFullScreen()  # Restoring/showing again stays windowed.
+
+    # There is one issue-scoped pair, hidden on the summary page.
+    assert sum(button.text() == "Undo" for button in dlg.findChildren(QPushButton)) == 1
+    assert sum(button.text() == "Redo" for button in dlg.findChildren(QPushButton)) == 1
+    assert not dlg.btn_issue_undo.isVisible() and not dlg.btn_issue_redo.isVisible()
 
     # Check Active Issues table
     assert dlg.tbl_active.rowCount() >= 1
@@ -270,6 +456,7 @@ def test_fix_point_errors_dialog_opens_and_resolves(win, app, auto):
     dlg._open_inline_editor(first_item)
     assert dlg.stack.currentIndex() == 1
     assert dlg.tbl_edit_pts.rowCount() >= 1
+    assert dlg.btn_issue_undo.isVisible() and dlg.btn_issue_redo.isVisible()
 
     # Test point selection sync
     dlg.tbl_edit_pts.selectRow(0)
@@ -312,6 +499,64 @@ def test_fix_point_errors_dialog_opens_and_resolves(win, app, auto):
 
     # Test Save & Exit
     dlg._save_and_exit()
+
+
+def test_flag_review_is_row_and_tab_driven_without_navigation_buttons(win, monkeypatch):
+    from plumbline.fieldwork import bridge as FB
+    from plumbline.ui.qa_workspace import FixPointErrorsDialog
+
+    pr = win.state.project
+    points = [
+        pr.add_point(1110 + idx, 1210 + idx, 50, number=f"R{idx + 1}", desc="BADCODE")
+        for idx in range(3)
+    ]
+    checks = [
+        ("Flag A", "review-flag-a", points[0]),
+        ("Flag B", "review-flag-b", points[1]),
+        ("Flag C", "review-flag-c", points[2]),
+    ]
+
+    def fake_check_project(project, **kwargs):
+        ids = list(project.points)
+        row_by_id = {pid: row for row, pid in enumerate(ids)}
+        findings = [{
+            "check": check,
+            "flag": key,
+            "level": "warn",
+            "detail": f"Review {check}",
+            "rows": [row_by_id[point.id]],
+            "key": key,
+        } for check, key, point in checks if point.desc == "BADCODE"]
+        return {"findings": findings, "ids": ids,
+                "rows": [], "stats": {}, "flags": {}, "line_issues": [], "code_checks": True}
+
+    monkeypatch.setattr(FB, "check_project", fake_check_project)
+    dialog = FixPointErrorsDialog(win.state, win)
+
+    assert not hasattr(dialog, "btn_previous_flag")
+    assert not hasattr(dialog, "btn_next_flag")
+    assert not hasattr(dialog, "btn_ignore_flag")
+
+    # Review is opened from the finding row; staged edits cannot be lost by Return.
+    finding = next(item for item in dialog.active_findings if item.get("key") == "review-flag-a")
+    row = dialog.active_findings.index(finding)
+    dialog.tbl_active.cellWidget(row, 0).click()
+    assert dialog.current_edit_finding["key"] == "review-flag-a"
+    dialog._validate_desc_text = lambda text, f2f_set=None: (True, "Valid code")
+    dialog.desc_edits[0][1].setText("EP")
+    dialog.btn_issue_return.click()
+    assert dialog.stack.currentIndex() == 1
+    assert "Apply or Discard" in dialog.lbl_status.text()
+
+    dialog._action_discard_issue()
+    finding = next(item for item in dialog.active_findings if item.get("key") == "review-flag-a")
+    dialog._open_inline_editor(finding)
+    dialog._validate_desc_text = lambda text, f2f_set=None: (True, "Valid code")
+    dialog.desc_edits[0][1].setText("EP")
+    dialog.btn_issue_apply.click()
+    assert points[0].desc == "EP"
+    assert dialog.current_edit_finding["key"] == "review-flag-a"
+    dialog._discard_and_exit()
 
 
 # ------------------------------------------------------------------ Fix Linework Dialog UI
@@ -375,7 +620,7 @@ def test_fix_linework_dialog_opens_and_resolves(win, app, auto):
 
 # ------------------------------------------------------------------ Potential Code in Descriptor & Corrections UI
 def test_potential_code_in_descriptor_corrections_ui(win, app, auto):
-    from PySide6.QtWidgets import QHeaderView
+    from PySide6.QtWidgets import QHeaderView, QPushButton
     from plumbline.fieldwork.bridge import FLAG_TITLES
     from plumbline.fieldwork.clean import _autocorrect_desc_leave_number
     from plumbline.fieldwork.parse import parse_desc_field
@@ -421,7 +666,7 @@ def test_potential_code_in_descriptor_corrections_ui(win, app, auto):
     dlg.show()
     app.processEvents()
 
-    # Verify splitter default sizes (~20-30% left, ~70-80% right)
+    # Verify the issue workspace keeps more width than the synchronized 2D/3D views.
     sizes = dlg.splitter.sizes()
     assert len(sizes) == 2
     assert sizes[0] < sizes[1]
@@ -430,10 +675,9 @@ def test_potential_code_in_descriptor_corrections_ui(win, app, auto):
     assert 0.15 <= left_ratio <= 0.45
 
     # Verify interactive resizable table headers
-    assert dlg.tbl_active.horizontalHeader().sectionResizeMode(0) == QHeaderView.Interactive
-    assert dlg.tbl_resolved.horizontalHeader().sectionResizeMode(0) == QHeaderView.Interactive
-    assert dlg.tbl_edit_pts.horizontalHeader().sectionResizeMode(0) == QHeaderView.Interactive
-    assert dlg.tbl_edit_resolved.horizontalHeader().sectionResizeMode(0) == QHeaderView.Interactive
+    for table in (dlg.tbl_active, dlg.tbl_resolved, dlg.tbl_edit_pts, dlg.tbl_edit_resolved):
+        assert all(table.horizontalHeader().sectionResizeMode(column) == QHeaderView.Interactive
+                   for column in range(table.columnCount()))
 
     # Locate "Potential code in descriptor" finding
     sep_finding = next((f for f in dlg.active_findings if "potential code" in f.get("check", "").lower() or "misplaced" in str(f.get("flag", "")).lower()), None)
@@ -450,10 +694,14 @@ def test_potential_code_in_descriptor_corrections_ui(win, app, auto):
 
     dlg._open_inline_editor(sep_finding)
     assert dlg.stack.currentIndex() == 1
+    assert {"Apply", "Save", "Discard", "Return"}.issubset(
+        {button.text() for button in dlg.findChildren(QPushButton)})
 
     # Verify points list has 5 data columns without Edit button in Col 0
     assert dlg.tbl_edit_pts.columnCount() == 5
     assert dlg.tbl_edit_pts.horizontalHeaderItem(0).text() == "Pt #"
+    assert all(dlg.tbl_edit_pts.horizontalHeader().sectionResizeMode(column) == QHeaderView.Interactive
+               for column in range(dlg.tbl_edit_pts.columnCount()))
 
     # Verify corrections table structure
     assert hasattr(dlg, "tbl_corrections")
@@ -462,7 +710,8 @@ def test_potential_code_in_descriptor_corrections_ui(win, app, auto):
     assert dlg.tbl_corrections.horizontalHeaderItem(1).text() == "Original Code"
     assert dlg.tbl_corrections.horizontalHeaderItem(2).text() == "Fixed Code"
     assert dlg.tbl_corrections.horizontalHeaderItem(3).text() == "Action"
-    assert dlg.tbl_corrections.horizontalHeader().sectionResizeMode(0) == QHeaderView.Interactive
+    assert all(dlg.tbl_corrections.horizontalHeader().sectionResizeMode(column) == QHeaderView.Interactive
+               for column in range(dlg.tbl_corrections.columnCount()))
 
     # Verify all dropdowns default to "Skip" and include "Correct (Leave # in Descriptor)"
     assert hasattr(dlg, "sep_corrections") and len(dlg.sep_corrections) >= 2
@@ -534,10 +783,15 @@ def test_separator_spacing_fix_stays_independent_from_misplaced_code(win, app, m
                for i in range(dialog.sep_corrections[0][3].count())]
     assert actions == ["Skip", "Correct", "Ignore"]
     first_fix = next(item for item in dialog.sep_corrections if item[0].id == point.id)
+    second_fix = next(item for item in dialog.sep_corrections if item[0].id == second_point.id)
     assert first_fix[2].text() == "MH / 30RCP"
-    first_fix[3].setCurrentText("Correct")
-    dialog._action_apply_separator_corrections()
+    assert first_fix[3].currentText() == "Correct"
+    assert second_fix[3].currentText() == "Correct"
+    second_fix[3].setCurrentText("Skip")
+    assert point.desc == "MH/30RCP"  # Staged until Save & Return.
+    dialog._action_save_issue()
 
+    assert dialog.stack.currentIndex() == 0
     assert point.desc == "MH / 30RCP"
     assert point.attrs["fieldwork_raw_desc"] == "MH/30RCP"
     assert second_point.desc == "MH   /30RCP"
@@ -559,12 +813,55 @@ def test_separator_spacing_fix_stays_independent_from_misplaced_code(win, app, m
     dialog._open_inline_editor(spacing)
     assert len(dialog.sep_corrections) == 1
     assert dialog.sep_corrections[0][2].text() == "MH / 30RCP"
-    dialog.sep_corrections[0][3].setCurrentText("Correct")
-    dialog._action_apply_separator_corrections()
+    assert dialog.sep_corrections[0][3].currentText() == "Correct"
+    dialog._action_save_issue()
+    assert dialog.stack.currentIndex() == 0
     assert second_point.desc == "MH / 30RCP"
     spacing_after = next(f for f in dialog.active_findings if f.get("flag") == "SeparatorSpacingError")
     assert spacing_after["status"] == "resolved"
     assert not spacing_after["pids"]
+
+
+def test_save_return_rechecks_once_for_staged_separator_corrections(win, monkeypatch):
+    from plumbline.fieldwork import bridge as FB
+    from plumbline.ui.qa_workspace import FixPointErrorsDialog
+
+    point = win.state.project.add_point(925, 1035, 50, number="9911", desc="MH/30RCP")
+    calls = []
+
+    def fake_check_project(project, **kwargs):
+        calls.append(1)
+        ids = list(project.points)
+        row = ids.index(point.id)
+        return {
+            "findings": [{
+                "check": "Separator spacing at the separator",
+                "flag": "SeparatorSpacingError",
+                "level": "error",
+                "detail": "Spacing differs from configured separators.",
+                "rows": [row],
+                "groups": [[row]],
+                "key": "save-separator-perf",
+            }],
+            "ids": ids,
+            "rows": [],
+            "stats": {},
+            "flags": {},
+            "line_issues": [],
+        }
+
+    monkeypatch.setattr(FB, "check_project", fake_check_project)
+    dialog = FixPointErrorsDialog(win.state, win)
+    finding = next(f for f in dialog.active_findings if f["key"] == "save-separator-perf")
+    dialog._open_inline_editor(finding)
+    assert dialog.sep_corrections[0][3].currentText() == "Correct"
+    assert len(calls) == 1
+
+    dialog._action_save_issue()
+    assert point.desc == "MH / 30RCP"
+    assert dialog.stack.currentIndex() == 0
+    assert len(calls) == 2  # Save performs the correction and does not trigger a second recheck.
+    dialog._save_and_exit()
 
 
 def test_separator_ignore_clears_warning_and_discard_restores_it(win, monkeypatch):
@@ -580,6 +877,146 @@ def test_separator_ignore_clears_warning_and_discard_restores_it(win, monkeypatc
         "detail": "Potential code appears after a descriptor separator.",
         "pids": [point.id],
         "key": "separator-ignore-regression",
+    }
+    calls = []
+
+    def fake_check_project(project, **kwargs):
+        calls.append(1)
+        return {
+            "findings": [dict(check_finding)],
+            "ids": list(project.points),
+            "rows": [],
+            "stats": {},
+            "flags": {},
+            "line_issues": [],
+        }
+
+    monkeypatch.setattr(FB, "check_project", fake_check_project)
+    dialog = FixPointErrorsDialog(win.state, win)
+    finding = next(f for f in dialog.active_findings if f["key"] == check_finding["key"])
+    assert len(calls) == 1
+    dialog._open_inline_editor(finding)
+
+    dialog.sep_corrections[0][3].setCurrentText("Ignore")
+    dialog._action_apply_separator_corrections()
+
+    assert len(calls) == 1  # Metadata-only ignore does not rerun the QA checks.
+    assert point.id not in dialog.error_point_ids
+    assert dialog.current_edit_finding["status"] == "resolved"
+    assert dialog.tbl_active.item(0, 1).text() == "RESOLVED"
+
+    # The issue-scoped undo/redo stack restores and reapplies the ignore choice.
+    dialog._undo_issue()
+    assert point.id in dialog.error_point_ids
+    dialog._redo_issue()
+    assert point.id not in dialog.error_point_ids
+
+    # Ignore is session-scoped: Discarding this issue restores the warning.
+    dialog._action_discard_issue()
+    assert point.id in dialog.error_point_ids
+    assert dialog.active_findings[0]["status"] == "active"
+    assert len(calls) == 1  # Undo, redo, and discard all avoid redundant QA passes.
+
+
+def test_stack_dropdowns_stage_together_and_undo_restores_unapplied_choices(win, monkeypatch):
+    from PySide6.QtWidgets import QPushButton
+    from plumbline.fieldwork import bridge as FB
+    from plumbline.ui.qa_workspace import FixPointErrorsDialog
+
+    pr = win.state.project
+    p1 = pr.add_point(940, 1040, 50, number="8941", desc="EP")
+    p2 = pr.add_point(941, 1041, 50, number="8942", desc="EP")
+    p3 = pr.add_point(950, 1050, 50, number="8951", desc="EP")
+    p4 = pr.add_point(951, 1051, 50, number="8952", desc="EP")
+    p5 = pr.add_point(960, 1060, 50, number="8961", desc="EP")
+    p6 = pr.add_point(961, 1061, 50, number="8962", desc="EP")
+    point_groups = [[p1.id, p2.id], [p3.id, p4.id], [p5.id, p6.id]]
+    point_ids = [pid for group in point_groups for pid in group]
+    check_finding = {
+        "check": "look-alike numbers",
+        "flag": "SimilarPointNumbers",
+        "level": "warn",
+        "detail": "Three unrelated number stacks are similar.",
+        "key": "lookalike-point-ignore-regression",
+    }
+
+    def fake_check_project(project, **kwargs):
+        ids = list(project.points)
+        row_by_pid = {pid: row for row, pid in enumerate(ids)}
+        finding = dict(check_finding)
+        finding["rows"] = [row_by_pid[pid] for pid in point_ids]
+        finding["groups"] = [[row_by_pid[pid] for pid in group] for group in point_groups]
+        return {"findings": [finding], "ids": ids,
+                "rows": [], "stats": {}, "flags": {}, "line_issues": []}
+
+    monkeypatch.setattr(FB, "check_project", fake_check_project)
+    dialog = FixPointErrorsDialog(win.state, win)
+    finding = next(f for f in dialog.active_findings if f["key"] == check_finding["key"])
+    dialog._open_inline_editor(finding)
+
+    assert len(dialog.stack_action_combos) == 3
+    for row in (0, 2, 4):
+        stack_cell = dialog.tbl_edit_pts.cellWidget(row, 0)
+        assert any(button.text() == "Edit Stack" for button in stack_cell.findChildren(QPushButton))
+        assert dialog.tbl_edit_pts.cellWidget(row, 6) is not None
+
+    stack1_key = dialog._stack_key(point_groups[0])
+    stack3_key = dialog._stack_key(point_groups[2])
+    stack1_combo = dialog.stack_action_combos[stack1_key]
+    stack3_combo = dialog.stack_action_combos[stack3_key]
+
+    # Two dropdown choices stay staged together; project data and flags do not change yet.
+    stack1_combo.setCurrentText("Ignore this stack")
+    stack3_combo.setCurrentText("Ignore this stack")
+    assert dialog.current_edit_finding["ignored_pids"] == set()
+    assert dialog.error_point_ids == set(point_ids)
+    assert p1.id in pr.points and p6.id in pr.points
+    assert dialog.btn_issue_undo.isEnabled()  # Undo can clear unapplied choices.
+    dialog.btn_issue_return.click()
+    assert dialog.stack.currentIndex() == 1
+    assert "Apply or Discard" in dialog.lbl_status.text()
+
+    # One Apply commits all staged stacks as a single history/log entry.
+    dialog.btn_issue_apply.click()
+    assert dialog.current_edit_finding["ignored_pids"] == {p1.id, p2.id, p5.id, p6.id}
+    assert dialog.current_edit_finding["pids"] == [p3.id, p4.id]
+    assert dialog.error_point_ids == {p3.id, p4.id}
+    assert dialog.tbl_edit_resolved.rowCount() == 1
+
+    # Undo unapplies the batch and restores the choices, but does not re-apply them.
+    dialog._undo_issue()
+    assert dialog.current_edit_finding["ignored_pids"] == set()
+    assert dialog.error_point_ids == set(point_ids)
+    assert dialog.stack_action_combos[stack1_key].currentData() == "ignore"
+    assert dialog.stack_action_combos[stack3_key].currentData() == "ignore"
+    assert dialog.btn_issue_redo.isEnabled()
+
+    # A second Undo with no applied batch clears the restored staged dropdowns only.
+    dialog._undo_issue()
+    assert dialog.current_edit_finding["ignored_pids"] == set()
+    assert dialog.error_point_ids == set(point_ids)
+    assert all(combo.currentData() is None for combo in dialog.stack_action_combos.values())
+    assert not dialog.btn_issue_undo.isEnabled()
+    dialog._discard_and_exit()
+
+
+def test_bulk_stack_merge_keeps_head_coordinates_and_merges_descriptions(win, monkeypatch):
+    from PySide6.QtCore import Qt
+    from plumbline.fieldwork import bridge as FB
+    from plumbline.ui.qa_workspace import FixPointErrorsDialog, merge_point_descriptions
+
+    pr = win.state.project
+    head = pr.add_point(920.0, 1020.0, 50.0, number="8921", desc="TREE / 12 INCH OAK")
+    other = pr.add_point(920.01, 1020.01, 70.0, number="8922", desc="SPOT / 512.3")
+    original_head_coords = (head.x, head.y, head.z)
+    original_head_desc = head.desc
+    check_finding = {
+        "check": "Close Points",
+        "flag": "ClosePointCollision",
+        "level": "warn",
+        "detail": "Two points are within the closeness tolerance.",
+        "pids": [head.id, other.id],
+        "key": "close-merge-keep-head-coordinates",
     }
 
     def fake_check_project(project, **kwargs):
@@ -597,23 +1034,111 @@ def test_separator_ignore_clears_warning_and_discard_restores_it(win, monkeypatc
     finding = next(f for f in dialog.active_findings if f["key"] == check_finding["key"])
     dialog._open_inline_editor(finding)
 
-    dialog.sep_corrections[0][3].setCurrentText("Ignore")
-    dialog._action_apply_separator_corrections()
+    stack_key = dialog._stack_key([head.id, other.id])
+    combo = dialog.stack_action_combos[stack_key]
+    keep_coords_index = combo.findData("merge_keep_coords")
+    assert keep_coords_index >= 0
+    assert "keep its X/Y/Z unchanged" in combo.itemData(keep_coords_index, Qt.ToolTipRole)
+    combo.setCurrentIndex(keep_coords_index)
+    expected_desc = merge_point_descriptions(
+        [head.desc, other.desc],
+        (pr.settings or {}).get("fieldbook_file"),
+        (pr.settings or {}).get("f2f_commands"),
+    )
 
-    assert point.id not in dialog.error_point_ids
-    assert dialog.current_edit_finding["status"] == "resolved"
-    assert dialog.tbl_active.item(0, 1).text() == "RESOLVED"
+    # Applying merges descriptions and removes the other point without averaging coordinates.
+    dialog.btn_issue_apply.click()
+    assert head.id in pr.points
+    assert other.id not in pr.points
+    assert (head.x, head.y, head.z) == original_head_coords
+    assert head.desc == expected_desc
+    assert head.desc != original_head_desc
+    resolution_summary = dialog.tbl_edit_resolved.item(0, 1).text()
+    assert "merged descriptions into #8921; kept head coordinates" in resolution_summary
+    assert "removed 1" in resolution_summary
 
-    # The issue-scoped undo/redo stack restores and reapplies the ignore choice.
+    # Undo restores point data and leaves the new action selected but unapplied.
     dialog._undo_issue()
-    assert point.id in dialog.error_point_ids
-    dialog._redo_issue()
-    assert point.id not in dialog.error_point_ids
+    assert head.id in pr.points and other.id in pr.points
+    assert head.desc == original_head_desc
+    assert (head.x, head.y, head.z) == original_head_coords
+    assert dialog.stack_action_combos[stack_key].currentData() == "merge_keep_coords"
+    dialog._discard_and_exit()
 
-    # Ignore is session-scoped: Discarding this issue restores the warning.
-    dialog._action_discard_issue()
-    assert point.id in dialog.error_point_ids
-    assert dialog.active_findings[0]["status"] == "active"
+
+def test_common_conversion_dialog_orders_correct_before_ignore_and_preserves_codes(app, tmp_path):
+    from PySide6.QtWidgets import QPushButton
+    from plumbline.fieldwork.clean import CleanDescriptionDialog
+    from plumbline.fieldwork.io_carlson import write_fwb_file
+
+    book = tmp_path / "conversion.fwb"
+    commands = {"multicode": "PLUS", "description": "NOTE"}
+    assert write_fwb_file(
+        book,
+        ["Code", "Description", "Symbol", "Layer", "Entity Type", "Category"],
+        [["EA", "Asphalt", "CG08", "PAVEMENT", "Point", "Surface"],
+         ["SW", "Sidewalk", "CG08", "SIDEWALK", "Point", "Surface"]],
+        commands=commands, rules=[["EA PLUS SW", "EA"]],
+    )
+    dlg = CleanDescriptionDialog(
+        "9001", "5101", "EA PLUS SW", "CommonConversionError",
+        "Rule would collapse two valid codes.", "(EA)(SW)", "", {"ea", "sw"},
+        fieldbook_path=str(book),
+    )
+    buttons = dlg.findChildren(QPushButton)
+    labels = [button.text() for button in buttons]
+    assert "&3. Correct" in labels and "&Ignore" in labels
+    assert labels.index("&3. Correct") < labels.index("&Ignore")
+
+    dlg.auto_fix_edit.setText("EA PLUS SW")
+    dlg._do_fix()
+    assert dlg.result_action == "fix"
+    assert dlg.result_new_desc == "EA PLUS SW"
+
+
+def test_common_error_rules_feed_point_proposals_default_to_correct_and_precede_unknown(win, app, tmp_path):
+    from plumbline.fieldwork.io_carlson import write_fwb_file
+    from plumbline.ui.qa_workspace import FixPointErrorsDialog
+
+    book = tmp_path / "common-errors.fwb"
+    assert write_fwb_file(
+        book,
+        ["Code", "Description", "Symbol", "Layer", "Entity Type", "Category"],
+        [["EA", "Asphalt", "CG08", "PAVEMENT", "Point", "Surface"],
+         ["SW", "Sidewalk", "CG08", "SIDEWALK", "Point", "Surface"],
+         ["RCP", "Reinforced Concrete Pipe", "CG08", "UTILITIES", "Point", "Utility"]],
+        rules=[["BADCODE", "RCP"], ["EA", "RCP"]],
+    )
+    project = win.state.project
+    project.settings["fieldbook_file"] = str(book)
+    unknown_point = project.add_point(950, 1050, 50, number="9051", desc="BADCODE ST")
+    valid_point = project.add_point(951, 1051, 50, number="9052", desc="EA")
+    project.add_point(952, 1052, 50, number="9053", desc="MYSTERY ST")
+    project.add_point(953, 1053, 50, number="9054", desc="ZZZ ST")
+
+    dialog = FixPointErrorsDialog(win.state, win)
+    common = next(f for f in dialog.active_findings if f.get("flag") == "CommonConversionError")
+    unknown = next(f for f in dialog.active_findings if f.get("flag") == "UnknownCode")
+    assert common["check"] == "Common error"
+    assert dialog.active_findings.index(common) < dialog.active_findings.index(unknown)
+    result_flags = [f.get("flag") for f in dialog.result["findings"]]
+    assert result_flags.index("CommonConversionError") < result_flags.index("UnknownCode")
+
+    dialog._open_inline_editor(unknown)
+    assert dialog.autofix_suggestions[unknown_point.id].text() == "Proposed autofix: RCP ST"
+    unknown_editor = next(editor for point, editor, _label in dialog.desc_edits
+                          if point.id == unknown_point.id)
+    assert unknown_editor.text() == "BADCODE ST"
+    assert unknown_point.desc == "BADCODE ST"
+    dialog.autofix_buttons[unknown_point.id].click()
+    assert unknown_editor.text() == "RCP ST"
+    assert unknown_point.desc == "BADCODE ST"  # Auto Fix stages; Apply/Save commits.
+
+    dialog._open_inline_editor(common)
+    assert [item[2].text() for item in dialog.sep_corrections] == ["RCP ST", "RCP"]
+    assert [item[3].currentText() for item in dialog.sep_corrections] == ["Correct", "Correct"]
+    assert {item[0].id for item in dialog.sep_corrections} == {unknown_point.id, valid_point.id}
+    dialog.close()
 
 
 def test_close_stack_ignore_suppresses_only_the_selected_point(win, monkeypatch):
@@ -643,7 +1168,11 @@ def test_close_stack_ignore_suppresses_only_the_selected_point(win, monkeypatch)
             "line_issues": [],
         }
 
+    popup_action_snapshots = []
+
     def accept_with_second_ignored(popup):
+        if popup.initial_plan:
+            popup_action_snapshots.append([combo.currentText() for combo in popup.combos])
         popup.combos[1].setCurrentText("Ignore")
         return QDialog.Accepted
 
@@ -654,27 +1183,46 @@ def test_close_stack_ignore_suppresses_only_the_selected_point(win, monkeypatch)
     dialog._open_inline_editor(finding)
     dialog._action_resolve_stack_dialog([p1.id, p2.id])
 
+    # The popup returns staged choices only; data and active findings wait for page-level Apply.
+    assert dialog.current_edit_finding["ignored_pids"] == set()
+    assert dialog.current_edit_finding["pids"] == [p1.id, p2.id]
+    assert p1.id in pr.points and p2.id in pr.points
+    dialog.btn_issue_apply.click()
+
     assert dialog.current_edit_finding["ignored_pids"] == {p2.id}
     assert dialog.current_edit_finding["pids"] == [p1.id]
     assert p1.id in dialog.error_point_ids
     assert p2.id not in dialog.error_point_ids
-    assert dialog.tbl_active.item(0, 1).text() == "PARTIAL"
 
+    dialog._undo_issue()
+    assert dialog.current_edit_finding["ignored_pids"] == set()
+    assert dialog.current_edit_finding["pids"] == [p1.id, p2.id]
+    assert dialog.stack_action_combos[dialog._stack_key([p1.id, p2.id])].currentData() == "individual"
+    assert p1.id in pr.points and p2.id in pr.points
+    dialog._action_resolve_stack_dialog([p1.id, p2.id])
+    assert popup_action_snapshots == [["Merge (Target)", "Ignore"]]
+
+    dialog._redo_issue()
+    assert dialog.current_edit_finding["ignored_pids"] == {p2.id}
+    assert dialog.tbl_active.item(0, 1).text() == "PARTIAL"
     dialog._action_ignore(dialog.current_edit_finding["key"])
-    assert dialog.active_findings == []
+    assert all(item.get("zero_check") for item in dialog.active_findings)
     assert dialog.error_point_ids == set()
 
 
 def test_issue_page_hides_exit_controls_and_deleted_separator_widgets_are_safe(win, app):
     from PySide6.QtCore import QCoreApplication, QEvent
+    from PySide6.QtWidgets import QPushButton
     from plumbline.ui.qa_workspace import FixPointErrorsDialog
 
     pr = win.state.project
     point = pr.add_point(910, 1010, 50, number="8911", desc="BADCODE1 ST")
     dialog = FixPointErrorsDialog(win.state, win)
 
-    exit_controls = (dialog.btn_save_exit, dialog.btn_discard_exit, dialog.btn_cancel)
+    exit_controls = (dialog.btn_save_exit, dialog.btn_discard_exit)
     assert all(not button.isHidden() for button in exit_controls)
+    assert not hasattr(dialog, "btn_cancel")
+    assert not any(button.text() == "Cancel" for button in dialog.findChildren(QPushButton))
 
     sep_finding = {
         "check": "Potential code in descriptor",
@@ -719,7 +1267,8 @@ def test_issue_page_hides_exit_controls_and_deleted_separator_widgets_are_safe(w
 
 # ------------------------------------------------------------------ Fix Unknown Code & Fieldbook Lookup
 def test_fix_unknown_code_fieldbook_lookup_and_validation(win, app, auto, monkeypatch):
-    from PySide6.QtWidgets import QMessageBox
+    from PySide6.QtWidgets import QHeaderView, QLabel, QMessageBox, QPushButton
+    from plumbline.fieldwork import clean as clean_module
     from plumbline.ui.qa_workspace import FixPointErrorsDialog
 
     pr = win.state.project
@@ -729,6 +1278,11 @@ def test_fix_unknown_code_fieldbook_lookup_and_validation(win, app, auto, monkey
     pr.settings["f2f_path"] = "test-office-standard.csv"
 
     p_unk = pr.add_point(850, 950, 50, number="8801", desc="BADCODE1 ST")
+    p_unk2 = pr.add_point(851, 951, 50, number="8802", desc="BADCODE2 ST")
+    monkeypatch.setattr(
+        clean_module, "_get_autofix_for_desc",
+        lambda raw, *_args, **_kwargs: "RCP ST" if raw.startswith("BADCODE") else raw,
+    )
 
     dlg = FixPointErrorsDialog(win.state, win)
     dlg.show()
@@ -739,18 +1293,36 @@ def test_fix_unknown_code_fieldbook_lookup_and_validation(win, app, auto, monkey
     assert unk_finding is not None
     assert unk_finding.get("level") == "error"
 
-    # 2. Open inline editor for Unknown Code
+    # 2. Open inline editor for Unknown Code; each affected point gets its own staged Auto Fix.
     dlg._open_inline_editor(unk_finding)
     assert dlg.stack.currentIndex() == 1
-    assert not dlg.btn_autofix_descriptions.isEnabled()
-    assert "temporarily disabled" in dlg.btn_autofix_descriptions.toolTip().lower()
+    assert p_unk.id in dlg.autofix_buttons and p_unk2.id in dlg.autofix_buttons
+    assert not any(button.text() == "Select All Correct" for button in dlg.findChildren(QPushButton))
+    suggestions = dlg.autofix_suggestions
+    assert set(suggestions) == {p_unk.id, p_unk2.id}
+    assert suggestions[p_unk.id].text() == "Proposed autofix: RCP ST"
+    assert suggestions[p_unk2.id].text() == "Proposed autofix: RCP ST"
+    original_label = next(label for label in dlg.findChildren(QLabel)
+                          if f"plumbline-point:{p_unk.id}" in label.text())
+    focused = []
+    monkeypatch.setattr(dlg, "_select_and_focus_points", lambda pids: focused.extend(pids))
+    original_label.linkActivated.emit(f"plumbline-point:{p_unk.id}")
+    assert focused == [p_unk.id]
+    auto_fix_button = dlg.autofix_buttons[p_unk.id]
+    second_auto_fix_button = dlg.autofix_buttons[p_unk2.id]
+    assert auto_fix_button.isEnabled() and second_auto_fix_button.isEnabled()
 
-    # Fixed-description input uses a dark foreground on its pale validation background.
+    # Fixed starts with the original; clicking Auto Fix fills each key-in box.
     fixed_edit = next(item[1] for item in dlg.desc_edits if item[0].id == p_unk.id)
+    second_fixed_edit = next(item[1] for item in dlg.desc_edits if item[0].id == p_unk2.id)
+    assert fixed_edit.text() == "BADCODE1 ST" and second_fixed_edit.text() == "BADCODE2 ST"
     assert "color: #1f2933" in fixed_edit.styleSheet()
-    old_fixed_text = fixed_edit.text()
-    dlg._action_autofix_descriptions()
-    assert fixed_edit.text() == old_fixed_text
+    auto_fix_button.click()
+    second_auto_fix_button.click()
+    assert fixed_edit.text() == "RCP ST" and second_fixed_edit.text() == "RCP ST"
+    assert p_unk.desc == "BADCODE1 ST" and p_unk2.desc == "BADCODE2 ST"
+    fixed_edit.setText(p_unk.desc)
+    second_fixed_edit.setText(p_unk2.desc)
 
     # 3. Verify original description highlights error token in red/underline
     highlighted = dlg._highlight_unknown_tokens(p_unk.desc)
@@ -762,6 +1334,8 @@ def test_fix_unknown_code_fieldbook_lookup_and_validation(win, app, auto, monkey
     assert hasattr(dlg, "fb_search")
     assert hasattr(dlg, "fb_category")
     assert hasattr(dlg, "desc_edits") and len(dlg.desc_edits) >= 1
+    assert all(dlg.fb_table.horizontalHeader().sectionResizeMode(column) == QHeaderView.Interactive
+               for column in range(dlg.fb_table.columnCount()))
 
     # Verify category dropdown contains categories
     assert dlg.fb_category.count() >= 2
@@ -811,6 +1385,163 @@ def test_fix_unknown_code_fieldbook_lookup_and_validation(win, app, auto, monkey
     dlg._save_and_exit()
 
 
+def test_field_book_report_default_uses_the_selected_book_name(tmp_path, win):
+    from plumbline.ui.fieldbook_dialog import FieldBookReportDialog
+
+    selected_book = tmp_path / "Road Survey Book.fwb"
+    report = FieldBookReportDialog(win.state.project, win, fwb_path=str(selected_book))
+    assert report._default_report_path() == str(selected_book.with_suffix(".txt"))
+    report.close()
+
+
+def test_changed_points_report_lists_every_point_in_a_merge_stack(win):
+    from PySide6.QtWidgets import QHeaderView
+    from plumbline.fieldwork import bridge as FB
+    from plumbline.ui.qa_workspace import FixPointErrorsDialog, QAReportDialog
+
+    project = win.state.project
+    head = project.add_point(500.0, 600.0, 50.0, number="95001", desc="EP")
+    duplicate = project.add_point(500.01, 600.01, 50.0, number="95002", desc="EP")
+    stack_ids = [head.id, duplicate.id]
+
+    def fake_check_project(pr, **_kwargs):
+        ids = list(pr.points)
+        active_stack = [pid for pid in stack_ids if pid in pr.points]
+        findings = []
+        if len(active_stack) > 1:
+            row_by_pid = {pid: row for row, pid in enumerate(ids)}
+            findings.append({
+                "check": "Close Points", "flag": "ClosePointCollision", "level": "warn",
+                "detail": "Two points occupy the same location.", "pids": active_stack,
+                "rows": [row_by_pid[pid] for pid in active_stack],
+                "groups": [[row_by_pid[pid] for pid in active_stack]],
+                "key": "full-stack-audit-regression",
+            })
+        return {"findings": findings, "ids": ids, "rows": [], "stats": {},
+                "flags": {}, "line_issues": []}
+
+    monkeypatch.setattr(FB, "check_project", fake_check_project)
+    dialog = FixPointErrorsDialog(win.state, win)
+    finding = next(item for item in dialog.active_findings
+                   if item["key"] == "full-stack-audit-regression")
+    dialog._open_inline_editor(finding)
+    key = dialog._stack_key(stack_ids)
+    combo = dialog.stack_action_combos[key]
+    combo.setCurrentIndex(combo.findData("merge_keep_coords"))
+    assert dialog._action_apply_staged_stack_actions()
+
+    audit = project.settings["qa_resolution_audit"]
+    assert [item["point_id"] for item in audit] == stack_ids
+    assert audit[0]["before"] == audit[0]["after"]
+    assert audit[0]["changed_fields"] == []
+    assert audit[1]["before"]["number"] == "95002"
+    assert audit[1]["after"] is None
+    assert audit[1]["changed_fields"] == ["removed"]
+
+    report = QAReportDialog(dialog._report_check_rows(), audit, win)
+    for table in (report.tbl_checks, report.tbl_point_audit):
+        assert all(table.horizontalHeader().sectionResizeMode(column) == QHeaderView.Interactive
+                   for column in range(table.columnCount()))
+    assert report.tbl_point_audit.rowCount() == 2
+    assert "#95001" in report.tbl_point_audit.item(0, 2).text()
+    assert "#95002" in report.tbl_point_audit.item(1, 2).text()
+    assert "No field values changed" in report.tbl_point_audit.item(0, 3).text()
+    assert "Point removed" in report.tbl_point_audit.item(1, 3).text()
+    report.close()
+    dialog.close()
+
+
+def test_qa_report_includes_zero_checks_persistent_point_audit_and_export(tmp_path, win, monkeypatch):
+    from plumbline.fieldwork import bridge as FB
+    from plumbline.ui.qa_workspace import (
+        FixPointErrorsDialog,
+        QAReportDialog,
+        _write_qa_report_csv,
+    )
+
+    pr = win.state.project
+    point = pr.add_point(350.0, 450.0, 25.0, number="93501", desc="BADCODE ST")
+
+    def fake_check_project(project, **kwargs):
+        ids = list(project.points)
+        return {
+            "rows": [[pid] for pid in ids],
+            "ids": ids,
+            "findings": [],
+            "stats": {},
+            "flags": {},
+            "line_issues": [],
+            "code_checks": True,
+        }
+
+    monkeypatch.setattr(FB, "check_project", fake_check_project)
+    dialog = FixPointErrorsDialog(win.state, win)
+    assert dialog.btn_report.text() == "QA Report…"
+    assert not hasattr(dialog, "btn_export")
+
+    # Clear checks remain visible and have a page to review.
+    clear_close = next(row for row in dialog._report_check_rows()
+                       if row["check"] == "Close points")
+    assert clear_close["status"] == "CLEAR"
+    assert clear_close["finding_count"] == 0
+    clear_row = next(idx for idx, item in enumerate(dialog.active_findings)
+                     if item.get("zero_check") and item["check"] == "Close points")
+    assert dialog.tbl_active.item(clear_row, 1).text() == "CLEAR"
+    dialog.tbl_active.cellWidget(clear_row, 0).click()
+    assert dialog.current_edit_finding["zero_check"]
+    assert "0 findings" in dialog.lbl_edit_detail.text()
+    dialog._action_return_to_summary()
+
+    # A correction creates durable before/after records for changed points only.
+    finding = {
+        "check": "Unknown code",
+        "flag": "UnknownCode",
+        "level": "error",
+        "detail": "Unknown code on one point.",
+        "pids": [point.id],
+        "points": [point.number],
+        "stack_groups": [[point.id]],
+        "key": "point-audit-regression",
+    }
+    dialog._open_inline_editor(finding)
+    dialog._apply_fix(
+        "Correct description",
+        lambda: setattr(point, "desc", "EP ST"),
+        resolved_points=[point.id],
+    )
+    audit = pr.settings["qa_resolution_audit"]
+    assert len(audit) == 1
+    assert audit[0]["before"]["description"] == "BADCODE ST"
+    assert audit[0]["after"]["description"] == "EP ST"
+    assert audit[0]["changed_fields"] == ["description"]
+
+    selected_book = tmp_path / "Selected Field Book.fwb"
+    dialog.fieldbook_path = str(selected_book)
+    report = QAReportDialog(dialog._report_check_rows(), audit, dialog)
+    assert report.default_export_path == str(selected_book.with_suffix(".csv"))
+    assert report.tabs.count() == 2
+    assert report.tbl_point_audit.rowCount() == 1
+    assert "Description: “BADCODE ST” → “EP ST”" in report.tbl_point_audit.item(0, 3).text()
+    assert report.btn_export.text().startswith("Export")
+    report_path = tmp_path / "qa_report.csv"
+    _write_qa_report_csv(report_path, dialog._report_check_rows(), audit)
+    exported = report_path.read_text(encoding="utf-8")
+    assert "CHECK SUMMARY" in exported and "RESOLVED POINT AUDIT" in exported
+    assert "Close points,CLEAR,0,0" in exported
+    assert "Specific Before → After Changes" in exported
+    assert "Description: “BADCODE ST” → “EP ST”" in exported
+    assert "BADCODE ST" in exported and "EP ST" in exported
+    report.close()
+
+    dialog._undo_issue()
+    assert point.desc == "BADCODE ST"
+    assert pr.settings["qa_resolution_audit"] == []
+    dialog._redo_issue()
+    assert point.desc == "EP ST"
+    assert len(pr.settings["qa_resolution_audit"]) == 1
+    dialog._discard_and_exit()
+
+
 def test_qa_workbench_uses_selected_vocabulary_and_fieldbook_path(win, monkeypatch):
     from plumbline.fieldwork import bridge as FB
     from plumbline.ui.qa_workspace import FixPointErrorsDialog
@@ -818,7 +1549,7 @@ def test_qa_workbench_uses_selected_vocabulary_and_fieldbook_path(win, monkeypat
     pr = win.state.project
     pr.add_point(80.0, 90.0, 10.0, number="88001", desc="OFFICE_CODE")
     selected_path = "/standards/selected-job.fwb"
-    monkeypatch.setattr(FB, "vocabulary_for", lambda _project: {
+    monkeypatch.setattr(FB, "vocabulary_for", lambda _project, **_kwargs: {
         "source": "none", "label": "", "codes": set(), "path": selected_path,
         "why": "selected file has no valid code vocabulary",
     })
@@ -836,7 +1567,7 @@ def test_qa_workbench_uses_selected_vocabulary_and_fieldbook_path(win, monkeypat
     assert checked[-1] == {"f2f": set(), "fieldbook_path": selected_path}
 
 
-def test_qa_fixes_and_rollbacks_rebuild_derived_linework(win):
+def test_qa_fixes_and_rollbacks_do_not_process_linework_implicitly(win):
     from plumbline.core.featurecodes import FeatureCode
     from plumbline.ui.qa_workspace import FixPointErrorsDialog
 
@@ -845,6 +1576,7 @@ def test_qa_fixes_and_rollbacks_rebuild_derived_linework(win):
     start = pr.add_point(0.0, 0.0, 10.0, number="99101", desc="QA ST")
     end = pr.add_point(10.0, 0.0, 20.0, number="99102", desc="QA END")
     duplicate = pr.add_point(100.0, 100.0, 30.0, number="99101", desc="OTHER")
+    unrelated = pr.add_point(500.0, 500.0, 30.0, number="99103", desc="OTHER")
     pr.process_linework()
 
     def line_start():
@@ -863,19 +1595,30 @@ def test_qa_fixes_and_rollbacks_rebuild_derived_linework(win):
     dialog._apply_fix("Move QA line vertex", lambda: setattr(start, "x", 2.0),
                       resolved_points=[start.id])
     assert start.x == pytest.approx(2.0)
-    assert line_start()[0] == pytest.approx(2.0)
+    assert line_start() == pytest.approx(initial_line_start)
+    assert not pr.linework_is_processed()
 
     dialog._undo_issue()
     assert start.x == pytest.approx(0.0)
     assert line_start() == pytest.approx(initial_line_start)
+    assert pr.linework_is_processed()
 
     dialog._redo_issue()
     assert start.x == pytest.approx(2.0)
-    assert line_start()[0] == pytest.approx(2.0)
+    assert line_start() == pytest.approx(initial_line_start)
+    assert not pr.linework_is_processed()
 
+    # Only an explicit invocation rebuilds the derived geometry.
+    pr.process_linework()
+    assert line_start()[0] == pytest.approx(2.0)
+    assert pr.linework_is_processed()
+
+    unrelated.desc = "Changed outside this issue"
     dialog._action_discard_issue()
     assert start.x == pytest.approx(0.0)
-    assert line_start() == pytest.approx(initial_line_start)
+    assert unrelated.desc == "Changed outside this issue"
+    assert line_start()[0] == pytest.approx(2.0)
+    assert not pr.linework_is_processed()
     assert dialog.resolved_findings == []
     assert dialog.history_undo == []
     assert not dialog.dirty
@@ -926,15 +1669,20 @@ def test_initial_view_staging_and_issue_scoped_undo_redo(win, app, auto):
     assert "[Active]" in dlg.lbl_issue_status.text() or "WARN" in dlg.lbl_issue_status.text()
     assert not dlg.btn_issue_undo.isEnabled()
 
-    # Apply close points merge on Issue 1
-    dlg._action_merge_close([p1, p2], average=True)
+    # Stage a stack merge; the project remains unchanged until page-level Apply.
+    close_key = dlg._stack_key([p1.id, p2.id])
+    merge_combo = dlg.stack_action_combos[close_key]
+    merge_combo.setCurrentText("Merge all into head; average coordinates")
+    assert p2.id in pr.points
+    dlg.btn_issue_apply.click()
     assert p1.id in pr.points
     assert p2.id not in pr.points  # merged
     assert dlg.btn_issue_undo.isEnabled()
 
-    # Test Scoped Undo on Issue 1
+    # Undo restores both the point data and the merge dropdown selection, without reapplying it.
     dlg._undo_issue()
-    assert p2.id in pr.points  # restored
+    assert p2.id in pr.points
+    assert dlg.stack_action_combos[close_key].currentData() == "merge"
     assert dlg.btn_issue_redo.isEnabled()
 
     # Test Scoped Redo on Issue 1
@@ -964,12 +1712,12 @@ def test_initial_view_staging_and_issue_scoped_undo_redo(win, app, auto):
     dlg._open_inline_editor(sep_finding)
     assert dlg.stack.currentIndex() == 1
 
-    # Apply fix on Issue 2
+    # Correct All stages row selections; Save & Return applies them.
+    original_p3_desc = p3.desc
     dlg._action_correct_all_separator_corrections()
-    assert "rcp" in p3.desc
-
-    # Save Issue 2 back to Initial View
+    assert p3.desc == original_p3_desc
     dlg._action_save_issue()
+    assert "rcp" in p3.desc
     assert dlg.stack.currentIndex() == 0
 
     # Verify Issue 2 row turns green RESOLVED in master table
@@ -1013,4 +1761,122 @@ def test_initial_view_staging_and_issue_scoped_undo_redo(win, app, auto):
     dlg._save_and_exit()
     assert p1.desc == "EC1 ST - EC1" or "EC1" in p1.desc
     assert "rcp" in p3.desc
+
+
+def test_qa_view_splitter_fills_height_and_keeps_views_recoverable(win, app):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QSizePolicy
+    from plumbline.ui.qa_workspace import FixLineworkDialog
+
+    dialog = FixLineworkDialog(win.state, win)
+    try:
+        dialog.resize(1200, 900)
+        dialog.show()
+        app.processEvents()
+        app.processEvents()
+
+        splitter = dialog.split_views
+        assert dialog.splitter.sizePolicy().verticalPolicy() == QSizePolicy.Expanding
+        assert dialog.w_left.sizePolicy().verticalPolicy() == QSizePolicy.Expanding
+        assert dialog.w_right.sizePolicy().verticalPolicy() == QSizePolicy.Expanding
+        root_layout = dialog.root_layout
+        margins = root_layout.contentsMargins()
+        available_height = (
+            dialog.root_widget.height() - margins.top() - margins.bottom()
+            - dialog.banner.height() - root_layout.spacing()
+        )
+        assert dialog.splitter.height() >= available_height - 2
+        assert dialog.splitter.width() >= dialog.root_widget.width() - 2
+        assert dialog.splitter.geometry().bottom() >= dialog.root_widget.rect().bottom() - 2
+        assert dialog.splitter.geometry().right() >= dialog.root_widget.rect().right() - 2
+        assert dialog.w_left.height() >= dialog.splitter.height() - 2
+        assert dialog.w_right.height() >= dialog.splitter.height() - 2
+
+        assert splitter.orientation() == Qt.Vertical
+        assert splitter.count() == 2
+        assert not splitter.isCollapsible(0)
+        assert not splitter.isCollapsible(1)
+        assert splitter.sizePolicy().verticalPolicy() == QSizePolicy.Expanding
+        assert dialog.canvas.sizePolicy().verticalPolicy() == QSizePolicy.Expanding
+        assert dialog.view3d.sizePolicy().verticalPolicy() == QSizePolicy.Expanding
+
+        sizes = splitter.sizes()
+        assert sum(sizes) >= splitter.height() - splitter.handleWidth() - 2
+        assert 0.57 <= sizes[0] / sum(sizes) <= 0.63
+        assert splitter.geometry().bottom() >= dialog.w_left.rect().bottom() - 2
+
+        # Extreme divider moves must leave each canvas above its minimum height.
+        for requested_sizes in ([0, 10000], [10000, 0]):
+            splitter.setSizes(requested_sizes)
+            app.processEvents()
+            actual_sizes = splitter.sizes()
+            assert actual_sizes[0] >= dialog.canvas.minimumHeight()
+            assert actual_sizes[1] >= dialog.view3d.minimumHeight()
+    finally:
+        dialog.close()
+        app.processEvents()
+
+
+def test_fix_point_maximized_window_fills_workbench_at_multiple_sizes(win, app):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QMainWindow
+    from plumbline.ui.qa_workspace import FixPointErrorsDialog
+
+    dialog = FixPointErrorsDialog(win.state, win)
+    assert isinstance(dialog, QMainWindow)
+    assert dialog.centralWidget() is dialog.root_widget
+
+    def assert_workbench_fills_window():
+        root_layout = dialog.root_layout
+        margins = root_layout.contentsMargins()
+        assert (margins.left(), margins.top(), margins.right(), margins.bottom()) == (0, 0, 0, 0)
+        available_height = (
+            dialog.root_widget.height() - margins.top() - margins.bottom()
+            - dialog.banner.height() - root_layout.spacing()
+        )
+        available_width = dialog.root_widget.width() - margins.left() - margins.right()
+        assert dialog.splitter.height() >= available_height - 2
+        assert dialog.splitter.width() >= available_width - 2
+        assert dialog.splitter.geometry().bottom() >= dialog.root_widget.rect().bottom() - 2
+        assert dialog.splitter.geometry().right() >= dialog.root_widget.rect().right() - 2
+        assert dialog.w_left.height() >= dialog.splitter.height() - 2
+        assert dialog.w_right.height() >= dialog.splitter.height() - 2
+
+    try:
+        dialog.show()
+        app.processEvents()
+        app.processEvents()
+
+        assert dialog.isMaximized()
+        assert not dialog.isFullScreen()
+        assert dialog.windowFlags() & Qt.WindowMaximizeButtonHint
+        assert dialog.windowFlags() & Qt.WindowMinimizeButtonHint
+        assert_workbench_fills_window()
+
+        dialog.showNormal()
+        dialog.resize(1200, 700)
+        app.processEvents()
+        app.processEvents()
+        assert not dialog.isMaximized() and not dialog.isFullScreen()
+        assert_workbench_fills_window()
+    finally:
+        dialog.close()
+        app.processEvents()
+
+
+def test_main_window_opens_qa_workbench_as_modal_central_window(win, app, monkeypatch):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QMainWindow
+
+    monkeypatch.setattr(win, "_ensure_fieldbook_for_processing", lambda **_kwargs: True)
+    win.open_fix_point_errors()
+    app.processEvents()
+
+    dialog = win._qa_workbench_window
+    assert isinstance(dialog, QMainWindow)
+    assert dialog.centralWidget() is dialog.root_widget
+    assert dialog.windowModality() == Qt.WindowModal
+    dialog._discard_and_exit()
+    app.processEvents()
+    assert win._qa_workbench_window is None
 

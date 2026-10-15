@@ -31,7 +31,8 @@ from .config import (crew_blocks, CONTROL_RANGE, BOUNDARY_RANGE, GENERAL_START,
                     get_command_map, get_command_set, get_separator_texts, get_separator_tokens)
 from ..core.fieldbook_syntax import (command_joiner, find_separator, normalize_separator_spacing,
                                      spacing_preference, split_at_separator, trim_separator_edges)
-from .parse import parse_desc_field, _validate_line_command_order, build_f2f_set_from_fieldbook, _strip_trailing_digits
+from .parse import (parse_desc_field, _validate_line_command_order, build_f2f_set_from_fieldbook,
+                    _strip_trailing_digits, common_conversion_rule_warning)
 from .detectors import normalize_point_number
 
 import re
@@ -242,6 +243,10 @@ def _autocorrect_desc(raw_desc: str, f2f_set: set, fieldbook_path=None, rules=No
             if not err or not fix:
                 continue
             if raw_stripped.casefold() == err.casefold():
+                warning = common_conversion_rule_warning(
+                    err, fix, f2f_set, fieldbook_path=fieldbook_path, commands=commands)
+                if warning:
+                    return None  # do not offer a known lossy auto-fix
                 return fix
             # Also handle normalized dash/space: compare tokens
             # e.g., err "EC" with fix "EC1" and raw "ec" -> fix
@@ -298,6 +303,8 @@ def _autocorrect_desc(raw_desc: str, f2f_set: set, fieldbook_path=None, rules=No
         # Use custom command set if fieldbook has one
         cmd_set = get_command_set(fieldbook_path, commands)
         parsed = parse_desc_field(raw_desc, f2f_set, fieldbook_path=fieldbook_path, command_set=cmd_set, rules=rules, commands=commands)
+        if any("CommonConversionError" in flag for flag in parsed.get("flags", [])):
+            return None  # preserve the valid multi-code source until a user reviews the rule
         # Only attempt if has UnknownCode, Orphan, MisplacedAfterSeparator, or SeparatorSpacingError
         has_unknown = any("UnknownCode" in f for f in parsed.get("flags", []))
         has_orphan = any("OrphanCommand" in f for f in parsed.get("flags", []))
@@ -870,6 +877,7 @@ class CleanDescriptionDialog(QDialog):
         self.pt_num = pt_num
         self.raw_desc = raw_desc
         self.flags = flags
+        self.is_common_conversion_error = "CommonConversionError" in str(flags)
         self.flag_detail = flag_detail
         self.f2f_set = f2f_set
         self.parsed_code = parsed_code
@@ -1061,14 +1069,17 @@ class CleanDescriptionDialog(QDialog):
         self.auto_fix_edit = QLineEdit()
         self.auto_fix_edit.setText(auto_fix_text)
         if not auto_fix_raw:
-            self.auto_fix_edit.setPlaceholderText("N/A")
+            self.auto_fix_edit.setPlaceholderText(
+                "Enter the complete verified description" if self.is_common_conversion_error else "N/A")
         self.auto_fix_edit.setStyleSheet(auto_fix_style)
         self.auto_fix_edit.setToolTip(auto_fix_tip)
         self.auto_fix_edit.setReadOnly(False)
         self.auto_fix_edit.setEnabled(True)
         # Keep QLabel alias for backwards compat (tests may check label)
         self.auto_fix_label = self.auto_fix_edit
-        corr_form.addRow("Auto Fix:", self.auto_fix_edit)
+        corr_form.addRow(
+            "Corrected Description:" if self.is_common_conversion_error else "Auto Fix:",
+            self.auto_fix_edit)
         # Keep dummy labels for compat / no longer shown in this box
         self.proposed_label = QLabel("")
         self.proposed_label.setVisible(False)
@@ -1099,7 +1110,10 @@ class CleanDescriptionDialog(QDialog):
             fix_enabled = False
             fix_tip = "No Auto Fix available — edit Auto Fix field to enable"
             fix_style = "background-color: #EEEEEE; color: #888;"
-        self.fix_btn = QPushButton("&3. Auto Fix")
+        self.fix_btn = QPushButton(
+            "&3. Correct" if self.is_common_conversion_error else "&3. Auto Fix")
+        if self.is_common_conversion_error:
+            fix_tip = "Apply a complete, verified description before considering Ignore"
         self.fix_btn.setToolTip(fix_tip + " (Alt+3)")
         self.fix_btn.setShortcut("Alt+3")
         self.fix_btn.clicked.connect(self._do_fix)
@@ -1122,14 +1136,14 @@ class CleanDescriptionDialog(QDialog):
             flags_only = flags or ""
             # Count distinct flag types in Flags field (not detail) to avoid double-counting UnknownCode in both
             flag_types = []
-            for ft in ["UnknownCode", "OrphanCommand", "MisplacedAfterSeparator", "LineOrderError", "SeparatorSpacingError", "EmptyDescription"]:
+            for ft in ["CommonConversionError", "UnknownCode", "OrphanCommand", "MisplacedAfterSeparator", "LineOrderError", "SeparatorSpacingError", "EmptyDescription"]:
                 if ft in flags_only:
                     flag_types.append(ft)
             # Per request: UnknownCode and OrphanCommand alone (or together) should NOT count as "multiple" that disables Key-In
             only_unknown_orphan = set(flag_types).issubset({"UnknownCode", "OrphanCommand"}) and len(flag_types) >= 1
             has_multiple = (len(flag_types) > 1 or flags_only.count(";") >= 1 or flags_only.count(",") >= 1) and not only_unknown_orphan
             # Non-token errors are anything except UnknownCode and OrphanCommand (per request: these should NOT gray out Key-In Fix Token)
-            is_non_token = any(ft in flags_only for ft in ["LineOrderError", "MisplacedAfterSeparator", "SeparatorSpacingError", "EmptyDescription"])
+            is_non_token = any(ft in flags_only for ft in ["CommonConversionError", "LineOrderError", "MisplacedAfterSeparator", "SeparatorSpacingError", "EmptyDescription"])
             if is_non_token or has_multiple:
                 self.key_token_btn.setEnabled(False)
                 self.key_token_btn.setToolTip("Single-token fix disabled — multiple issues or non-token error (use Auto Fix or Entire Code)")
@@ -1477,23 +1491,38 @@ class CleanDescriptionDialog(QDialog):
         except Exception:
             edited = None
         if edited:
-            # Validate edited text contains at least one valid code or is correctable
-            # Allow a complete rewrite using the active Field Book's commands and separators.
-            # If edited differs from raw, validate it parses without UnknownCode or is non-empty
+            # Common-conversion findings need a safe full description, not a first-token-only
+            # check: the correction rule itself is what may have discarded valid codes.
             try:
                 from .parse import parse_desc_field as _pdf_fix
                 from .config import get_command_set as _gcs_fix
                 fb_path_fix = getattr(self, '_fb_path', None)
                 cs_fix = _gcs_fix(fb_path_fix) if fb_path_fix else None
-                chk = _pdf_fix(edited, self.f2f_set, fieldbook_path=fb_path_fix, command_set=cs_fix)
-                # If edited still has UnknownCode, warn but still allow if user insists? For now warn
-                if any("UnknownCode" in f for f in chk.get("flags", [])):
-                    # Try to see if edited is at least a known code token
+                chk = _pdf_fix(edited, self.f2f_set, fieldbook_path=fb_path_fix,
+                               command_set=cs_fix, rules=[] if self.is_common_conversion_error else None)
+                flags_fix = chk.get("flags", [])
+                if self.is_common_conversion_error:
+                    blocked = [flag for flag in flags_fix if any(
+                        kind in flag for kind in ("UnknownCode", "OrphanCommand",
+                                                  "MisplacedAfterSeparator", "EmptyDescription"))]
+                    valid_codes = [item for item in
+                                   chk.get("code_classified", []) + chk.get("free_classified", [])
+                                   if item.get("type") == "code"
+                                   and item.get("status") in ("exact", "line_instance")]
+                    if blocked or not valid_codes:
+                        reason = ", ".join(blocked) if blocked else "no valid Field Book code"
+                        QMessageBox.warning(self, "Fix Error",
+                                            f"Enter a complete description with verified Field Book codes ({reason}).")
+                        return
+                elif any("UnknownCode" in flag for flag in flags_fix):
+                    # Legacy edit flow allows a single known first code when other text is being repaired.
                     if not self._validate_token(edited.split()[0]):
                         QMessageBox.warning(self, "Fix Error", f"Edited fix '{edited}' still has UnknownCode — check fieldbook.")
                         return
-            except Exception:
-                pass
+            except Exception as ex:
+                if self.is_common_conversion_error:
+                    QMessageBox.warning(self, "Fix Error", f"Could not verify the corrected description: {ex}")
+                    return
             self.result_action = "fix"
             self.result_new_desc = edited
             self.accept()

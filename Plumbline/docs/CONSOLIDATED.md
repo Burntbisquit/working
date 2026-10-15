@@ -173,7 +173,7 @@ Easting; 'Convert a Height' removed." / "1.000136506 must not be typable as 1.00
   decimals** - `1.000136506` round-trips exactly, in the CRS dialog, in the import panel and in the
   field window.
 * "Convert a Height" is gone from the CRS dialog; the NGVD29 note now points at the tool that does
-  the job properly (**Coordinates > Reproject**), and a geoid note says what a missing model means.
+  the job properly (**Survey > Project Coordinate System > Reproject**), and a geoid note says what a missing model means.
 * SAF is ground/grid (`ground = base + (grid - base) * saf`), which is the TXDOT convention the
   user's numbers came from.
 * Pinned by `test_item_10_*` and `test_item_11_*`.
@@ -196,11 +196,11 @@ That is how a check gets switched off and stays off.
   * `field book + job codes` - a book with no code table merged with the job's own converted codes;
   * `job codes` - only when they came from the office's Carlson export (`f2f_path`), because the
     program's built-in default codes are a starting set, not this job's vocabulary;
-  * `none` - and then the description and line checks **do not run**, and the banner says which
-    half cannot and why.  An empty vocabulary is never run as if it were one.
-* The dock and the field window run the same checks (`bridge.check_project`), so the same data says
-  the same thing through either door.
-* **Auditable across close/reopen**: each run is stored on the project
+  * `none` - number/position and blank-description checks still run; vocabulary-dependent checks
+    pause and the banner says which inputs are missing. An empty vocabulary is never run as if it were one.
+* The Check Fieldwork dock and Fix Point Errors use the point-error run/cache. Whole-line findings
+  use a separate Fix Linework run/cache; `Line command order` remains in Fix Point Errors by direction.
+* **Auditable across close/reopen**: each point-check run is stored on the project
   (`settings["check_report"]`: when, how many points, crews, every finding with the point ids it
   named *and* their numbers, the vocabulary used and its size), written beside the job as
   `Reports/Check Fieldwork <stamp>.fwc` (the same unified 9-column report the field window writes,
@@ -735,7 +735,7 @@ know where on the earth the job is — imagery, KML, GIS, reprojection, grid con
 so, by name:
 
 > Grid convergence needs a coordinate system — this project's CRS is UNASSIGNED.
-> Select CRS first (Coordinates > Project Coordinate System…).
+> Select CRS first (Survey > Project Coordinate System…).
 
 ## What deliberately did not merge
 

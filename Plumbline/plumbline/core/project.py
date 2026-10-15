@@ -1,6 +1,8 @@
 """The Project: everything in one drawing/job, plus (de)serialisation and undo snapshots."""
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import math
 import os
@@ -35,6 +37,34 @@ DEFAULT_SETTINGS = {
     "f2f_path": "",              # the office's field-to-finish code table last converted from
 }
 
+
+def _package_relative_path(root: Path, value) -> str:
+    """Store an asset under a package root relative to the project file."""
+    text = str(value or "")
+    if not text or "://" in text:
+        return text
+    try:
+        path = Path(text).expanduser()
+        candidate = path if path.is_absolute() else root / path
+        return candidate.resolve().relative_to(root.resolve()).as_posix()
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return text
+
+
+def _package_absolute_path(root: Path, value) -> str:
+    """Resolve an internal relative package reference for the live application session."""
+    text = str(value or "")
+    if not text or "://" in text:
+        return text
+    try:
+        path = Path(text).expanduser()
+        if path.is_absolute():
+            return text
+        return str((root / path).resolve())
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return text
+
+
 # Everything an edit can change, and therefore everything undo/redo must carry.  `name` is in
 # here so undo can restore a rename (and so AppState.edit(discard_if_unchanged=True) notices
 # one); `path` deliberately is not - undoing an edit should never change which file you are
@@ -47,6 +77,7 @@ class Project:
     def __init__(self, name: str = "Untitled", crs: ProjectCRS | None = None):
         self.name = name
         self.path: str | None = None
+        self._portable_paths = False
         # No silent geodetic assumption: a project without a CRS uses plain local coordinates (US survey feet)
         self.crs: ProjectCRS = crs or ProjectCRS.local("ftUS")
         self.settings: dict = dict(DEFAULT_SETTINGS)
@@ -59,7 +90,9 @@ class Project:
         # Named sets of objects that can be switched on and off together (core/groups.py).  A
         # group switched off hides its objects **everywhere** - drawing, exports and surfaces.
         self.groups: GroupSet = GroupSet()
-        self.codes: FeatureCodeTable = default_codes()
+        # A new project has no office vocabulary until a Field Book is selected or converted.
+        # The built-in starter library remains available explicitly through the Feature Codes UI.
+        self.codes: FeatureCodeTable = FeatureCodeTable()
         self.notes: str = ""
         self._next_id = 1
         self.revision = 0
@@ -318,13 +351,136 @@ class Project:
         self.touch()
         return {"matched": matched, "unknown": unknown}
 
+    def linework_input_signature(self, order: str = "file") -> str:
+        """Fingerprint the point coding, coordinates, feature codes and command map used to build lines."""
+        # Mirror build_linework's ordering exactly: its default/file mode sorts by point id, while
+        # number mode sorts by numeric point number (with the same id tie-breaker).
+        ordered_points = list(self.points.values())
+        if order == "number":
+            def point_number_key(point):
+                try:
+                    return (0, float(point.number), point.id)
+                except ValueError:
+                    return (1, 0.0, point.id)
+            ordered_points.sort(key=point_number_key)
+        else:
+            ordered_points.sort(key=lambda point: point.id)
+        points = [
+            [point.id, str(point.number), point.x, point.y, point.z, str(point.desc or "")]
+            for point in ordered_points
+        ]
+        codes = sorted(self.codes.to_list(),
+                       key=lambda item: (str(item.get("code", "")).casefold(),
+                                         str(item.get("code", ""))))
+        manual_overrides = [
+            [entity.id, entity.attrs or {}]
+            for entity in sorted(self.entities.values(), key=lambda item: item.id)
+            if isinstance(entity, Polyline)
+            and (entity.attrs or {}).get("manual_linework_override")
+        ]
+        payload = {
+            "version": "linework-build-v1",
+            "order": str(order),
+            "points": points,
+            "codes": codes,
+            "commands": (self.settings or {}).get("f2f_commands"),
+            "manual_overrides": manual_overrides,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False, default=str, allow_nan=True).encode("utf-8")
+        return hashlib.blake2b(encoded, digest_size=24).hexdigest()
+
+    def linework_is_processed(self) -> bool:
+        """Whether derived linework matches the current build inputs.
+
+        Older projects predate the content signature. Their existing generated lines are treated as
+        the last processed state once loaded; from_dict records that baseline so subsequent point or
+        code edits make it stale.
+        """
+        signature = str((self.settings or {}).get("linework_processed_signature") or "")
+        if signature:
+            order = str((self.settings or {}).get("linework_processed_order") or "file")
+            return signature == self.linework_input_signature(order)
+        return any(str(getattr(entity, "derived", "") or "").startswith("linework")
+                   or getattr(entity, "derived", "") == "manual-linework"
+                   for entity in self.entities.values())
+
     def process_linework(self, order: str = "file") -> dict:
-        """(Re)build linework from coded points.  Replaces previously generated linework."""
+        """(Re)build coded linework, respecting geometry edits accepted as manual overrides."""
+        input_signature = self.linework_input_signature(order)
+        manual_overrides = {}
+        for entity in self.entities.values():
+            if not isinstance(entity, Polyline):
+                continue
+            attrs = entity.attrs or {}
+            if not attrs.get("manual_linework_override"):
+                continue
+            raw_scopes = attrs.get("linework_override_scopes", []) or []
+            valid_scopes = False
+            if isinstance(raw_scopes, (tuple, list)):
+                for raw in raw_scopes:
+                    if not isinstance(raw, dict) or not str(raw.get("code", "")).strip():
+                        continue
+                    code = str(raw.get("code", "")).strip()
+                    string = str(raw.get("string", "") or "").strip()
+                    source_ids = set()
+                    for pid in raw.get("point_ids", []) or []:
+                        try:
+                            source_ids.add(int(pid))
+                        except (TypeError, ValueError):
+                            continue
+                    source_sequences = set()
+                    for sequence in raw.get("source_sequences", []) or []:
+                        if not isinstance(sequence, (tuple, list)) or len(sequence) < 2:
+                            continue
+                        try:
+                            source_sequences.add(tuple(int(pid) for pid in sequence))
+                        except (TypeError, ValueError):
+                            continue
+                    key = (code.casefold(), string.casefold())
+                    manual_overrides.setdefault(key, []).append((source_ids, source_sequences))
+                    valid_scopes = True
+            if not valid_scopes:
+                raw_ids = attrs.get("linework_override_point_ids", []) or []
+                source_ids = set()
+                for pid in raw_ids:
+                    try:
+                        source_ids.add(int(pid))
+                    except (TypeError, ValueError):
+                        continue
+                source_sequences = set()
+                for sequence in attrs.get("linework_override_source_sequences", []) or []:
+                    if not isinstance(sequence, (tuple, list)) or len(sequence) < 2:
+                        continue
+                    try:
+                        source_sequences.add(tuple(int(pid) for pid in sequence))
+                    except (TypeError, ValueError):
+                        continue
+                for raw in attrs.get("linework_override_keys", []) or []:
+                    if isinstance(raw, (tuple, list)) and len(raw) >= 2 and str(raw[0]).strip():
+                        key = (str(raw[0]).casefold(), str(raw[1]).casefold())
+                        manual_overrides.setdefault(key, []).append((source_ids, source_sequences))
         removed = self.remove_derived("linework")
         strings = build_linework(self.points.values(), self.codes, order,
                                  commands=self.settings.get("f2f_commands"))
         made = 0
         for ls in strings:
+            override_sets = manual_overrides.get((str(ls.code).casefold(), str(ls.string).casefold()), [])
+            line_sequence = tuple(int(pid) for pid in ls.ids)
+            line_ids = set(line_sequence)
+            suppressed = False
+            for source_ids, source_sequences in override_sets:
+                if source_sequences:
+                    if any(line_sequence == sequence or line_sequence == sequence[::-1]
+                           for sequence in source_sequences):
+                        suppressed = True
+                        break
+                elif source_ids and line_ids and line_ids.issubset(source_ids):
+                    # Compatibility for old overrides that only recorded the source point set.
+                    suppressed = True
+                    break
+            if suppressed:
+                continue
             fc = self.codes.get(ls.code)
             pts = [self.points[i] for i in ls.ids if i in self.points]
             if len(pts) < 2:
@@ -332,8 +488,11 @@ class Project:
             verts = np.array([[p.x, p.y, p.z] for p in pts])
             self.add_polyline(verts, fc.layer or "0", ls.closed, None,
                               "breakline" if fc.breakline else "line", "linework",
-                              {"code": ls.code, "string": ls.string, "points": [p.number for p in pts]})
+                              {"code": ls.code, "string": ls.string,
+                               "points": [p.number for p in pts], "point_ids": [p.id for p in pts]})
             made += 1
+        self.settings["linework_processed_signature"] = input_signature
+        self.settings["linework_processed_order"] = str(order)
         self.touch()
         return {"strings": made, "replaced": removed}
 
@@ -437,7 +596,7 @@ class Project:
 
     # ------------------------------------------------------------------ persistence
     def to_dict(self) -> dict:
-        return {
+        data = {
             "format": FORMAT, "version": VERSION, "name": self.name, "saved": time.strftime("%Y-%m-%d %H:%M:%S"),
             "crs": self.crs.to_dict(), "settings": self.settings, "notes": self.notes,
             "layers": [l.to_dict() for l in self.layers.values()],
@@ -449,15 +608,75 @@ class Project:
             "codes": self.codes.to_list(), "next_id": self._next_id,
             "groups": self.groups.to_list(),
         }
+        if self._portable_paths:
+            data["package"] = {"relative_asset_paths": True}
+            if self.path:
+                root = Path(self.path).expanduser().resolve().parent
+                data["settings"] = copy.deepcopy(self.settings)
+                for key in ("fieldbook_file", "f2f_path", "data_folder", "field_data_source_folder"):
+                    value = data["settings"].get(key)
+                    if value:
+                        data["settings"][key] = _package_relative_path(root, value)
+                data["imagery"] = copy.deepcopy(data["imagery"])
+                for layer in data["imagery"]:
+                    source = layer.get("source")
+                    if isinstance(source, dict) and source.get("path"):
+                        source["path"] = _package_relative_path(root, source["path"])
+                data["points"] = copy.deepcopy(data["points"])
+                for point in data["points"]:
+                    attrs = point[7] if len(point) > 7 else None
+                    if not isinstance(attrs, dict):
+                        continue
+                    for key in ("fieldwork_source", "fieldwork_folder"):
+                        if attrs.get(key):
+                            attrs[key] = _package_relative_path(root, attrs[key])
+                    imported = attrs.get("import")
+                    if isinstance(imported, dict) and imported.get("folder"):
+                        imported["folder"] = _package_relative_path(root, imported["folder"])
+        if self.path:
+            # File-backed imagery inside the project folder should remain usable after
+            # the folder is moved, even for projects not created through Save As.
+            root = Path(self.path).expanduser().resolve().parent
+            data["imagery"] = [
+                {**layer, "source": dict(layer.get("source") or {})}
+                for layer in data["imagery"]
+            ]
+            has_internal_imagery = False
+            for layer in data["imagery"]:
+                if layer.get("kind") != "file":
+                    continue
+                source = layer.get("source")
+                value = source.get("path") if isinstance(source, dict) else None
+                if not value or "://" in str(value):
+                    continue
+                try:
+                    path = Path(str(value)).expanduser()
+                    candidate = path if path.is_absolute() else root / path
+                    source["path"] = candidate.resolve().relative_to(root).as_posix()
+                except (OSError, RuntimeError, ValueError, TypeError):
+                    continue
+                has_internal_imagery = True
+            if has_internal_imagery:
+                package_meta = data.get("package")
+                if not isinstance(package_meta, dict):
+                    package_meta = {}
+                data["package"] = {**package_meta, "relative_asset_paths": True}
+        return data
 
     def save(self, path: str | os.PathLike | None = None):
         path = Path(path or self.path or "")
         if not str(path):
             raise ValueError("no path")
+        previous_path = self.path
+        self.path = str(path)
         tmp = path.with_suffix(path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, separators=(",", ":"))
-        os.replace(tmp, path)
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.to_dict(), f, separators=(",", ":"))
+            os.replace(tmp, path)
+        except Exception:
+            self.path = previous_path
+            raise
         self.path = str(path)
 
     @classmethod
@@ -465,6 +684,9 @@ class Project:
         if d.get("format") != FORMAT:
             raise ValueError("Not a Plumbline project file")
         p = cls(d.get("name", "Untitled"), ProjectCRS.from_dict(d["crs"]))
+        package_meta = d.get("package") or {}
+        p._portable_paths = bool(
+            isinstance(package_meta, dict) and package_meta.get("relative_asset_paths"))
         p.settings = {**DEFAULT_SETTINGS, **d.get("settings", {})}
         p.notes = d.get("notes", "")
         p.layers = {l["name"]: Layer.from_dict(l) for l in d.get("layers", [])}
@@ -482,11 +704,24 @@ class Project:
             ck = ImageryCheck.from_dict(c)
             p.checks[ck.id] = ck
         p.groups = GroupSet.from_list(d.get("groups", []))
-        if d.get("codes"):
-            p.codes = FeatureCodeTable.from_list(d["codes"])
+        if "codes" in d:
+            # An explicit empty list is meaningful for a new job with no selected Field Book.
+            p.codes = FeatureCodeTable.from_list(d.get("codes") or [])
+        else:
+            # Preserve the historical fallback for older project files that predate the code table.
+            p.codes = default_codes()
         p._next_id = int(d.get("next_id", 1))
         p.ensure_layer("0", (230, 230, 230))
         p.ensure_layer("POINTS", (255, 255, 255))
+        # Older project files have no input signature. Treat any existing derived linework as
+        # processed at the loaded point/code state, then let signature comparison mark it stale
+        # after the next edit/import.
+        if (not p.settings.get("linework_processed_signature")
+                and any(str(getattr(entity, "derived", "") or "").startswith("linework")
+                        or getattr(entity, "derived", "") == "manual-linework"
+                        for entity in p.entities.values())):
+            p.settings["linework_processed_order"] = "file"
+            p.settings["linework_processed_signature"] = p.linework_input_signature("file")
         p.touch()
         return p
 
@@ -496,6 +731,16 @@ class Project:
             d = json.load(f)
         p = cls.from_dict(d)
         p.path = str(path)
+        if p._portable_paths:
+            root = Path(path).expanduser().resolve().parent
+            for key in ("fieldbook_file", "f2f_path", "data_folder", "field_data_source_folder"):
+                value = p.settings.get(key)
+                if value:
+                    p.settings[key] = _package_absolute_path(root, value)
+            for layer in p.imagery.values():
+                source = getattr(layer, "source", None)
+                if isinstance(source, dict) and source.get("path"):
+                    source["path"] = _package_absolute_path(root, source["path"])
         return p
 
     # ------------------------------------------------------------------ transforms

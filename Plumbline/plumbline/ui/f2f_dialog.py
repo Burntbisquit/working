@@ -113,20 +113,21 @@ class CodeCommandsDialog(QDialog):
 class CorrectionRulesDialog(QDialog):
     """Two-column rules: Common Error (what was typed in field) -> Fix (valid code)."""
 
-    def __init__(self, rules=None, fieldbook_codes=None, parent=None):
+    def __init__(self, rules=None, fieldbook_codes=None, parent=None, commands=None):
         super().__init__(parent)
         self.setWindowTitle("Correction Rules — Common Errors")
         self.resize(650, 420)
         lay = QVBoxLayout(self)
-        lay.addWidget(Hint("Stored with the field book so it travels with the job. "
-                           "Automatically fixes known typos (e.g. IPF -> 12IPF) during check runs."))
+        lay.addWidget(Hint("Stored with the Field Book. Fix must match an active code. Amber rows could collapse a valid multi-code description into one code; review them before saving."))
 
         self.fieldbook_codes = [str(c).upper() for c in (fieldbook_codes or [])]
         self._fb_set = {c.casefold() for c in self.fieldbook_codes}
+        self.commands = commands
+        self.common_conversion_warnings: dict[int, str] = {}
 
         self.table = QTableWidget()
         self.table.setColumnCount(2)
-        self.table.setHorizontalHeaderLabels(["Common Error", "Fix (Field Book code)"])
+        self.table.setHorizontalHeaderLabels(["Common Error", "Fix"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.setAlternatingRowColors(True)
@@ -139,6 +140,12 @@ class CorrectionRulesDialog(QDialog):
             self.table.setItem(r, 0, QTableWidgetItem(str(err)))
             self.table.setItem(r, 1, QTableWidgetItem(str(fix)))
         lay.addWidget(self.table)
+        self.table.cellChanged.connect(lambda *_args: self._refresh_conversion_warnings())
+        self.warning_label = QLabel("")
+        self.warning_label.setWordWrap(True)
+        self.warning_label.setStyleSheet("color: #946200; font-size: 11px;")
+        lay.addWidget(self.warning_label)
+        self._refresh_conversion_warnings()
 
         btn_row = QHBoxLayout()
         add_btn = QPushButton("Add Row")
@@ -157,6 +164,30 @@ class CorrectionRulesDialog(QDialog):
         btn_row.addWidget(cancel)
         lay.addLayout(btn_row)
 
+    def _refresh_conversion_warnings(self):
+        from ..fieldwork.parse import common_conversion_rule_warning
+        warnings = {}
+        for r in range(self.table.rowCount()):
+            err_item, fix_item = self.table.item(r, 0), self.table.item(r, 1)
+            err = err_item.text().strip() if err_item else ""
+            fix = fix_item.text().strip() if fix_item else ""
+            warning = common_conversion_rule_warning(
+                err, fix, self._fb_set, commands=self.commands)
+            if warning:
+                warnings[r] = warning
+            for item in (err_item, fix_item):
+                if item is None:
+                    continue
+                item.setBackground(QBrush(QColor("#FFF1C2")) if warning else QBrush())
+                item.setToolTip(warning or "")
+        self.common_conversion_warnings = warnings
+        if warnings:
+            self.warning_label.setText(
+                f"{len(warnings)} rule(s) may collapse valid multi-code descriptions — highlighted amber. "
+                "Review before saving.")
+        else:
+            self.warning_label.setText("")
+
     def _add_row(self):
         r = self.table.rowCount()
         self.table.insertRow(r)
@@ -169,9 +200,50 @@ class CorrectionRulesDialog(QDialog):
         if not rows:
             if self.table.rowCount() > 0:
                 self.table.removeRow(self.table.rowCount() - 1)
+            self._refresh_conversion_warnings()
             return
         for r in rows:
             self.table.removeRow(r)
+        self._refresh_conversion_warnings()
+
+    def validation_error(self) -> str | None:
+        """Return the first invalid row, ensuring every Fix is an active Field Book code."""
+        for r in range(self.table.rowCount()):
+            err_item = self.table.item(r, 0)
+            fix_item = self.table.item(r, 1)
+            err = err_item.text().strip() if err_item else ""
+            fix = fix_item.text().strip() if fix_item else ""
+            if not err and not fix:
+                continue
+            if not err:
+                return f"Row {r + 1}: enter a Common Error."
+            if not fix:
+                return f"Row {r + 1}: enter a Fix code."
+            if not self._fb_set:
+                return "Load or select a Field Book with feature codes before saving Fix values."
+            if fix.casefold() not in self._fb_set:
+                return f"Row {r + 1}: Fix '{fix}' is not a code in the active Field Book."
+        return None
+
+    def accept(self):
+        error = self.validation_error()
+        if error:
+            QMessageBox.warning(self, "Correction Rules", error)
+            return
+        if self.common_conversion_warnings:
+            examples = [self.table.item(r, 0).text().strip()
+                        for r in sorted(self.common_conversion_warnings)[:5]
+                        if self.table.item(r, 0)]
+            reply = QMessageBox.question(
+                self, "Common Conversion Warning",
+                "Some rules can collapse valid multi-code descriptions "
+                f"({', '.join(examples)}). Review the amber rows. Save these rules anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        super().accept()
 
     def get_rules(self) -> list[list[str]]:
         rules = []
@@ -310,8 +382,9 @@ class ConvertFieldToFinishDialog(QDialog):
             self.commands = dlg.get_commands()
 
     def _edit_rules(self):
+        # Correction rules belong to the Field Book, not to this job's subset of converted codes.
         codes = [self.table.code_of(i, self.mapping) for i in range(len(self.table.rows))]
-        dlg = CorrectionRulesDialog(self.rules, codes, self)
+        dlg = CorrectionRulesDialog(self.rules, codes, self, commands=self.commands)
         if dlg.exec():
             self.rules = dlg.get_rules()
 

@@ -1,35 +1,18 @@
-"""What coordinate system each file's numbers were in - recorded, and changeable afterwards.
+"""Per-file coordinate-system records and corrections.
 
-Item 6 of the change order, in the user's words:
+Imports store their point coordinates in the project CRS; when an import transformed from a
+selected source CRS, that source is retained as provenance. The Survey > File Coordinate Systems
+dialog can correct a file after import:
 
-    "any csv import assumes the project crs. repro only happens when it is a different crs.
-     need a way to change the crs of a file after the fact.  (assumed TXNC grid, was TXC ground)"
+* **Set to Project** records the current project CRS without moving coordinates.
+* **Reproject** treats a user-selected corrected CRS as the file's current source and transforms
+  only that file's points into the project's current CRS. Source and destination SAFs are applied
+  around the respective transformations.
+* **Ground / grid SAF** changes the scale of only that file's points, without changing datum.
 
-Three statements, three jobs for this module.
-
-**Assumed, not asked.**  A CSV is a column of numbers; it does not say where they are.  So the
-importer assumes the project's own system - the safe assumption, and the one that makes a plain
-points file import with no boxes to fill in (``ui/import_export.py``).  Nothing is reprojected when
-the assumption holds, because nothing needs to move.
-
-**Recorded.**  The assumption is written down against the file, together with which of the parts
-were assumed and which came from the file itself: the horizontal system, the elevation unit and
-vertical datum, and the ground/grid state (SAF from a base point).  Without this record the
-assumption is invisible, and an invisible assumption is the one that gets discovered in the
-checking stage.
-
-**Changeable.**  "Assumed TXNC grid, was TXC ground" is the exact failure this is about: the
-numbers are right and the *label* is wrong, or the numbers are wrong and the label is right.
-Those need opposite operations, so the dialog that edits a file's CRS offers both, in the
-program's own words - **relabel** (nothing moves) and **reproject** (the data moves) - and says
-which one it is about to do, with how many points it will touch.  A ground/grid correction is the
-third case and is offered as its own operation, because dividing by a SAF of 1.000136506 is not a
-reprojection: no datum changes, the distances do.
-
-The record lives on the **project**, not on the points: it is one fact about one file, and the
-points already carry the file name they came from (:mod:`plumbline.core.provenance`).  Projects
-saved before this existed simply have no records, and the dialog shows the files it can see
-points from with the CRS left blank rather than guessing one.
+The record lives on the project, not on the points: the points carry the file name they came from
+(:mod:`plumbline.core.provenance`). Older projects with no record remain visible with a blank
+system rather than an inferred one.
 """
 from __future__ import annotations
 
@@ -44,10 +27,12 @@ KEY = "file_crs"
 
 #: How the file's system was arrived at, in the words the dialog shows.
 METHODS = {
-    "project": "assumed to be the project's system (the default for a CSV)",
+    "project": "set to the project's coordinate system",
+    "imported": "converted into the project's system at import",
     "file": "read from the file itself",
     "chosen": "chosen at import time",
     "edited": "changed afterwards on this screen",
+    "reprojected": "reprojected into the project's system",
     "field-book": "the job's field book / fieldwork import",
 }
 
@@ -134,36 +119,42 @@ def points_of(project, file: str) -> list:
 
 # --------------------------------------------------------------------------------------------- the two operations
 def relabel(project, file: str, rec: dict) -> dict:
-    """Say the file was in *rec*'s system all along.  **Nothing moves.**
-
-    The right answer to "assumed TXNC grid, and it really was TXNC grid - it was the record that
-    was wrong".  No coordinates are touched, so this is safe on a job that has already been worked
-    on, and it is undoable like any other edit.
-    """
+    """Change one file's recorded system without changing any coordinates."""
     rec = dict(rec)
     rec["method"] = "edited"
     rec["when"] = _stamp()
     return record(project, file, rec)
 
 
-def reproject(project, file: str, rec: dict, *, convert_z: bool = True) -> dict:
-    """Move the coordinates of one file's points into *rec*'s system.  **The data moves.**
+def set_to_project(project, file: str) -> dict:
+    """Record that this file's points are already in the project's current coordinate system."""
+    previous = for_file(project, file) or {}
+    rec = make_from_project(project, method="project")
+    if previous.get("source_crs"):
+        rec["source_crs"] = dict(previous["source_crs"])
+    return record(project, file, rec)
 
-    Only the points from that file are touched - everything else in the project stays where it is -
-    which is what makes this different from Project > Reproject.  Heights are converted only when
-    the vertical unit changes, exactly as the project-wide operation does.
+
+def reproject(project, file: str, source_rec: dict, *, convert_z: bool = True) -> dict:
+    """Convert this file's points from the corrected source system into the project system.
+
+    ``source_rec`` describes what the selected file coordinates are in *now*.  The destination is
+    always the project's current CRS.  This direction matters for a file whose projection was
+    assigned incorrectly: the user supplies the corrected source system, and the file's points
+    are transformed into the project system.  ``ProjectCRS.transform_to`` applies the source
+    ground-to-grid SAF and the project's grid-to-ground SAF, when either is enabled.
     """
-    from .crs import ProjectCRS
     from . import audit as AUD
 
-    old_rec = for_file(project, file) or make_from_project(project)
-    target = to_projectcrs(rec)
-    if target is None:
-        raise ValueError("Pick the coordinate system this file is actually in.")
+    source = to_projectcrs(source_rec)
+    if source is None:
+        raise ValueError("Pick the corrected coordinate system these file coordinates are in.")
+    target = project.crs
+    if target.is_local:
+        raise ValueError("Assign a project coordinate system before reprojecting file coordinates.")
     pts = points_of(project, file)
-    old_crs = to_projectcrs(old_rec) or project.crs
-    fn = old_crs.transform_to(target)
-    zs = (U.M_PER_UNIT.get(old_crs.vunit, 1.0) / U.M_PER_UNIT.get(target.vunit, 1.0)
+    fn = source.transform_to(target, target.strategy)
+    zs = (U.M_PER_UNIT.get(source.vunit, 1.0) / U.M_PER_UNIT.get(target.vunit, 1.0)
           if convert_z else 1.0)
     xs = np.array([p.x for p in pts], float)
     ys = np.array([p.y for p in pts], float)
@@ -173,16 +164,11 @@ def reproject(project, file: str, rec: dict, *, convert_z: bool = True) -> dict:
         if convert_z and np.isfinite(p.z):
             p.z *= zs
     AUD.record(project, pts)          # the audit trail is the same one the reprojection tool uses
-    out = dict(rec)
-    out["method"] = "edited"
-    out["when"] = _stamp()
-    out["reprojected_from"] = old_rec.get("label") or old_rec.get("key") or "the previous record"
-    out["label"] = target.label or out.get("label", "")   # the label follows the system
-    out["unit"] = target.unit
-    out["vunit"] = target.vunit
+    out = make_from_project(project, method="reprojected")
+    out["reprojected_from"] = source_rec.get("label") or source_rec.get("key") or "the corrected source system"
+    out["source_crs"] = dict(source_rec)
     record(project, file, out)
-    return {"points": len(pts), "from": old_rec.get("label") or old_rec.get("key") or "",
-            "to": out.get("label") or out.get("key") or "", "record": out}
+    return {"points": len(pts), "from": source.label, "to": target.label, "record": out}
 
 
 def rescale_ground(project, file: str, *, saf: float, to_ground: bool, base_n: float = 0.0,
@@ -265,5 +251,5 @@ def to_projectcrs(rec: dict):
 
 
 __all__ = ["KEY", "METHODS", "make", "make_from_project", "record_from_crs", "to_projectcrs",
-           "record", "forget", "for_file", "files", "points_of", "relabel", "reproject",
-           "rescale_ground"]
+           "record", "forget", "for_file", "files", "points_of", "relabel", "set_to_project",
+           "reproject", "rescale_ground"]

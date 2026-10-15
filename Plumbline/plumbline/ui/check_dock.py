@@ -10,12 +10,12 @@ Two different questions get asked about a job, and they need two different tools
   project, after the import renumbered them, after somebody edited a description, dropped a pin
   or merged a second download in.  That is this dock: *View > Panels > Check Fieldwork*.
 
-It runs the checks the field window runs, through the same code
-(:func:`plumbline.fieldwork.bridge.check_project` - the same three detectors and the same
-description parser), so the two windows cannot disagree about what "a duplicate" means.  What this
-dock adds is reach: click a finding to select those points in the drawing, double-click to zoom to
-them, and the Points list's Source File / Parent Folder columns say which download and which crew
-each one came from.
+It runs the project's point-error checks through the shared bridge and description parser. Whole-line
+completeness and geometry-sequence checks are kept in the separate Fix Linework workbench and its
+independent cache. The point check still includes **Line command order**, which is deliberately
+routed to Fix Point Errors. What this dock adds is reach: click a finding to select those points in
+the drawing, double-click to zoom to them, and the Points list's Source File / Parent Folder columns
+say which download and which crew each one came from.
 
 **A vocabulary is what makes the description check a check.**  Without the office's own codes the
 parser would call every code unknown - a hundred false alarms, which is how a check gets switched
@@ -23,19 +23,16 @@ off and stays off.  So this dock runs what it can with what it has, and says whi
 did:
 
 * a **field book** (``.fwb``) - the one the job remembers, or the first one in the job folder's
-  ``Field Book`` folder: all five checks run;
+  ``Field Book`` folder: point and description checks run;
 * the **job's own feature codes** - when they came from the office's Carlson table (*Survey >
-  Convert Field to Finish*), that table is the vocabulary, and all five checks run;
-* **neither** - the three number checks run and the description and line checks do not, and the
-  dock says so and offers both ways out.
+  Convert Field to Finish*), that table is the vocabulary for point and description checks;
+* **neither** - number checks and blank-description checks run, while vocabulary-dependent checks
+  wait; the dock says so and offers both ways out.
 
-**The fifth check is the linework.** A point can have a valid description while its command meanings
-are out of sequence; that only shows when the line is read as a whole - a segment without an End Line
-or Close, or a curve that starts and never ends. Those issues
-are read by :mod:`plumbline.fieldwork.linecheck` - the same reader the field window's Line Repair
-tab uses - and they come back here as findings that select the offending points in the drawing,
-including the ones whose *other* end is a different point.  Fixing them is the field window's
-Line Repair tab (Fix / Key-In / Ignore); this dock is where they are seen from the drawing side.
+**Line command order** is a description-level point finding and stays in Fix Point Errors. Whole-line
+completeness and geometry-sequence checks are not run or cached here; open **Fix Linework** for that
+separate check path. That separation prevents a point-check refresh from silently running a line
+check or replacing its cached results.
 
 There are no tolerances to set here on purpose: the checks use the same tolerances the field
 window uses, because a check that finds something in one window and not the other is worse than
@@ -414,8 +411,8 @@ class LineRepairDialog(QDialog):
                 if new_desc != p.desc:
                     p.desc = new_desc
             pr.touch()
-            if hasattr(pr, "process_linework"):
-                pr.process_linework()
+        self.state.log("Line coding updated. Use Process Linework when you are ready to rebuild derived lines.",
+                       "info")
         self.accept()
 
 
@@ -504,10 +501,9 @@ class CheckFieldworkDock(QWidget):
         lay.addWidget(self.tbl, 1)
 
         lay.addWidget(Hint("Click a finding to select those points in the drawing; double-click to "
-                           "zoom to them.  The three number checks use the same tolerances as the "
-                           "field window (2 cm apart, 5 cm of height), and the line findings are "
-                           "read by the same code the field window's Line Repair tab uses - fix "
-                           "them there (Fix / Key-In / Ignore).  The drawing-wide checks stay on "
+                           "zoom to them. The point checks use the fieldwork tolerances. Line command "
+                           "order is reviewed in Fix Point Errors; other whole-line findings have a "
+                           "separate run/cache in Fix Linework. The drawing-wide checks stay on "
                            "Survey > Data Quality Check."))
 
         self.btn_save = QPushButton("Save Report...")
@@ -516,7 +512,7 @@ class CheckFieldworkDock(QWidget):
                                  "the job's Reports folder when the job has one.")
         row.addWidget(self.btn_save)
         self.btn_workbench.clicked.connect(self.open_workbench)
-        self.btn_run.clicked.connect(lambda *_: self.run(alert=True))
+        self.btn_run.clicked.connect(lambda *_: self.run(alert=True, force=True))
         self.btn_autofix.clicked.connect(self.auto_fix)
         self.btn_save.clicked.connect(self.save_report)
         self.btn_book.clicked.connect(self.choose_field_book)
@@ -577,8 +573,16 @@ class CheckFieldworkDock(QWidget):
         ``Source/`` or beside the download in ``Field Data/`` counts.
         """
         chosen = (self.state.project.settings or {}).get("fieldbook_file")
-        if chosen and Path(chosen).exists():
-            return Path(chosen)
+        if chosen:
+            path = Path(chosen).expanduser()
+            if not path.is_absolute():
+                root = self.job_root()
+                if root is None and getattr(self.state.project, "path", None):
+                    root = Path(self.state.project.path).expanduser().parent
+                if root is not None:
+                    path = Path(root) / path
+            if path.is_file():
+                return path
         from ..fieldwork import bridge as FB
         books = FB.fieldbooks_in(self.job_root())
         return books[0] if books else fieldbook_in(self.job_root())
@@ -604,34 +608,40 @@ class CheckFieldworkDock(QWidget):
         n = len(self.code_set)
         if v["source"] == "none":
             head = (f"{v['why']}.  " if v.get("why") else "No field book.  ")
-            self.banner.set(head + "The number and position checks run, the description and line "
-                            "checks cannot.  Point the job at a field book (Field Book...), or "
-                            "build a code table from the office's Carlson export (Convert Field to "
+            self.banner.set(head + "Number/position and blank-description checks run; vocabulary-based "
+                            "description and Line command order checks are paused. Whole-line checks "
+                            "are separate in Fix Linework. Point the job at a field book (Field Book...), "
+                            "or build a code table from the office's Carlson export (Convert Field to "
                             "Finish...).", "warn")
             return
         if v["source"] == "field book":
-            self.banner.set(f"Field book: {v['label']} - {n:,} codes.  All five checks run.", "info")
+            self.banner.set(f"Field book: {v['label']} - {n:,} codes. Point-error checks are active; "
+                            "whole-line checks run separately in Fix Linework.", "info")
         elif v["source"] == "field book + job codes":
             self.banner.set(f"Field book {v['label']} holds no code table, so this job's own "
-                            f"{n:,} feature codes are used as well - all five checks run.", "info")
+                            f"{n:,} feature codes are used as well. Point-error checks are active; "
+                            "whole-line checks run separately in Fix Linework.", "info")
         else:
             self.banner.set(f"No field book, but this job's {n:,} feature codes are the vocabulary "
-                            f"({v['label']}) - all five checks run.", "info")
+                            f"({v['label']}). Point-error checks are active; whole-line checks run "
+                            "separately in Fix Linework.", "info")
 
-    def choose_field_book(self):
+    def choose_field_book(self, _checked=False, *, run_check: bool = True):
         from .fieldbook_dialog import FieldBookDialog
         dlg = FieldBookDialog(self.state, self)
         dlg.exec()
         self.refresh_banner()
-        self.run()
+        if run_check:
+            self.run()
 
-    def build_code_table(self):
+    def build_code_table(self, _checked=False, *, run_check: bool = True):
         """Hand off to the window's own Convert Field to Finish, then re-check with its codes."""
         from .fieldbook_dialog import FieldBookDialog
         dlg = FieldBookDialog(self.state, self)
         dlg.action_convert()
         self.refresh_banner()
-        self.run()
+        if run_check:
+            self.run()
 
     def alert_if_no_fieldbook(self):
         """Say it once, in a box, when a check is run on a job without a vocabulary.
@@ -658,11 +668,11 @@ class CheckFieldworkDock(QWidget):
         m.setDefaultButton(b_pick)
         m.exec()
         if m.clickedButton() is b_pick:
-            self.choose_field_book()
+            self.choose_field_book(run_check=False)
         elif m.clickedButton() is b_conv:
-            self.build_code_table()
+            self.build_code_table(run_check=False)
         elif m.clickedButton() is b_later:
-            self.run()
+            pass  # The outer run() continues with the checks that do not need a code table.
 
     def _no_field_points(self) -> bool:
         from ..fieldwork import bridge as FB
@@ -679,20 +689,27 @@ class CheckFieldworkDock(QWidget):
             self.run(store=False)
 
     def _changed(self, kinds=None):
-        """Something in the drawing moved: say the check is out of date, do not re-run by itself."""
+        """Flag the point run stale only when point-check inputs changed."""
+        changed_kinds = set(kinds or {"all"})
+        if not changed_kinds.intersection({"points", "all"}):
+            return
         if self.result is None or self._stale:
             return
         self._stale = True
-        self.btn_run.setText("Run the Check *")
-        self.btn_run.setToolTip("The drawing has changed since this check was run")
+        self.btn_run.setText("Update Check *")
+        self.btn_run.setToolTip("QA inputs changed since this check. Click to compute a fresh check "
+                                "and update the cache.")
+        current = self.lbl_when.text().split("  |  Inputs changed", 1)[0]
+        self.lbl_when.setText(current + "  |  Inputs changed; update the check.")
 
-    def run(self, alert: bool = False, store: bool = True):
+    def run(self, alert: bool = False, store: bool = True, force: bool = False):
         """Run the field-data checks and show the findings.
 
         *alert* is set from the Run button: with no vocabulary loaded the check can only do half
-        its job, and that is the moment to say so in a box rather than in a strip.  *store* is
-        False for a run nobody asked for (the one that fills the dock when a project is opened),
-        because a window that dirties a project on sight is a window that loses trust.
+        its job, and that is the moment to say so in a box rather than in a strip. *force* is for an
+        explicit rerun; automatic refreshes reuse a result only when the complete QA-input
+        signature still matches. *store* is False for a run nobody asked for (the one that fills
+        the dock when a project is opened), because opening a window must not dirty the project.
         """
         from ..fieldwork import bridge as FB
 
@@ -702,8 +719,9 @@ class CheckFieldworkDock(QWidget):
         book = self.fieldbook()
         v = getattr(self, "_vocabulary", None) or self.vocabulary()
         try:
-            self.result = FB.check_project(self.state.project, f2f=self.code_set,
-                                           fieldbook_path=book or (v.get("path") or None))
+            self.result, cache_status, input_signature = FB.check_project_cached(
+                self.state.project, f2f=self.code_set,
+                fieldbook_path=book or (v.get("path") or None), force=force)
         except Exception as ex:                          # a check must never break the window
             self.banner.set(f"The check could not run: {ex}", "bad")
             self.state.log(f"Check fieldwork could not run: {ex}", "warn")
@@ -712,19 +730,22 @@ class CheckFieldworkDock(QWidget):
         # there, with what it found, when it ran and which vocabulary it used.  It goes inside an
         # edit so it is undoable and so the project knows it has changed.
         if store:
-            self._store(v)
+            self._store(v, input_signature)
         self._stale = False
         self.btn_run.setText("Run the Check")
-        self.btn_run.setToolTip("")
+        self.btn_run.setToolTip("Force a fresh check now; automatic refreshes reuse results only "
+                                "when QA inputs are unchanged.")
         self._fill_table()
         findings = self.result["findings"]
         stats = self.result["stats"] or {}
         points = stats.get("rows", 0)
         crews = stats.get("crews") or []
-        line_count = len(self.result.get("line_issues") or [])
+        cache_note = {"hit": "cached inputs unchanged", "updated": "refreshed after input changes",
+                      "rerun": "freshly recomputed"}.get(
+                          cache_status, "freshly computed" if force else "")
         self.lbl_when.setText(f"{points:,} point(s) in the check"
                               + (f", crews {', '.join(str(c) for c in crews)}" if crews else "")
-                              + (f", {line_count} line issue(s)" if line_count else ""))
+                              + (f"  |  {cache_note}" if cache_note else ""))
         errors = sum(1 for f in findings if f["level"] == "error")
         warns = sum(1 for f in findings if f["level"] == "warn")
         self.state.log(f"Check fieldwork: {points:,} field point(s), {len(findings)} finding(s)"
@@ -732,13 +753,13 @@ class CheckFieldworkDock(QWidget):
                        + ".  " + PROV.summary(self.state.project), "warn" if errors else "ok")
 
     # --------------------------------------------------------------------- the audit trail
-    def _store(self, vocabulary: dict):
-        """Save this run on the project, and write the same run beside the job when there is one."""
+    def _store(self, vocabulary: dict, input_signature: str | None = None):
+        """Save this run, its verified inputs and the same report beside the job when available."""
         from ..fieldwork import bridge as FB
         try:
             with self.state.edit("Run the Check"):
                 payload = FB.store_report(self.state.project, self.result, vocabulary=vocabulary,
-                                          job_root=self.job_root())
+                                          job_root=self.job_root(), input_signature=input_signature)
                 path = None
                 root = self.job_root()
                 if root:
@@ -775,19 +796,47 @@ class CheckFieldworkDock(QWidget):
             return False
         from ..fieldwork import bridge as FB
         rows, ids = FB.working_rows_from_project(self.state.project)
+        vocabulary = getattr(self, "_vocabulary", None) or self.vocabulary()
+        book = self.fieldbook()
+        saved_signature = payload.get("input_signature")
+        try:
+            current_signature = FB.check_input_signature(
+                self.state.project, f2f=self.code_set,
+                fieldbook_path=book or (vocabulary.get("path") or None),
+                _prepared_rows=(rows, ids))
+        except Exception:
+            current_signature = None
+        signature_matches = bool(saved_signature and current_signature == saved_signature)
         id_to_row = {pid: i for i, pid in enumerate(ids)}
         findings = []
         for f in payload.get("findings") or []:
+            check_name = str(f.get("check", ""))
+            is_line_order = (str(f.get("flag", "")).casefold() == "lineordererror"
+                             or check_name.strip().casefold() in {
+                                 "line command order", "line command out of order", "line: line order"})
+            # Older point reports carried whole-line findings in this same list. Keep the
+            # point-side Line command order entry, but leave other line findings to Fix Linework.
+            if check_name.casefold().startswith("line:") and not is_line_order:
+                continue
             idxs = [id_to_row[i] for i in (f.get("points") or []) if i in id_to_row]
-            findings.append({"level": f.get("level", "info"), "check": f.get("check", ""),
-                             "message": f.get("message", ""), "rows": idxs,
-                             "stored": True})
+            findings.append({"level": f.get("level", "info"), "check": check_name,
+                             "flag": f.get("flag", ""), "message": f.get("message", ""),
+                             "rows": idxs, "stored": True})
         self.result = {"rows": rows, "ids": ids, "findings": findings, "stats": {}, "flags": {},
                        "code_checks": payload.get("vocabulary") not in ("none", "", None),
                        "line_issues": [], "stored": payload}
-        self._stale = False
-        self.btn_run.setText("Run the Check")
-        self.btn_run.setToolTip("")
+        self._stale = not signature_matches or bool(self.state.dirty)
+        self.btn_run.setText("Update Check *" if self._stale else "Run the Check")
+        if self._stale:
+            if signature_matches and self.state.dirty:
+                self.btn_run.setToolTip("The project has unsaved changes. Click to compute a fresh check "
+                                        "and update the cache.")
+            else:
+                self.btn_run.setToolTip("The saved check is unverified or its QA inputs changed. "
+                                        "Click to compute a fresh check and update the cache.")
+        else:
+            self.btn_run.setToolTip("Force a fresh check now; automatic refreshes reuse results only "
+                                "when QA inputs are unchanged.")
         self._fill_table()
         when = payload.get("when", "")
         vocab = payload.get("vocabulary_label") or payload.get("vocabulary", "")
@@ -797,8 +846,14 @@ class CheckFieldworkDock(QWidget):
                               f"{len(findings)} finding(s){extra}"
                               + (f", vocabulary {vocab}" if vocab else "")
                               + (f"  |  {Path(payload['file']).name}" if payload.get("file") else ""))
-        if self.state.dirty:
-            self.lbl_when.setText(self.lbl_when.text() + "  (the drawing has changed since)")
+        if not saved_signature:
+            self.lbl_when.setText(self.lbl_when.text() + "  |  Older report: QA inputs were not "
+                                  "fingerprinted; update check to verify.")
+        elif not signature_matches:
+            self.lbl_when.setText(self.lbl_when.text() + "  |  QA inputs changed since this run; "
+                                  "update the check.")
+        elif self.state.dirty:
+            self.lbl_when.setText(self.lbl_when.text() + "  |  The project has unsaved changes.")
         return True
 
     def _fill_table(self):
@@ -808,7 +863,12 @@ class CheckFieldworkDock(QWidget):
         for r, f in enumerate(findings):
             row_idxs = f.get("rows") or []
             point_ids = [ids[i] for i in row_idxs if 0 <= i < len(ids)]
-            vals = [f["level"].upper(), f["check"], f["message"],
+            check_name = str(f.get("check", ""))
+            is_line_order = (str(f.get("flag", "")).casefold() == "lineordererror"
+                             or check_name.casefold() in {
+                                 "line command order", "line command out of order", "line: line order"})
+            display_name = "Line command order" if is_line_order else check_name
+            vals = [f["level"].upper(), display_name, f["message"],
                     f"{len(row_idxs):,}" if row_idxs else (f"{f.get('count'):,}"
                                                            if f.get("count") else "")]
             for c, v in enumerate(vals):
@@ -826,6 +886,11 @@ class CheckFieldworkDock(QWidget):
                     btn.setToolTip("Resolve duplicate point number or coordinate conflicts")
                     btn.clicked.connect(lambda _=False, pids=point_ids: self._open_duplicate_resolver(pids))
                     self.tbl.setCellWidget(r, 4, btn)
+                elif is_line_order:
+                    btn = QPushButton("Fix...")
+                    btn.setToolTip("Review Line command order in Fix Point Errors")
+                    btn.clicked.connect(lambda _checked=False: self.open_workbench())
+                    self.tbl.setCellWidget(r, 4, btn)
                 elif "description" in chk or "code" in chk or "unknown" in msg or "vocabulary" in msg:
                     btn = QPushButton("Fix...")
                     btn.setToolTip("Interactively fix descriptions and match feature codes")
@@ -833,7 +898,7 @@ class CheckFieldworkDock(QWidget):
                     self.tbl.setCellWidget(r, 4, btn)
                 elif "line" in chk or "figure" in chk or "unclosed" in msg or "sequence" in msg:
                     btn = QPushButton("Repair...")
-                    btn.setToolTip("Repair linework point sequences and start/end codes")
+                    btn.setToolTip("Open the line-specific repair tool for this older stored finding")
                     btn.clicked.connect(lambda _=False, pids=point_ids: self._open_line_repair(pids))
                     self.tbl.setCellWidget(r, 4, btn)
                 else:

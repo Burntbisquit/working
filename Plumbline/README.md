@@ -40,6 +40,15 @@ python -m plumbline doctor                                # checks every library
 python -m plumbline                                       # opens the welcome window
 ```
 
+**To run the tests**, install the development extra in that environment and run pytest headlessly (the suite includes Qt UI tests):
+
+```bash
+python -m pip install -e ".[dev]"
+QT_QPA_PLATFORM=offscreen python -m pytest -q
+```
+
+GitHub Actions runs the suite on both supported Python versions, 3.13 and 3.14.
+
 * **Python 3.13 or newer, 64-bit** (`requires-python` is `>=3.13`). **Python 3.14 is the version this release is built and tested against**, and the one `install_windows.bat` picks when it is available; the full test suite passes on 3.14 (on Linux). It also passes unchanged on **3.13** (verified on Linux), so 3.13 is supported too - you just get an advisory note from `doctor`. Anything newer than 3.14 is untested: PySide6 may not have a build for it yet. On Windows every library has a ready-made 64-bit wheel for 3.14 (checked with pip's resolver); everything installs from wheels (PySide6, pyproj, shapely, pyogrio, ezdxf, rasterio ...).
 * `rasterio` is optional (GeoTIFF orthophotos); without it PNG/JPG + world file images still work.
 * Linux needs the usual Qt system libraries (`libxkbcommon0`, `libegl1`, `libxcb-*` ...) - if Qt complains on start, install them.
@@ -109,25 +118,20 @@ standard end in a digit, so *"the digits after a code are a string number"* is w
 code table wins**; otherwise the digits are read as a string number. On the real job below that is the difference between resolving
 3,749 and 3,763 of 3,773 points.
 
-**The field-data checks also run in the drawing window.** *View > Panels > Check Fieldwork* opens a dock of its own beside the point list:
-the same duplicate-number, look-alike-number and points-on-top-of-each-other checks Fieldwork Manager runs, plus the description check - and the
-linework check - over **the points that are actually in this project** - after the import renumbered them, after somebody edited a description or
-merged a second download in. Click a finding to select those points in the drawing; double-click to zoom to them. The office's code table is what
-makes the description check a check: a job with a field book (or with codes built by *Convert Field to Finish*) runs all five checks and says so on
-the strip; a job without one runs the three number checks, says plainly that the description and line checks could not run, and offers both ways
-out - pick an existing `.fwb`, or build one from the office's Carlson export. A check that quietly cannot run is worse than no check, which is why
-that sentence is on screen and not in a log. **Every run is recorded on the job** - when it ran, over how many points, every finding and
-the point numbers it named, and which code table it was run against - so the check is still there after the project is closed and reopened, and
-`Save Report...` writes it out as a `.fwc` the field window and Excel both read.
+**The point-error checks also run in the drawing window.** *View > Panels > Check Fieldwork* opens a dock beside the point list and checks the points
+that are actually in this project: duplicate numbers, look-alike numbers, close points, descriptions and **Line command order**. Point results are
+cached independently from line-error results; changed inputs mark the displayed point report stale, and *Update Check* explicitly recomputes it.
+Click a finding to select its points in the drawing; double-click to zoom to them. A Field Book (or codes built by *Convert Field to Finish*) enables
+the vocabulary-dependent point checks. Without one, number and blank-description checks still run, while code- and command-dependent checks wait. The dock
+says which work ran and offers both ways to load a vocabulary. Every point-check run is recorded on the job and `Save Report...` writes a `.fwc` the
+field window and Excel can read.
 
-**Line repair reads a line, not a point.** A point can have a valid feature code while the configured Start Curve meaning has no matching End Curve,
-so the curve inside the line never ends; the two ends of that mistake usually sit on different points, which is why no single-description check can see it.
-The field window's **Line Repair** tab reads each code's points as a sequence and names the four ways a line can be incomplete (missing Start Line,
-End Line, Start Curve, or End Curve) against the point whose fix it is. **Fix** offers the description that would mend it, placed in semantic command order
-(Start Line → Start Curve → End Curve → End Line or Close); **Key-In** takes the corrected description typed by hand; **Ignore** records the decision in the
-check report so the next run does not re-open it. Tokens come from the active Field Book. Every fix is then **read back from the line**: the tool says which
-issues it cleared, refuses to call a still-broken line corrected, and names the issue it cleared at *another* point without being asked. The same reader
-feeds the drawing window's dock, so the two windows cannot disagree about where a line ends.
+**Whole-line errors use a separate geometry-correction workflow.** Open *Survey > Fix Linework* to run the existing Field Book-driven line-sequence
+checks; their results and cache do not share the point-error run. **Line command order** remains in *Fix Point Errors* by design. Fix Linework currently
+reports the existing incomplete-line/curve-sequence findings; no additional geometry checks are implied. The active Field Book supplies command meanings,
+and its fix tools read the line again to validate a correction. Importing points, running point checks, editing descriptions, and opening a route do not
+silently rebuild linework. *Survey > Process Linework* is the explicit action for generating or refreshing derived polylines; Open Route may offer it when
+the current point/code inputs have not yet been processed.
 
 ![Check Fieldwork](docs/img/check_fieldwork.png)
 
@@ -194,7 +198,7 @@ holding data comes out byte-identical - so it doubles as a regression check betw
 
 ## Coordinate systems
 
-The coordinate-system manager (**Coordinates > Project Coordinate System**) is the part of a CAD tool that bites, so it is explicit:
+The coordinate-system manager (**Survey > Project Coordinate System**) is the part of a CAD tool that bites, so it is explicit:
 
 ![CRS manager](docs/img/crs_manager.png)
 
@@ -249,7 +253,9 @@ image* or *Custom tile URL*.
 
 **Comparing imagery with your points is a measurement, not a report.** Pan the imagery under the drawing and measure with
 **Draw > Distance / Bearing** (two clicks: distance and bearing) or with the *Measure* tool on any pair. *Nudge east / north* shifts the
-**displayed** imagery to sit where you want it - the survey is never altered, and the nudge is saved with the layer.
+**displayed** imagery to sit where you want it - the survey is never altered, and the nudge is saved with the layer. For point-based alignment,
+select a visible layer and use *Nudge by points...*: click an image feature, then where it should land (the target follows the current snap setting).
+Repeat for extra pairs and press Enter or right-click to apply their average shift.
 
 **Google Earth round trip**: *Export KMZ* (datum handling shown and remembered) -> open in Google Earth -> drop a pin on the same feature for each
 point, named with the point number -> save the pins as KML/KMZ -> *Import pins*. The pins come in as **reference points** on the `OTHER` layer
@@ -288,8 +294,8 @@ A description contains a Field Book feature code, optional string identifier, li
 command token to a fixed meaning: Start Line begins a string, End Line finishes it, Close returns a closed feature to its first point, and configured curve
 commands mark the curve's endpoints. Intermediate coded points continue a string; string identifiers keep interleaved strings apart. Multi-code and
 description separators, including their spacing, follow the active Field Book and Settings. **Survey > Feature Code Table** edits the starter library
-(layer, colour, linetype, point/line/polygon, breakline, counts-as-ground). *Process Linework* builds polylines (regenerated, never duplicated);
-breakline codes feed the surface.
+(layer, colour, linetype, point/line/polygon, breakline, counts-as-ground). The explicit *Process Linework* action builds polylines
+(regenerated, never duplicated); imports and checks do not run it automatically. Breakline codes feed the surface.
 
 **Survey > Convert Field to Finish** reads the office's own code standard straight into those codes - Carlson's Field-to-Finish file, the one every office
 here keeps: **1,717 codes over 216 layers, without retyping anything**. Carlson's layout is the default and asks no questions, and the columns are found

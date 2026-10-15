@@ -352,26 +352,15 @@ DEFAULT_COMMAND_LABELS = list(DEFAULT_COMMAND_LABELS)
 
 
 def read_fwb_extra(path: Path | str) -> dict:
-    """Read extra rules/commands stored in .fwb or F2F file (#EXTRA_JSON)."""
-    import json
-    path = Path(path)
-    if not path.exists():
-        return {"commands": list(DEFAULT_COMMANDS), "rules": []}
-    try:
-        with open(path, "r", encoding="utf-8-sig", errors="ignore") as fh:
-            for line in fh:
-                line = line.strip()
-                if line.startswith("#EXTRA_JSON"):
-                    j = line[len("#EXTRA_JSON"):].strip()
-                    data = json.loads(j)
-                    if isinstance(data, dict):
-                        return {
-                            "commands": data.get("commands", list(DEFAULT_COMMANDS)),
-                            "rules": data.get("rules", []),
-                        }
-    except Exception:
-        pass
-    return {"commands": list(DEFAULT_COMMANDS), "rules": []}
+    """Read canonical command meanings/rules from the active book, including legacy metadata."""
+    from ..fieldwork.io_carlson import read_fwb_extra as read_extra
+    return read_extra(Path(path))
+
+
+def write_fwb_extra(path: Path | str, rules=None, commands=None) -> bool:
+    """Update an existing Field Book's metadata without losing its rows or unknown JSON keys."""
+    from ..fieldwork.io_carlson import write_fwb_extra as write_extra
+    return write_extra(Path(path), rules=rules, commands=commands)
 
 
 def write_fwb(dest_path: Path | str, table: F2FTable, mapping: ColumnMap | None = None,

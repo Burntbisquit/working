@@ -1,9 +1,9 @@
 """New Project -> the cancelable job-folder setup.
 
-Making a job folder is eleven folders and four files, some of them seeded from a code
-table that may be a megabyte of CSV.  Doing that inside a dialog's OK handler freezes
-the window with no explanation and no way out, so this runs it as a short sequence of
-steps behind a progress dialog with a real, working **Cancel**.
+Making a job folder creates the standard subfolders, a short setup note, and the root
+project file. The subfolders start empty; no placeholder Field Book or control file is
+seeded. Doing this inside a dialog's OK handler freezes the window with no explanation
+and no way out, so this runs it behind a progress dialog with a real, working **Cancel**.
 
 Cancel means cancel
 -------------------
@@ -19,73 +19,46 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
+from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
                                QHBoxLayout, QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton,
                                QVBoxLayout, QWidget)
 
 from ..core import jobtemplate as JT
+from ..core.settings import default_project_folder
 
 
 # --------------------------------------------------------------------------------------------- options panel
 class JobSetupPanel(QWidget):
-    """The 'set up the job folders' section of the New Project dialog.
-
-    Self-contained so the New Project dialog can drop it in, and so it can be tested
-    without constructing the whole dialog.
-    """
+    """Choose where to create a job and preview the one standard folder structure."""
 
     def __init__(self, parent=None, default_parent_folder: str = ""):
         super().__init__(parent)
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
 
-        self.chk = QCheckBox("&Set up the job folder (folders, field book, control list, project file)")
-        self.chk.setChecked(True)
-        self.chk.setToolTip("Creates the standard job folder tree so the download, the code table and "
-                            "the output all land where they belong from day one.")
-        root.addWidget(self.chk)
-
         form = QFormLayout()
         row = QHBoxLayout()
-        # One folder, not two (item 12): the *parent* folder is chosen, and the job folder itself
-        # is named after the job.  "Location" and "the project's folder" were two names for the
-        # same decision, which is how a user ends up with a project file somewhere else than the
-        # job it belongs to.
-        self.ed_folder = QLineEdit(default_parent_folder or str(Path.cwd()))
-        self.ed_folder.setPlaceholderText("parent folder - the job folder is created inside it")
+        self.ed_folder = QLineEdit(default_parent_folder or str(default_project_folder()))
+        self.ed_folder.setPlaceholderText("Parent folder - the job folder is created inside it")
         btn = QPushButton("Browse...")
         btn.clicked.connect(self._browse)
         row.addWidget(self.ed_folder, 1)
         row.addWidget(btn)
         holder = QWidget()
         holder.setLayout(row)
-        form.addRow("Project folder:", holder)
-
-        self.cmb_style = QComboBox()
-        for t in JT.TEMPLATES.values():
-            self.cmb_style.addItem(t.name, t.name)
-            self.cmb_style.setItemData(self.cmb_style.count() - 1, t.description, Qt.ItemDataRole.ToolTipRole)
-        form.addRow("Folder style:", self.cmb_style)
-
-        self.sp_weeks = None                       # kept as a name so old callers fail loudly
+        form.addRow("Create project in:", holder)
+        self.sp_weeks = None                       # compatibility: Field Data starts without week folders
         root.addLayout(form)
 
         self.lbl_preview = QLabel()
+        self.lbl_preview.setObjectName("standardFolderPreview")
         self.lbl_preview.setWordWrap(True)
         self.lbl_preview.setStyleSheet("color: #888; font-family: Consolas, monospace;")
         root.addWidget(self.lbl_preview)
 
-        self.cmb_style.currentIndexChanged.connect(self._refresh_preview)
-        self.chk.toggled.connect(self._enable)
         self.ed_folder.textChanged.connect(self._refresh_preview)
         self._job_name = ""
         self._refresh_preview()
-
-    # -- helpers ---------------------------------------------------------------------
-    def _enable(self, on: bool):
-        for w in (self.ed_folder, self.cmb_style):
-            w.setEnabled(on)
-        self.lbl_preview.setEnabled(on)
 
     def _browse(self):
         start = self.ed_folder.text() or str(Path.home())
@@ -94,8 +67,7 @@ class JobSetupPanel(QWidget):
             self.ed_folder.setText(folder)
 
     def set_job_name(self, name: str):
-        """The New Project dialog tells this panel the job name, so the preview can show the
-        folder this setup will actually make: ``<parent>/<job name>/``."""
+        """Show the actual ``<parent>/<job name>/`` package that will be created."""
         self._job_name = str(name or "").strip()
         self._refresh_preview()
 
@@ -105,16 +77,17 @@ class JobSetupPanel(QWidget):
         return Path(self.parent_folder).expanduser() / (safe.strip().strip(".") or "Untitled Job")
 
     def _refresh_preview(self):
-        template = JT.TEMPLATES.get(self.cmb_style.currentData(), JT.JOB_TEMPLATE)
         here = self.folder_path()
-        rows = [f"Job folder: {here}/ ({here.name}{JT.PROJECT_EXT})",
-                f"Folders:    {', '.join(template.all_paths())}"]
+        rows = [f"Project folder: {here}/", f"Folders:"]
+        rows.extend(f"  {folder.name}/ - {folder.purpose}" for folder in JT.JOB_TEMPLATE.folders)
+        rows.append(f"Files at root: Job Setup.txt and {here.name}{JT.PROJECT_EXT}")
+        rows.append("All subfolders start empty (no placeholder Field Book or control files).")
         self.lbl_preview.setText("\n".join(rows))
 
-    # -- results ---------------------------------------------------------------------
     @property
     def enabled(self) -> bool:
-        return self.chk.isChecked()
+        """The standard package is always created; folder setup is not optional."""
+        return True
 
     @property
     def parent_folder(self) -> str:
@@ -122,17 +95,15 @@ class JobSetupPanel(QWidget):
 
     @property
     def template(self) -> JT.JobTemplate:
-        return JT.TEMPLATES.get(self.cmb_style.currentData(), JT.JOB_TEMPLATE)
+        return JT.JOB_TEMPLATE
 
     @property
     def weeks(self) -> int | None:
-        """Always None: Field Data/ is created empty (kept so callers do not break)."""
+        """Field Data starts empty; imported folder names are kept as supplied."""
         return None
 
     def validate(self) -> str | None:
         """A human-readable reason the settings cannot be used, or None."""
-        if not self.enabled:
-            return None
         if not self.parent_folder:
             return "Choose where the job folder should be created."
         parent = Path(self.parent_folder).expanduser()

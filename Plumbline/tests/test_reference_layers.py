@@ -75,6 +75,19 @@ def _import_csv(state, path, role=None, dup_policy="renumber"):
     return apply_import(state, batch, plan, f"points ({Path(path).name})")
 
 
+def test_import_never_processes_linework_implicitly(tmp_path):
+    project = _project()
+    state = _State(project)
+    source = _csv(tmp_path / "field.csv", [(1, BASE_N, BASE_E, 500.0, "EP ST")])
+    calls = []
+    project.process_linework = lambda: calls.append("processed")
+
+    _import_csv(state, source)
+
+    assert calls == []
+    assert not hasattr(ImportPlan(), "process_linework")
+
+
 # --------------------------------------------------------------------------- core: the lists
 def test_a_stakeout_csv_lands_on_its_own_layer_and_not_in_the_fieldwork_list(tmp_path):
     pr = _project()
@@ -244,6 +257,7 @@ def qapp():
 
 
 def test_the_import_dialog_offers_the_three_roles_and_a_way_in_for_field_data(tmp_path, qapp):
+    from PySide6.QtWidgets import QDialogButtonBox
     from plumbline.ui.app_state import AppState
 
     st = AppState(_project())
@@ -259,16 +273,20 @@ def test_the_import_dialog_offers_the_three_roles_and_a_way_in_for_field_data(tm
     assert "Control - reference layer CONTROL" in labels
     assert "Other reference - reference layer OTHER" in labels
     assert dlg.cmb_role.itemData(0) is None
+    assert dlg.bb.button(QDialogButtonBox.Ok).text() == "Import"
+
+    control_dlg = CsvImportDialog(st, f, None, default_role="control")
+    assert control_dlg.target_role() == "control"
 
     dlg.cmb_role.setCurrentIndex(dlg.cmb_role.findData("stakeout"))
     assert dlg.target_role() == "stakeout"
     assert not dlg.panel.ed_layer.isEnabled(), "the role owns the layer, so the layer box steps aside"
-    assert not dlg.panel.chk_lw.isEnabled(), "reference points do not build linework"
+    assert not hasattr(dlg.panel, "chk_lw"), "imports never process linework automatically"
     assert "STAKE-OUT" in dlg.status.text() or "stake-out" in dlg.status.text().lower()
 
     dlg.cmb_role.setCurrentIndex(0)                                  # this job's field data
     assert dlg.target_role() is None
-    assert dlg.panel.ed_layer.isEnabled() and dlg.panel.chk_lw.isEnabled()
+    assert dlg.panel.ed_layer.isEnabled()
 
 
 def test_the_export_dialog_offers_each_list_with_its_count(tmp_path, qapp):
@@ -366,6 +384,183 @@ def test_reference_folder_dialog_lists_and_filters_csvs(tmp_path, qapp):
     tally = Importer(_Win()).import_reference_folder(tmp_path, "control", selected_files=selected)
     assert tally["files"] == 2
     assert tally["points"] == 2
+
+
+
+def test_field_data_import_is_staged_and_same_folder_file_point_count_is_greyed(tmp_path, qapp):
+    from PySide6.QtCore import Qt
+    from plumbline.ui.app_state import AppState
+    from plumbline.ui.import_export import Importer, ReferenceFolderDialog
+
+    source_root = tmp_path / "Downloads" / "Crew 1"
+    source_root.mkdir(parents=True)
+    source = _csv(source_root / "crew1.csv", [(7, BASE_N + 7, BASE_E + 7, 507.0, "EP")])
+    job_root = tmp_path / "Job"
+    job_root.mkdir()
+    state = AppState(_project())
+    state.project.path = str(job_root / "Job.plb")
+
+    class _Win:
+        def __init__(self, app_state):
+            self.state = app_state
+
+        def _job_folder(self):
+            return job_root
+
+    tally = Importer(_Win(state)).import_reference_folder(
+        source_root, None, recursive=True, selected_files=[source])
+    stored = job_root / "Field Data" / source.name
+    assert tally["points"] == 1 and stored.is_file()
+    assert state.project.settings["data_folder"] == str(job_root / "Field Data")
+    manifest = state.project.settings["field_data_imports"][0]
+    assert manifest["source_folder"] == "crew 1"
+    assert manifest["source_file"] == "crew1.csv"
+    assert manifest["point_count"] == 1
+    assert "size" not in manifest
+
+    dlg = ReferenceFolderDialog(state, source_root, None, field_data_only=True)
+    assert [dlg.chk_table.horizontalHeaderItem(i).text() for i in range(4)] == [
+        "", "File", "Subfolder / Path", "Points",
+    ]
+    assert dlg._file_point_counts == [1]
+    assert dlg._imported_flags == [True]
+    assert dlg._checkboxes[0].isEnabled() is False
+    assert dlg.chk_table.cellWidget(0, 0).isEnabled() is False
+    assert all(not (dlg.chk_table.item(0, col).flags() & Qt.ItemFlag.ItemIsEnabled)
+               for col in range(1, 4))
+    assert dlg.selected_files() == []
+
+    # The disabled/grey state survives save and reopen, and also matches the packaged Field Data copy.
+    state.project.save()
+    reopened_state = AppState(Project.load(state.project.path))
+    reopened_dlg = ReferenceFolderDialog(reopened_state, source_root, None, field_data_only=True)
+    assert reopened_dlg._imported_flags == [True]
+    stored_dlg = ReferenceFolderDialog(
+        state, job_root / "Field Data", None, field_data_only=True)
+    assert stored_dlg._imported_flags == [True]
+
+    # Same path, but the recheck now parses two points instead of the one originally imported.
+    source.write_text(
+        "PT,NORTHING,EASTING,ELEVATION,DESCRIPTION\n"
+        f"7,{BASE_N + 7},{BASE_E + 7},507.0,EP\n"
+        f"8,{BASE_N + 8},{BASE_E + 8},508.0,EP\n",
+        encoding="utf-8")
+    dlg._refresh_files()
+    assert dlg._file_point_counts == [2]
+    assert dlg._imported_flags == [False]
+    assert dlg._checkboxes[0].isEnabled() is True
+    assert dlg.selected_files() == [source]
+
+    # The manifest shares one undo step with its imported points.
+    assert state.undo().startswith("Import points")
+    assert not state.project.points
+    assert state.project.settings.get("field_data_imports", []) == []
+
+
+def test_legacy_field_data_manifest_rechecks_the_stored_file_point_count(tmp_path, qapp):
+    from plumbline.ui.app_state import AppState
+    from plumbline.ui.import_export import ReferenceFolderDialog
+
+    source_root = tmp_path / "Downloads" / "Crew 1"
+    source_root.mkdir(parents=True)
+    source = _csv(source_root / "crew1.csv", [(7, BASE_N + 7, BASE_E + 7, 507.0, "EP")])
+    job_root = tmp_path / "Job"
+    stored_root = job_root / "Field Data"
+    stored_root.mkdir(parents=True)
+    stored = _csv(stored_root / source.name, [(7, BASE_N + 7, BASE_E + 7, 507.0, "EP")])
+
+    state = AppState(_project())
+    state.project.path = str(job_root / "Job.plb")
+    state.project.settings["data_folder"] = str(stored_root)
+    state.project.settings["field_data_imports"] = [{
+        "source_relative": "crew 1/crew1.csv",
+        "stored_relative": "field data/crew1.csv",
+        "size": source.stat().st_size,
+    }]
+
+    dlg = ReferenceFolderDialog(state, source_root, None, field_data_only=True)
+    assert dlg._file_point_counts == [1]
+    assert dlg._imported_flags == [True]
+
+    source.write_text(
+        "PT,NORTHING,EASTING,ELEVATION,DESCRIPTION\n"
+        f"7,{BASE_N + 7},{BASE_E + 7},507.0,EP\n"
+        f"8,{BASE_N + 8},{BASE_E + 8},508.0,EP\n",
+        encoding="utf-8")
+    dlg._refresh_files()
+    assert dlg._file_point_counts == [2]
+    assert dlg._imported_flags == [False]
+
+
+def test_field_data_recheck_does_not_guess_parsed_count_from_point_provenance(tmp_path, qapp):
+    from plumbline.ui.app_state import AppState
+    from plumbline.ui.import_export import ReferenceFolderDialog
+
+    source_root = tmp_path / "Downloads" / "Crew 2"
+    source_root.mkdir(parents=True)
+    source = _csv(source_root / "legacy.csv", [(11, BASE_N + 11, BASE_E + 11, 511.0, "EP")])
+    state = AppState(_project())
+    point = state.project.add_point(BASE_E + 11, BASE_N + 11, 511.0,
+                                    number="11", desc="EP")
+    point.attrs["import"] = {
+        "file": source.name,
+        "folder": str(source_root),
+        "set": "points",
+        "when": "2026-10-10T12:00:00",
+    }
+
+    # Provenance identifies the source path, but cannot prove the original parsed count once
+    # there is no manifest/staged copy. Do not grey a file by guessing from points still present.
+    dlg = ReferenceFolderDialog(state, source_root, None, field_data_only=True)
+    assert dlg._file_point_counts == [1]
+    assert dlg._imported_flags == [False]
+
+    source.write_text(
+        "PT,NORTHING,EASTING,ELEVATION,DESCRIPTION\n"
+        f"11,{BASE_N + 11},{BASE_E + 11},511.0,EP\n"
+        f"12,{BASE_N + 12},{BASE_E + 12},512.0,EP\n",
+        encoding="utf-8")
+    dlg._refresh_files()
+    assert dlg._file_point_counts == [2]
+    assert dlg._imported_flags == [False]
+
+
+def test_first_field_data_import_resolves_job_root_after_save_as(tmp_path, qapp):
+    from plumbline.ui.app_state import AppState
+    from plumbline.ui.import_export import Importer, ReferenceFolderDialog
+
+    source_root = tmp_path / "Downloads" / "First Import"
+    source_root.mkdir(parents=True)
+    source = _csv(source_root / "survey.csv", [(8, BASE_N + 8, BASE_E + 8, 508.0, "EP")])
+    job_root = tmp_path / "Saved Job"
+    state = AppState(Project("Untitled", C.ProjectCRS.from_key(6584)))
+
+    def _save_as_before_edit():
+        job_root.mkdir()
+        state.project.path = str(job_root / "Saved Job.plb")
+        return True
+
+    state._save_untitled_before_edit = _save_as_before_edit
+
+    class _Win:
+        def __init__(self, app_state):
+            self.state = app_state
+
+        def _job_folder(self):
+            path = self.state.project.path
+            return Path(path).parent if path else None
+
+    tally = Importer(_Win(state)).import_reference_folder(
+        source_root, None, recursive=True, selected_files=[source])
+    stored = job_root / "Field Data" / source.name
+    assert tally["points"] == 1 and stored.is_file()
+    assert len(state.project.settings["field_data_imports"]) == 1
+    record = state.project.settings["field_data_imports"][0]
+    assert record["point_count"] == 1 and "size" not in record
+
+    dlg = ReferenceFolderDialog(state, source_root, None, field_data_only=True)
+    assert dlg._imported_flags == [True]
+    assert dlg.selected_files() == []
 
 
 def test_folder_points_preview_dialog(tmp_path, qapp):

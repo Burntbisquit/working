@@ -1,6 +1,7 @@
 """Interactive UI dialogs for point recoding and field-to-finish linework editing."""
 from __future__ import annotations
 
+import copy
 import math
 from typing import Sequence
 
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
 
 from ..core import point_linework_coder as PLC
 from ..core.featurecodes import CLOSE_FLAGS, parse_description
+from ..core.linework_editor import resolve_vertex_point_ids
 from ..core.model import Polyline, SurveyPoint
 from ..core.settings import settings
 from ..core.fieldbook_syntax import command_joiner, command_map
@@ -125,9 +127,7 @@ class JoinPointsDialog(QDialog):
             PLC.join_points_to_string(self.points, code, str_id, closed=closed,
                                       commands=self.commands)
             pr.touch()
-            if hasattr(pr, "process_linework"):
-                res = pr.process_linework()
-                self.state.log(f"Linework generated: {res.get('strings', 0)} string(s).", "ok")
+        self.state.log("Linework coding saved. Use Process Linework to build the geometry.", "info")
         self.accept()
 
 
@@ -144,21 +144,13 @@ class EditLineworkCodingDialog(QDialog):
         lay = QVBoxLayout(self)
 
         pr = state.project
-        # Identify member points in the polyline string
-        pt_numbers = (polyline_entity.attrs or {}).get("points", [])
-        if pt_numbers:
-            self.points = [pr.point_by_number(num) for num in pt_numbers if pr.point_by_number(num) is not None]
-        else:
-            # Match by vertex coordinates
-            self.points = []
-            for v in polyline_entity.verts:
-                # Find closest point
-                for p in pr.points.values():
-                    if abs(p.x - v[0]) < 0.005 and abs(p.y - v[1]) < 0.005:
-                        self.points.append(p)
-                        break
+        # Resolve stable point identities rather than trusting potentially duplicated point numbers.
+        self.point_ids, self.link_issues = resolve_vertex_point_ids(pr, polyline_entity)
+        self.source_point_ids = [pid for pid in self.point_ids if pid is not None]
+        self.points = [copy.deepcopy(pr.points[pid]) for pid in self.source_point_ids]
+        self.can_apply = bool(self.points) and not self.link_issues
 
-        lay.addWidget(QLabel(f"<b>Linework String: {polyline_entity.layer} ({len(self.points)} Points)</b>"))
+        lay.addWidget(QLabel(f"<b>Linework String: {polyline_entity.layer} ({len(self.points)} Linked Points)</b>"))
 
         self.tbl = QTableWidget(len(self.points), 4)
         self.tbl.setHorizontalHeaderLabels(["Point #", "Current Description", "Role", "New Description"])
@@ -202,12 +194,21 @@ class EditLineworkCodingDialog(QDialog):
         act_row.addStretch(1)
         lay.addLayout(act_row)
 
-        lay.addWidget(Hint("Edits modify the point descriptions directly so porting to Carlson or Civil 3D stays faithful."))
+        for button in (b_rev, b_close, b_recode):
+            button.setEnabled(self.can_apply)
+        if self.link_issues:
+            status = "Point coding is disabled until every line vertex has a unique point link. " + self.link_issues[0]
+        elif not self.points:
+            status = "No linked survey points were found for this line."
+        else:
+            status = "Coding changes are staged on copies; Apply & Reprocess commits one undoable edit, while Cancel discards them."
+        lay.addWidget(Hint(status))
 
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
         b_apply = QPushButton("Apply & Reprocess")
         b_apply.setProperty("accent", True)
+        b_apply.setEnabled(self.can_apply)
         b_apply.clicked.connect(self._apply)
         b_cancel = QPushButton("Cancel")
         b_cancel.clicked.connect(self.reject)
@@ -236,6 +237,8 @@ class EditLineworkCodingDialog(QDialog):
         self._refresh_table()
 
     def _change_code(self):
+        if not self.can_apply or not self.points:
+            return
         new_code, ok = QMessageBox.getText(self, "Change Code", "New Feature Code Prefix (e.g. EP2, TOC1):") if hasattr(QMessageBox, "getText") else (None, False)
         if not ok or not new_code:
             from PySide6.QtWidgets import QInputDialog
@@ -264,13 +267,29 @@ class EditLineworkCodingDialog(QDialog):
             self.edits.append((p, ed))
 
     def _apply(self):
+        if not self.can_apply:
+            return
         pr = self.state.project
-        with self.state.edit("Edit Linework Coding", kinds=("points", "entities")):
-            for p, ed in self.edits:
-                new_desc = ed.text().strip()
-                if new_desc != p.desc:
-                    p.desc = new_desc
-            pr.touch()
-            if hasattr(pr, "process_linework"):
-                pr.process_linework()
+        updates = {draft.id: ed.text().strip() for draft, ed in self.edits}
+        missing = [point_id for point_id in updates if point_id not in pr.points]
+        if missing:
+            QMessageBox.warning(
+                self,
+                "Linework changed",
+                "One or more linked survey points no longer exist. Reopen the point coder before applying.",
+            )
+            return
+        changes = {point_id: description for point_id, description in updates.items()
+                   if pr.points[point_id].desc != description}
+        if not changes:
+            self.accept()
+            return
+        try:
+            with self.state.edit("Edit Linework Coding", kinds=("points", "entities")):
+                for point_id, description in changes.items():
+                    pr.points[point_id].desc = description
+        except Exception as ex:
+            QMessageBox.warning(self, "Apply Linework Coding", str(ex))
+            return
+        self.state.log("Linework coding updated. Use Process Linework to rebuild derived geometry.", "info")
         self.accept()

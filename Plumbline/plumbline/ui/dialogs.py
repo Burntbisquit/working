@@ -18,7 +18,7 @@ from .. import __version__
 from ..core import cogo
 from ..core import units as U
 from ..core.featurecodes import FeatureCode, FeatureCodeTable, default_codes
-from ..core.settings import settings, user_dir
+from ..core.settings import default_project_folder, settings, user_dir
 from ..io import reports
 from ..core.qa import run_checks
 from .widgets import Banner, ColorButton, FormDialog, Hint, dspin, error_box, info_box, ispin, confirm
@@ -98,7 +98,8 @@ class ReportViewer(QDialog):
 # ----------------------------------------------------------------------------- settings
 class SettingsDialog(FormDialog):
     def __init__(self, parent=None):
-        super().__init__(parent, "Settings", "", "Save", 480)
+        super().__init__(parent, "Settings", "", "Save", 680)
+        self.setMinimumWidth(640)
         s = settings()
         self.cmb_theme = QComboBox()
         self.cmb_theme.addItem("Dark", "dark")
@@ -118,8 +119,37 @@ class SettingsDialog(FormDialog):
         self.sp_snap = ispin(int(s.get("snap_px")), 4, 40)
         self.sp_pt = ispin(int(s.get("point_size_px")), 3, 24)
         self.sp_lab = ispin(int(s.get("label_px")), 7, 24)
+        try:
+            control_tolerance = float(s.get("control_point_tolerance", 0.01))
+            if not math.isfinite(control_tolerance) or control_tolerance < 0:
+                control_tolerance = 0.01
+        except (TypeError, ValueError, OverflowError):
+            control_tolerance = 0.01
+        self.sp_control_tolerance = dspin(control_tolerance, 0.0, 10000.0, 4, 0.01)
+        self.sp_control_tolerance.setToolTip(
+            "Survey-point differences at or below this amount are treated as coordinate rounding. "
+            "The value is applied in each coordinate's stored units (horizontal for northing/easting, "
+            "vertical for elevation).")
+        self.chk_require_fieldbook = QCheckBox(
+            "Require a Field Book before point, code, and linework processing")
+        self.chk_require_fieldbook.setChecked(bool(s.get("require_fieldbook_for_processing", True)))
+        self.chk_require_fieldbook.setToolTip(
+            "When enabled, opening a project without a usable Field Book opens the Field Book tool automatically. "
+            "Processing actions open it again if needed and stay blocked unless a Field Book is loaded. "
+            "Turn this off to allow processing without one.")
         self.ed_cache = QLineEdit(s.get("tile_cache_dir") or "")
         self.ed_cache.setPlaceholderText(str(s.tile_cache_dir))
+        self.ed_project_folder = QLineEdit(
+            str(s.get("default_project_folder") or default_project_folder()))
+        self.ed_project_folder.setToolTip(
+            "New Project, New Job Folder, and Save As create project folders inside this location.")
+        self.browse_project_folder = QPushButton("Browse...")
+        self.browse_project_folder.clicked.connect(self._browse_project_folder)
+        project_folder_row = QHBoxLayout()
+        project_folder_row.addWidget(self.ed_project_folder, 1)
+        project_folder_row.addWidget(self.browse_project_folder)
+        project_folder_holder = QWidget()
+        project_folder_holder.setLayout(project_folder_row)
         self.chk_space_commands = QCheckBox("Separate a feature code from its line command")
         self.chk_space_commands.setChecked(bool(s.get("space_between_commands", True)))
         self.chk_space_multicode = QCheckBox("Add spaces around the multi-code separator")
@@ -134,6 +164,9 @@ class SettingsDialog(FormDialog):
         self.form.addRow("Snap distance (pixels):", self.sp_snap)
         self.form.addRow("Point symbol size (pixels):", self.sp_pt)
         self.form.addRow("Label size (pixels):", self.sp_lab)
+        self.form.addRow("Control comparison tolerance:", self.sp_control_tolerance)
+        self.form.addRow("", self.chk_require_fieldbook)
+        self.form.addRow("Default project folder:", project_folder_holder)
         self.form.addRow("Imagery cache folder:", self.ed_cache)
         syntax_box = QGroupBox("Field Book command spacing")
         syntax_layout = QVBoxLayout(syntax_box)
@@ -156,6 +189,15 @@ class SettingsDialog(FormDialog):
         self.b_sites.clicked.connect(self.open_registry)
         self.b_save_settings.clicked.connect(self.save_settings)
         self.b_load_settings.clicked.connect(self.load_settings)
+
+    def _browse_project_folder(self):
+        start = Path(self.ed_project_folder.text()).expanduser()
+        if not start.is_dir():
+            start = start.parent if start.parent.is_dir() else Path.home()
+        folder = QFileDialog.getExistingDirectory(
+            self, "Default project folder", str(start))
+        if folder:
+            self.ed_project_folder.setText(folder)
 
     # -- settings files / the pull-site registry
     def open_registry(self):
@@ -200,9 +242,12 @@ class SettingsDialog(FormDialog):
         s.set("snap_px", self.sp_snap.value(), False)
         s.set("point_size_px", self.sp_pt.value(), False)
         s.set("label_px", self.sp_lab.value(), False)
+        s.set("control_point_tolerance", self.sp_control_tolerance.value(), False)
+        s.set("require_fieldbook_for_processing", self.chk_require_fieldbook.isChecked(), False)
         s.set("space_between_commands", self.chk_space_commands.isChecked(), False)
         s.set("space_around_multicode_separator", self.chk_space_multicode.isChecked(), False)
         s.set("space_around_description_separator", self.chk_space_description.isChecked(), False)
+        s.set("default_project_folder", self.ed_project_folder.text().strip(), False)
         s.set("tile_cache_dir", self.ed_cache.text().strip(), True)
 
 

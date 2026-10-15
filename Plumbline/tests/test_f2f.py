@@ -365,6 +365,62 @@ def test_write_and_read_fwb_with_extra_json(tmp_path):
     assert len(lines) == len(table.rows) + 2  # header + rows + extra json
 
 
+def test_fwb_metadata_edits_preserve_unknown_json_and_validate_active_rules(app, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QDialog
+    from plumbline.core.project import Project
+    from plumbline.fieldwork import io_carlson as IC
+    from plumbline.ui.app_state import AppState
+    from plumbline.ui.fieldbook_dialog import FieldBookDialog
+    from plumbline.ui.f2f_dialog import CorrectionRulesDialog
+
+    path = tmp_path / "Office.fwb"
+    headers = ["Code", "Description", "Symbol", "Layer", "Entity Type", "Category"]
+    rows = [
+        ["EA", "Asphalt", "CG08", "PAVEMENT", "Point", "Surface"],
+        ["SW", "Sidewalk", "CG08", "SIDEWALK", "Point", "Surface"],
+    ]
+    commands = {"start_line": "BEGIN", "multicode": "PLUS", "description": "NOTE"}
+    rules = [["EA PLUS SW", "EA"]]
+    assert IC.write_fwb_file(path, headers, rows, commands=commands, rules=rules,
+                             extra_fields={"office_note": "keep this metadata"})
+
+    extra = f2f.read_fwb_extra(path)
+    assert extra["commands"]["start_line"] == "BEGIN"
+    assert extra["rules"] == rules
+    assert f2f.write_fwb_extra(path, commands={**commands, "start_line": "START"})
+    extra = f2f.read_fwb_extra(path)
+    assert extra["commands"]["start_line"] == "START"
+    assert extra["office_note"] == "keep this metadata"
+    read_headers, read_rows = IC.read_fwb_file(path)
+    assert read_headers == headers and read_rows == rows
+
+    project = Project("Office")
+    project.codes, _stats = f2f.convert(f2f.read(path))
+    project.settings["fieldbook_file"] = str(path)
+    state = AppState(project)
+    dialog = FieldBookDialog(state)
+    assert dialog.table_cmds.item(0, 1).text() == "START"
+    assert dialog.table_rules.horizontalHeaderItem(0).text() == "Common Error"
+    assert dialog.table_rules.horizontalHeaderItem(1).text() == "Fix"
+    assert dialog.table_rules.item(0, 0).text() == "EA PLUS SW"
+
+    opened = []
+    def capture_rules_dialog(instance):
+        opened.append(instance)
+        return QDialog.DialogCode.Rejected
+    monkeypatch.setattr(CorrectionRulesDialog, "exec", capture_rules_dialog)
+    dialog._edit_rules()
+    assert len(opened) == 1  # regression: use the dialog's fieldbook_codes parameter
+    assert set(opened[0].fieldbook_codes) == {"EA", "SW"}
+    assert 0 in opened[0].common_conversion_warnings
+    assert "collapse valid multi-code descriptions" in opened[0].warning_label.text()
+
+    rules_dlg = CorrectionRulesDialog([["typo", "BAD"]], fieldbook_codes=["EA", "SW"])
+    assert "not a code" in rules_dlg.validation_error()
+    rules_dlg.table.item(0, 1).setText("SW")
+    assert rules_dlg.validation_error() is None
+
+
 def test_archive_old_fieldbooks_and_place_in_project(tmp_path):
     """Pulling a fieldbook from a different file location copies it to project FB directory
     and archives existing old versions into a timestamped zip archive."""
@@ -430,7 +486,7 @@ def test_invalid_fieldbook_is_rejected_before_archiving_active_book(tmp_path):
     external = tmp_path / "Unreadable.fwb"
     external.write_text("", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="empty"):
+    with pytest.raises(ValueError, match="usable field codes"):
         FBD.place_fieldbook_in_project(external, project)
 
     assert active.exists()

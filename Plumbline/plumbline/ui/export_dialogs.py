@@ -285,7 +285,7 @@ class KmlExportDialog(FormDialog):
         self.state = state
         pr = state.project
         if pr.crs.is_local:
-            self.root.insertWidget(1, Banner("This project uses local coordinates - assign a coordinate system first (Coordinates menu); "
+            self.root.insertWidget(1, Banner("This project uses local coordinates - assign a coordinate system first (Survey menu); "
                                              "otherwise there is no way to place it on the earth.", "bad"))
         self.chk_pts = QCheckBox("Survey points")
         self.chk_lab = QCheckBox("Show point numbers as labels")
@@ -337,7 +337,7 @@ def export_kml(window):
     pr = st.project
     if pr.crs.is_local:
         error_box(window, "Export KML", "This project uses local coordinates. Assign a coordinate system first "
-                                        "(Coordinates > Project Coordinate System).")
+                                        "(Survey > Project Coordinate System).")
         return
     dlg = KmlExportDialog(st, window)
     if not dlg.exec():

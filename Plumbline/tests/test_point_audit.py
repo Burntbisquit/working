@@ -15,6 +15,7 @@ report is in the Reports menu where the item said it would be.
 import contextlib
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 pytest.importorskip("PySide6")
@@ -96,6 +97,29 @@ def test_an_import_records_what_the_points_were(tmp_path):
     assert first["z"] == pytest.approx(500.0) and first["desc"] == "EP1"
     assert first["file"] == "crew6.csv" and first["when"]
     assert AUD.has_baseline(pr) and "3 imported point(s) on record" in AUD.describe(pr)
+
+
+def test_transformed_import_records_project_crs_and_original_source_provenance(tmp_path):
+    from pyproj import Transformer
+
+    from plumbline.core import filecrs as FCRC
+
+    state = _State(_project())
+    source_crs = C.CRS.from_epsg(32614)
+    easting, northing = Transformer.from_crs(4326, source_crs, always_xy=True).transform(-96.1, 32.8)
+    path = _csv(tmp_path / "utm_points.csv", [[1, northing, easting, 123.0, "CP"]])
+    batch = CSV.read_points(path, CSV.CsvMapping(*_sniff(path)))
+    plan = ImportPlan(src_crs=source_crs)
+    apply_import(state, batch, plan, "UTM control", path)
+
+    point = _by_number(state.project, "1")
+    expected_x, expected_y = state.project.crs.transform_from(source_crs)(
+        np.array([easting]), np.array([northing]))
+    record = FCRC.for_file(state.project, path.name)
+    assert (point.x, point.y) == pytest.approx((expected_x[0], expected_y[0]))
+    assert record["key"] == state.project.crs.authority
+    assert record["method"] == "imported"
+    assert record["source_crs"]["key"] == "EPSG:32614"
 
 
 def test_a_fresh_job_is_clean_and_says_so(tmp_path):

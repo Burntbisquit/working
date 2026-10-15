@@ -68,6 +68,28 @@ def test_the_dialog_shows_all_four_tabs_and_says_what_the_project_is_on(app, mak
     d.close()
 
 
+def test_project_crs_defaults_to_five_texas_2011_usft_zones_with_collapsed_search(app, make_state):
+    from plumbline.ui.crs_dialog import texas_2011_usft_rows
+
+    d = _open(make_state(crs=C.ProjectCRS.unassigned()), app)
+    keys = [d.cmb_texas.itemData(i) for i in range(d.cmb_texas.count())]
+    assert keys == [6584, 6582, 6578, 6588, 6586]
+    assert len(texas_2011_usft_rows()) == 5
+    assert all(C.TEXAS_ZONES[key]["units"] == "USft" for key in keys)
+    assert all("(USft)" in d.cmb_texas.itemText(i) for i in range(d.cmb_texas.count()))
+    assert d.cmb_texas.currentData() == C.TEXAS_DEFAULT_EPSG
+    assert not d.search_area.button.isChecked() and d.search_area.body.isHidden()
+
+    d.cmb_texas.setCurrentIndex(d.cmb_texas.findData(6582))
+    assert d._build_result().key == "6582"
+
+    d.search_area.button.setChecked(True)
+    d.picker.select_key("EPSG:6583")
+    assert d._build_result().authority == "EPSG:6583"
+    assert d.cmb_texas.currentIndex() == -1
+    d.close()
+
+
 def test_the_saf_box_has_room_for_four_more_characters_than_it_used_to(app, make_state):
     """A Surface Adjustment Factor is read digit by digit, and the box used to be sized for 14
     characters - two or three short of what a user types.  It is sized from its own font now.

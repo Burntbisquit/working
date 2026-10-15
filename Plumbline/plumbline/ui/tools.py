@@ -135,6 +135,136 @@ class PanTool(Tool):
         self._last = None
 
 
+# ----------------------------------------------------------------------------- imagery nudge
+class ImageryNudgeTool(Tool):
+    """Nudge one imagery layer from image-to-target point pairs picked in the plan view.
+
+    Each pair begins at a feature in the displayed imagery, then clicks where that feature should
+    land (usually a survey point). The first click is never snapped; the target click follows the
+    canvas's current snap setting. Extra pairs are averaged to reduce the effect of a loose click.
+    Only the imagery layer's display offset changes; survey coordinates are left alone.
+    """
+
+    name = "imagery_nudge"
+    label = "Nudge Imagery by Points"
+    cursor = Qt.CrossCursor
+
+    def __init__(self, canvas, layer_id: int, on_finish=None, on_deactivate=None):
+        super().__init__(canvas)
+        self.layer_id = int(layer_id)
+        layer = self.state.project.imagery.get(self.layer_id)
+        self.initial_nudge = tuple(layer.nudge) if layer is not None else (0.0, 0.0)
+        self.pairs: list[tuple[float, float, float, float]] = []
+        self.pending_image = None        # (x, y) awaiting its target location
+        self._done = False
+        self._closed_notified = False
+        self._on_finish = on_finish
+        self._on_deactivate = on_deactivate
+
+    @property
+    def wants_snap(self) -> bool:
+        # The image location must be raw; let the user snap only the target click.
+        return self.pending_image is not None
+
+    def hint(self) -> str:
+        if self.pending_image is not None:
+            return ("Image point picked. Click where it should land (snap is optional); "
+                    "then repeat for more pairs or press Enter/right-click to apply.")
+        n = len(self.pairs)
+        prefix = f"{n} point pair(s) ready. " if n else ""
+        return (prefix + "Click an image feature, then its target location. "
+                "Press Enter/right-click to apply the average nudge; Esc cancels.")
+
+    def press(self, ev, x, y, sx, sy):
+        if self._done:
+            return
+        if self.pending_image is None:
+            self.pending_image = (float(x), float(y))
+            self.say(self.hint())
+            self.c.update()
+            return
+
+        image_x, image_y = self.pending_image
+        self.pairs.append((image_x, image_y, float(x), float(y)))
+        self.pending_image = None
+        self.say(self.hint())
+        self.c.update()
+
+    def right_click(self, ev):
+        self.finish()
+
+    def key(self, ev) -> bool:
+        if ev.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self.finish()
+            return True
+        if ev.key() == Qt.Key_Escape:
+            self.cancel()
+            return True
+        return False
+
+    def finish(self):
+        if self._done:
+            return
+        if self.pending_image is not None:
+            self.pending_image = None
+            self.say("Incomplete point pair discarded. Click another image feature, or press Enter again to apply.")
+            self.c.update()
+            return
+
+        layer = self.state.project.imagery.get(self.layer_id)
+        if not self.pairs or layer is None:
+            self.cancel()
+            if self._on_finish is not None:
+                self._on_finish(False)
+            return
+
+        dx = float(np.mean([target_x - image_x for image_x, _image_y, target_x, _target_y in self.pairs]))
+        dy = float(np.mean([target_y - image_y for _image_x, image_y, _target_x, target_y in self.pairs]))
+        new_nudge = (self.initial_nudge[0] + dx, self.initial_nudge[1] + dy)
+        self._done = True
+        with self.state.edit(f"Nudge imagery by {len(self.pairs)} point pair(s)", kinds=("imagery",)):
+            layer = self.state.project.imagery.get(self.layer_id)
+            if layer is not None:
+                layer.nudge = new_nudge
+        self.state.log(f"Imagery nudged by {dx:,.3f} east, {dy:,.3f} north from "
+                       f"{len(self.pairs)} point pair(s). Survey points were not moved.", "ok")
+        if self._on_finish is not None:
+            self._on_finish(True)
+
+    def cancel(self):
+        self._done = True
+        self.pending_image = None
+        self.pairs.clear()
+        self.c.update()
+
+    def deactivate(self):
+        if not self._done:
+            self.cancel()
+        if not self._closed_notified and self._on_deactivate is not None:
+            self._closed_notified = True
+            self._on_deactivate()
+
+    def paint(self, painter: QPainter, view):
+        if not self.pairs and self.pending_image is None:
+            return
+        from PySide6.QtGui import QPen
+        col = QColor(theme.colors()["accent"])
+        pen = QPen(col, 1.5, Qt.DashLine)
+        painter.save()
+        painter.setPen(pen)
+        for image_x, image_y, target_x, target_y in self.pairs:
+            ix, iy = view.to_screen(image_x, image_y)
+            tx, ty = view.to_screen(target_x, target_y)
+            painter.drawLine(int(ix), int(iy), int(tx), int(ty))
+            painter.drawEllipse(QPointF(ix, iy), 4.0, 4.0)
+            painter.drawEllipse(QPointF(tx, ty), 5.0, 5.0)
+        if self.pending_image is not None:
+            x, y = self.pending_image
+            sx, sy = view.to_screen(x, y)
+            painter.drawEllipse(QPointF(sx, sy), 7.0, 7.0)
+        painter.restore()
+
+
 # ----------------------------------------------------------------------------- select
 class SelectTool(Tool):
     name = "select"

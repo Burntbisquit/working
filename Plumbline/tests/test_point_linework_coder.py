@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from plumbline.core.model import Polyline, SurveyPoint
+from plumbline.core.featurecodes import default_codes
 from plumbline.core.point_linework_coder import (
     change_string_code,
     close_string_coding,
@@ -26,6 +27,8 @@ from plumbline.core.project import Project
 
 def create_test_project():
     pr = Project()
+    # These linework tests deliberately use Plumbline's generic starter library.
+    pr.codes = default_codes()
     pr.add_point(100.0, 200.0, 10.0, number="101", desc="EP ST")
     pr.add_point(150.0, 250.0, 10.5, number="102", desc="EP")
     pr.add_point(200.0, 300.0, 11.0, number="103", desc="EP")
@@ -36,6 +39,7 @@ def create_test_project():
 # ------------------------------------------------------------------ Join Points
 def test_join_points_to_string():
     pr = Project()
+    pr.codes = default_codes()
     p1 = pr.add_point(0, 0, 0, number="1", desc="GS")
     p2 = pr.add_point(10, 0, 0, number="2", desc="GS")
     p3 = pr.add_point(20, 0, 0, number="3", desc="GS")
@@ -56,6 +60,7 @@ def test_join_points_to_string():
 
 def test_join_points_closed():
     pr = Project()
+    pr.codes = default_codes()
     p1 = pr.add_point(0, 0, 0, number="1", desc="")
     p2 = pr.add_point(10, 0, 0, number="2", desc="")
     p3 = pr.add_point(10, 10, 0, number="3", desc="")

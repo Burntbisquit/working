@@ -2,7 +2,7 @@
 
 Everything here is computer-generated - it is NOT a real survey.  Coordinates sit in NAD83(2011) / Texas
 North Central (US survey feet, EPSG:6584) near Mesquite, TX so the CRS tools and imagery have a plausible
-place to land; change the project CRS (Coordinates > Project Coordinate System > Assign) to move it anywhere.
+place to land; change the project CRS (Survey > Project Coordinate System > Assign) to move it anywhere.
 
 The sample is built the long way round on purpose: the points are written out as a field download, then run
 through the same Fieldwork Manager code path a real job takes (read -> check -> import -> code -> linework).
@@ -444,7 +444,7 @@ sample. That one is a real reduced survey.
 
 1. **Draw > Polyline**, then **Surface > Create Surface** and **Volumes**.
 2. **Survey > Data Quality Check** - nothing to find here, but the tool runs.
-3. **Coordinates > Project Coordinate System** and *Reproject* to EPSG:6583 (the metre
+3. **Survey > Project Coordinate System** and *Reproject* to EPSG:6583 (the metre
    version of the same zone) - the coordinates convert, the drawing does not move.
 4. **Survey > Fieldwork Manager** and open `Field Data/Week 1/` to see the field side
    of the same points.

@@ -47,6 +47,17 @@ def _html_details(key: str) -> str:
     return "".join(h)
 
 
+def texas_2011_usft_rows() -> list[tuple[int, str]]:
+    """The five Texas NAD83(2011) State Plane zones in US survey feet, ordered north to south."""
+    order = {"North Central": 0, "North": 1, "Central": 2,
+             "South Central": 3, "South": 4}
+    rows = [(int(key), str(info["name"]))
+            for key, info in C.TEXAS_ZONES.items()
+            if info.get("state") == "TX" and info.get("era") == "2011"
+            and info.get("units") == "USft" and isinstance(key, int)]
+    return sorted(rows, key=lambda row: order.get(C.TEXAS_ZONES[row[0]].get("zone"), 9))
+
+
 # ----------------------------------------------------------------------------- picker
 class CRSPicker(QWidget):
     """Search + favourites + details for choosing a coordinate system."""
@@ -194,6 +205,17 @@ class CRSPicker(QWidget):
                 self.list.setCurrentRow(i)
                 return
 
+    def clear_selection(self):
+        """Clear the current search result without changing its query text."""
+        self.list.blockSignals(True)
+        self.list.clearSelection()
+        self.list.setCurrentRow(-1)
+        self.list.blockSignals(False)
+        self._key = ""
+        self.detail.clear()
+        self.star.setEnabled(False)
+        self.star.setText("☆ Favorite")
+
 
 # ----------------------------------------------------------------------------- project CRS dialog
 class CRSDialog(QDialog):
@@ -224,8 +246,23 @@ user's (which system, and assign or reproject) are the ones the dialog asks for.
         # ---- tab 1: coordinate system
         t1 = QWidget()
         l1 = QVBoxLayout(t1)
+        quick = QGroupBox("Texas State Plane — NAD83 (2011), US survey feet")
+        quick_layout = QFormLayout(quick)
+        self.cmb_texas = QComboBox()
+        for key, label in texas_2011_usft_rows():
+            self.cmb_texas.addItem(f"EPSG:{key}   {label}", key)
+        default_index = self.cmb_texas.findData(C.TEXAS_DEFAULT_EPSG)
+        self.cmb_texas.setCurrentIndex(max(0, default_index))
+        quick_layout.addRow("Zone:", self.cmb_texas)
+        l1.addWidget(quick)
+        self.search_area = Collapsible("Search other coordinate systems...", expanded=False,
+                                       tooltip="The full projected CRS catalogue is searchable here; it is collapsed by default.")
+        search_layout = self.search_area.body_layout()
         self.picker = CRSPicker(kinds=("projected",))
-        l1.addWidget(self.picker, 1)
+        self.picker.setMinimumHeight(220)
+        search_layout.addWidget(self.picker, 1)
+        l1.addWidget(self.search_area, 1)
+        self._selected_key = f"EPSG:{self.cmb_texas.currentData()}"
         self.fit = Banner("", "info")
         l1.addWidget(self.fit)
         modes = QGroupBox("What Should Happen to the Coordinates in This Project?")
@@ -408,6 +445,7 @@ user's (which system, and assign or reproject) are the ones the dialog asks for.
 
         # ---- wiring
         self.picker.changed.connect(self._candidate_changed)
+        self.cmb_texas.currentIndexChanged.connect(self._quick_crs_changed)
         self.r_assign.toggled.connect(self._mode_changed)
         self.chk_net.toggled.connect(self._net_toggled)
         self.cmb_vdatum.currentIndexChanged.connect(self._vdatum_changed)
@@ -440,15 +478,38 @@ user's (which system, and assign or reproject) are the ones the dialog asks for.
                 except Exception:
                     sug = []
         self.picker.set_suggestions(sug)
-        if not cur.is_local and cur.authority.startswith(("EPSG", "ESRI")):
-            self.picker.select_key(cur.authority)
         if cur.is_local:
             self.r_assign.setChecked(True)
             self.r_reproj.setEnabled(False)
             self.r_reproj.setToolTip("A local project has no position on the earth, so there is nothing to convert from. Assign a CRS instead.")
-            self.fit.set("This project uses local coordinates. Pick the coordinate system your numbers are really in and choose Assign.", "info")
+            self.fit.set("This project uses local coordinates. Choose the Texas zone that matches your numbers, or search for another system.", "info")
+            self._selected_key = f"EPSG:{C.TEXAS_DEFAULT_EPSG}"
+            self.cmb_texas.setCurrentIndex(max(0, self.cmb_texas.findData(C.TEXAS_DEFAULT_EPSG)))
         else:
             self.r_assign.setChecked(True)
+            if C.is_derived_key(cur.key):
+                current_key = f"PLUMBLINE:{cur.key}"
+            elif cur.authority.startswith(("EPSG:", "ESRI:")):
+                current_key = cur.authority
+            else:
+                current_key = ""
+            tail = current_key.split(":")[-1]
+            quick_value = C.normal_key(tail) if tail else ""
+            quick_index = self.cmb_texas.findData(quick_value)
+            if quick_index >= 0:
+                self.cmb_texas.setCurrentIndex(quick_index)
+                self._selected_key = f"EPSG:{self.cmb_texas.itemData(quick_index)}"
+            elif current_key:
+                self.cmb_texas.blockSignals(True)
+                self.cmb_texas.setCurrentIndex(-1)
+                self.cmb_texas.blockSignals(False)
+                self._selected_key = current_key
+                self.picker.select_key(current_key)
+            else:
+                self.cmb_texas.blockSignals(True)
+                self.cmb_texas.setCurrentIndex(-1)
+                self.cmb_texas.blockSignals(False)
+                self._selected_key = ""
         if cur.is_local:
             self.tabs.setTabEnabled(3, False)              # no ground scale without a projection
         self._strategy = "auto"                            # reprojection only - see the module note
@@ -463,7 +524,7 @@ user's (which system, and assign or reproject) are the ones the dialog asks for.
 
     # ------------------------------------------------------------------ candidate / fit
     def _candidate(self) -> C.ProjectCRS | None:
-        key = self.picker.current_key()
+        key = self._selected_key
         if not key:
             return None
         try:
@@ -475,8 +536,8 @@ user's (which system, and assign or reproject) are the ones the dialog asks for.
         cand.vunit = self.cmb_v.currentData() or cand.vunit
         return cand
 
-    def _candidate_changed(self, key: str):
-        # unless the user chose an elevation unit themselves, elevations follow the new system's unit
+    def _set_candidate_vunit(self, key: str):
+        # Unless the user chose an elevation unit themselves, heights follow the selected system.
         if self._init_done and not self._v_touched:
             try:
                 i = self.cmb_v.findData(C.describe_crs(key)["unit"])
@@ -484,6 +545,26 @@ user's (which system, and assign or reproject) are the ones the dialog asks for.
                     self.cmb_v.setCurrentIndex(i)
             except Exception:
                 pass
+
+    def _candidate_changed(self, key: str):
+        if not key:
+            return
+        self._selected_key = key
+        self.cmb_texas.blockSignals(True)
+        self.cmb_texas.setCurrentIndex(-1)
+        self.cmb_texas.blockSignals(False)
+        self._set_candidate_vunit(key)
+        self._update_fit()
+
+    def _quick_crs_changed(self, index: int):
+        if index < 0:
+            return
+        code = self.cmb_texas.itemData(index)
+        if code is None:
+            return
+        self._selected_key = f"EPSG:{code}"
+        self.picker.clear_selection()
+        self._set_candidate_vunit(self._selected_key)
         self._update_fit()
 
     def _mode_changed(self):
@@ -558,7 +639,7 @@ user's (which system, and assign or reproject) are the ones the dialog asks for.
                 self.lbl_geoid.setText("No geoid model is chosen for this datum: NGVD29 is related to "
                                        "NAVD88 by VERTCON, not to the ellipsoid.  This dialog no longer "
                                        "converts heights - set the datum here, then move the heights with "
-                                       "the reprojection tool (Coordinates > Reproject), which records "
+                                       "the Reproject option in Survey > Project Coordinate System, which records "
                                        "what it did.")
             else:
                 self.lbl_geoid.setText("No geoid model is needed for this datum.")
@@ -583,6 +664,7 @@ user's (which system, and assign or reproject) are the ones the dialog asks for.
         if not repl:
             return
         key = f"PLUMBLINE:{repl}" if str(repl).endswith("-ft") else f"EPSG:{repl}"
+        self.search_area.button.setChecked(True)
         self.picker.select_key(key)
         self.r_assign.setChecked(True)
         self.btn_legacy.setVisible(False)
@@ -670,7 +752,7 @@ user's (which system, and assign or reproject) are the ones the dialog asks for.
     # ------------------------------------------------------------------ accept
     def _build_result(self) -> C.ProjectCRS | None:
         cur = self.project.crs
-        key = self.picker.current_key()
+        key = self._selected_key
         cand = self._candidate() if key else None
         if cand is not None:
             crs, chosen_key = cand.crs, cand.key

@@ -52,7 +52,7 @@ Built from the descriptions: strings 390.
 
 1. **Survey > Data Quality Check** - the same findings the office's check report has.
 2. **Layer panel** - the job draws on the office's own layers, not `TOPO-GROUND`.
-3. **Coordinates > Project Coordinate System** - the job is on EPSG:6584 (NAD83(2011) Texas North Central, US survey feet). Under *SAF (ground scale)* try `Scale from origin (0,0) - TXDOT SOP` with a county factor and watch the coordinates move.
+3. **Survey > Project Coordinate System** - the job is on EPSG:6584 (NAD83(2011) Texas North Central, US survey feet). Under *SAF (ground scale)* try `Scale from origin (0,0) - TXDOT SOP` with a county factor and watch the coordinates move.
 4. **Imagery > Add Imagery** - align an aerial against surveyed edge-of-pavement shots, then **Draw > Distance / Bearing** between a shot and the feature it is on: comparing the two is a measurement now, not a report.
 5. **Survey > Fieldwork Manager** - open the same job's field data, run the duplicate check, and send the clean points back.
 

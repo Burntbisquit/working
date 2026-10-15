@@ -424,13 +424,15 @@ class CanvasView(QWidget):
 
     def keyPressEvent(self, ev):
         k = ev.key()
-        if self.tool is not None and self.tool.key(ev):
+        if k == Qt.Key_Escape:
+            # Give the active tool a chance to clear its transient state, then always
+            # return the main view to Pan. Toolbar/panel focus is handled by MainWindow.
+            if self.tool is not None:
+                self.tool.key(ev)
+            self.escape_pressed.emit()
             ev.accept()
             return
-        if k == Qt.Key_Escape:
-            # The tool gets first refusal (so a dialog can use Esc for its own purpose), and
-            # if it does not want it the main window puts the tool down and selects Pan.
-            self.escape_pressed.emit()
+        if self.tool is not None and self.tool.key(ev):
             ev.accept()
             return
         step = 80

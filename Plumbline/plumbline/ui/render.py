@@ -98,6 +98,7 @@ class DisplayOptions:
     show_desc: bool = False
     show_lines: bool = True
     show_text: bool = True
+    show_surfaces: bool = True
     show_imagery: bool = True
     show_grid: bool = False
     show_scalebar: bool = True
@@ -535,10 +536,11 @@ class SceneRenderer:
         sc = self.scene()
         dpr = p.device().devicePixelRatioF() if hasattr(p.device(), "devicePixelRatioF") else 1.0
         _hidden = pr.hidden_ids()
-        for s in pr.surfaces.values():
-            if s.id in _hidden:
-                continue
-            self._surface(p, view, s, dpr)
+        if opts.show_surfaces:
+            for s in pr.surfaces.values():
+                if s.id in _hidden:
+                    continue
+                self._surface(p, view, s, dpr)
         if opts.show_lines:
             self._lines(p, view, sc, opts)
         if opts.show_points and len(sc.pt_ids):

@@ -1,13 +1,16 @@
 """Import pipeline: options panel, per-format dialogs and the dispatcher used by the main window."""
 from __future__ import annotations
 
+import filecmp
 import math
+import shutil
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import numpy as np
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
                                QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPushButton, QRadioButton, QSpinBox,
                                QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
@@ -15,6 +18,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
 from ..core import audit as AUD
 from ..core import crs as C
 from ..core import filecrs as FCRC
+from ..core import field_data as FD
 from ..core import provenance as PROV
 from ..core import reference as REF
 from ..core import units as U
@@ -52,7 +56,6 @@ class ImportPlan:
     z_scale: float = 1.0
     dup_policy: str = "renumber"
     layer_override: str | None = None
-    process_linework: bool = False
     reference_role: str | None = None      # stakeout | control | other -> a reference list, not field data
 
 
@@ -122,20 +125,24 @@ def apply_import(state, batch: ImportBatch, plan: ImportPlan, label: str, path=N
         # This is inside the edit, so undoing the import takes the record with it, and it is what
         # "change the CRS of a file afterwards" reads and rewrites.
         if src.name:
+            converted_on_import = bool(plan.src_crs is not None or plan.geographic or
+                                       plan.scale_xy != 1.0 or plan.z_scale != 1.0)
+            rec = FCRC.make_from_project(pr, method="imported" if converted_on_import else "project")
+            # Keep the file's declared/chosen source as provenance, but the row's primary CRS
+            # describes the coordinates now stored in the project after apply_import's transform.
+            source_rec = None
             if plan.src_crs is not None:
                 try:
-                    from .crs import ProjectCRS as _PC
-                    rec = FCRC.record_from_crs(_PC(plan.src_crs), method="chosen")
+                    from ..core.crs import ProjectCRS as _PC
+                    source_rec = FCRC.record_from_crs(_PC(plan.src_crs), method="chosen")
                 except Exception:
-                    rec = FCRC.make_from_project(pr, method="chosen")
+                    source_rec = None
             elif plan.geographic:
-                rec = FCRC.make(key="", label="longitude / latitude (WGS 84)", unit="m", vunit="m",
-                                vertical="HAE", method="chosen")
-            else:
-                rec = FCRC.make_from_project(pr, method="project" if plan.assign_crs is None else "chosen")
+                source_rec = FCRC.make(key="EPSG:4326", label="longitude / latitude (WGS 84)",
+                                       unit="degree", vunit=pr.crs.vunit, vertical="HAE", method="chosen")
+            if source_rec is not None:
+                rec["source_crs"] = source_rec
             FCRC.record(pr, src.name, rec)
-        if plan.process_linework:
-            stats["linework"] = pr.process_linework()["strings"]
     return stats
 
 
@@ -259,10 +266,8 @@ class ImportOptionsPanel(QWidget):
             self.cmb_dup.addItem(lbl, v)
         self.ed_layer = QLineEdit()
         self.ed_layer.setPlaceholderText("(blank = keep layers from the file / feature codes)")
-        self.chk_lw = QCheckBox("Build linework from feature codes after import")
         of.addRow("If a point number already exists:", self.cmb_dup)
         of.addRow("Put everything on layer:", self.ed_layer)
-        of.addRow("", self.chk_lw)
         lay.addWidget(o)
 
         self.btn_other.clicked.connect(self._choose_other)
@@ -347,7 +352,7 @@ class ImportOptionsPanel(QWidget):
         # them here is what makes them "part of import" (change order, item 7).
         self.vg.apply_to(pc)
         p = ImportPlan(geographic=self.geographic, dup_policy=self.cmb_dup.currentData(),
-                       layer_override=self.ed_layer.text().strip() or None, process_linework=self.chk_lw.isChecked(),
+                       layer_override=self.ed_layer.text().strip() or None,
                        swap_xy=self.chk_swap.isChecked() and not self.geographic)
         eff = self._assign if (self.r_assign.isChecked() and self._assign is not None) else pc
         if self.r_other.isChecked() and self._chosen is not None:
@@ -415,7 +420,7 @@ class ImportOptionsPanel(QWidget):
             return ("This project uses local coordinates, so a file in another system cannot be converted. "
                     "Either assign a coordinate system to the project, or import the numbers as local coordinates.")
         if self.geographic and self.project.crs.is_local:
-            return "Longitude/latitude data needs a project coordinate system. Assign one first (Coordinates menu)."
+            return "Longitude/latitude data needs a project coordinate system. Assign one first (Survey menu)."
         return self.vg.validate()
     
 
@@ -451,7 +456,7 @@ class _ImportDialog(QDialog):
 class CsvImportDialog(QDialog):
     MAXPREV = 40
 
-    def __init__(self, state, path, parent=None):
+    def __init__(self, state, path, parent=None, *, default_role: str | None = None):
         super().__init__(parent)
         self.state = state
         self.path = Path(path)
@@ -494,7 +499,8 @@ class CsvImportDialog(QDialog):
                             ("Control - reference layer CONTROL", "control"),
                             ("Other reference - reference layer OTHER", "other")]:
             self.cmb_role.addItem(label, role)
-        self.cmb_role.setCurrentIndex(0)
+        role_index = self.cmb_role.findData(default_role) if default_role is not None else 0
+        self.cmb_role.setCurrentIndex(role_index if role_index >= 0 else 0)
         self.cmb_role.setToolTip("Reference points draw, snap and export with everything else, but they are kept\n"
                                  "out of the fieldwork list and out of the data-quality checks - they are not our shots.\n"
                                  "Each role has its own layer and its own point numbers.")
@@ -511,7 +517,7 @@ class CsvImportDialog(QDialog):
         self.panel = ImportOptionsPanel(state, geographic=False, assume_project_crs=True)
         root.addWidget(self.panel)
         self.bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.bb.button(QDialogButtonBox.Ok).setText("Import points")
+        self.bb.button(QDialogButtonBox.Ok).setText("Import")
         self.bb.accepted.connect(self._ok)
         self.bb.rejected.connect(self.reject)
         root.addWidget(self.bb)
@@ -613,10 +619,8 @@ class CsvImportDialog(QDialog):
         self.panel.ed_layer.setEnabled(role is None)
         self.panel.ed_layer.setPlaceholderText("(the layer of the chosen role)" if role
                                               else "(blank = keep layers from the file / feature codes)")
-        self.panel.chk_lw.setEnabled(role is None)
         if role:
             self.panel.ed_layer.clear()
-            self.panel.chk_lw.setChecked(False)
         self._update_preview()
 
     def _geo_changed(self):
@@ -768,7 +772,7 @@ class Importer:
         self.w = window
         self.state = window.state
 
-    def import_path(self, path) -> bool:
+    def import_path(self, path, *, default_role: str | None = None) -> bool:
         p = Path(path)
         ext = p.suffix.lower()
         try:
@@ -790,7 +794,7 @@ class Importer:
             if ext in IMAGE_EXT:
                 return self.w.add_imagery_file(str(p))
             if ext in CSV_EXT or True:
-                return self._csv(p)
+                return self._csv(p, default_role=default_role)
         except Exception as ex:
             import traceback
             error_box(self.w, "Import Failed", f"{p.name} could not be imported:\n{ex}", traceback.format_exc())
@@ -823,10 +827,14 @@ class Importer:
         for m in batch.messages:
             self.state.log(f"{path.name}: {m}", "warn")
         self.state.zoom_extents()
+        if plan.reference_role is None and stats.get("points", 0):
+            complete = getattr(self.w, "_complete_import_onboarding", None)
+            if callable(complete):
+                complete(imported_points=stats["points"])
         return True
 
-    def _csv(self, p: Path) -> bool:
-        dlg = CsvImportDialog(self.state, p, self.w)
+    def _csv(self, p: Path, *, default_role: str | None = None) -> bool:
+        dlg = CsvImportDialog(self.state, p, self.w, default_role=default_role)
         if not dlg.exec():
             return False
         return self._finish(dlg.batch, dlg.plan, f"points ({p.name})", p)
@@ -895,59 +903,148 @@ class Importer:
             self.state.log(f"Added {added} image overlay(s) from {p.name}.", "ok")
         return ok
 
-    # -- a whole folder of reference points, one role for all of it
+    # -- a whole folder of point files, either this job's field data or one reference role
     def import_reference_folder(self, folder, role: str | None, recursive: bool = False,
                                 selected_files: list[Path] | None = None) -> dict:
-        """Read point files in a folder and put the lot on one reference role's layer.
+        """Read selected point files, stage field data inside the package, and import the points.
 
-        No dialog per file: the role was chosen once.  A file that cannot be read is skipped and
-        named in the log - it is never imported half-guessed, because a control list with the
-        northing and easting columns swapped is worse than no control list.
+        A source file is copied under the job's standard ``Field Data`` folder before its points
+        are applied. The source/stored folder and filename plus parsed point count are remembered,
+        so a later folder scan disables only that same identity with the same point count.
+        Reference-role imports keep their existing in-place behavior.
         """
-        files = reference_folder_files(folder, recursive) if selected_files is None else list(selected_files)
+        source_root = Path(folder)
+        files = reference_folder_files(source_root, recursive) if selected_files is None else list(selected_files)
         tally = dict(files=0, points=0, duplicates=0, skipped=0, failed=0, unreadable=[])
-        for f in files:
+        for source_file in files:
+            source_file = Path(source_file)
             try:
-                sn = CSV.sniff(f)
-                m = CSV.CsvMapping(sn.delimiter, 1 if sn.has_header else 0, list(sn.roles))
-                batch = CSV.read_points(f, m)
+                sn = CSV.sniff(source_file)
+                mapping = CSV.CsvMapping(sn.delimiter, 1 if sn.has_header else 0, list(sn.roles))
+                batch = CSV.read_points(source_file, mapping)
             except Exception as ex:
                 tally["failed"] += 1
-                tally["unreadable"].append((f.name, str(ex)))
+                tally["unreadable"].append((source_file.name, str(ex)))
                 continue
             if not batch.points:
                 tally["failed"] += 1
-                tally["unreadable"].append((f.name, "no readable points"))
+                tally["unreadable"].append((source_file.name, "no readable points"))
                 continue
-            plan = ImportPlan(reference_role=role, dup_policy="renumber")
-            label = (f"{REF.label_for(role)} points ({f.name})" if role
-                     else f"points ({f.name})")
-            stats = apply_import(self.state, batch, plan, label, f, job_root=self._job_folder())
+
+            try:
+                plan = ImportPlan(reference_role=role, dup_policy="renumber")
+                label = (f"{REF.label_for(role)} points ({source_file.name})" if role
+                         else f"points ({source_file.name})")
+                if role is None:
+                    # Let the edit transaction finish Save As first.  An Untitled project has no
+                    # job root yet, so computing Field Data/ before entering this block silently
+                    # skipped both the package copy and the manifest for its first folder import.
+                    with self.state.edit(f"Import {label}"):
+                        job_root = self._job_folder()
+                        field_root = Path(job_root) / "Field Data" if job_root else None
+                        stored_file = (self._stage_field_data_file(source_file, source_root, field_root)
+                                       if field_root is not None else source_file)
+                        stats = apply_import(self.state, batch, plan, label, stored_file,
+                                             job_root=job_root)
+                        if stats.get("points", 0):
+                            self._remember_field_data_file(
+                                source_root, source_file, field_root, stored_file,
+                                point_count=len(batch.points))
+                else:
+                    job_root = self._job_folder()
+                    stats = apply_import(self.state, batch, plan, label, source_file,
+                                         job_root=job_root)
+            except Exception as ex:
+                tally["failed"] += 1
+                tally["unreadable"].append((source_file.name, str(ex)))
+                continue
+
             tally["files"] += 1
             tally["points"] += stats.get("points", 0)
             tally["duplicates"] += stats.get("duplicates", 0)
             tally["skipped"] += stats.get("skipped", 0)
-        self.record_reference_folder(folder, role, tally)
+
+        self.record_reference_folder(source_root, role, tally)
         for name, why in tally["unreadable"]:
             self.state.log(f"{name}: skipped ({why})", "warn")
         if tally["points"]:
             self.state.zoom_extents()
         return tally
 
-    def record_reference_folder(self, folder, role: str, tally: dict):
-        """Keep the folder on the job.
+    @staticmethod
+    def _stage_field_data_file(source_file: Path, source_root: Path, field_root: Path) -> Path:
+        """Copy a source file to Field Data without replacing an earlier import."""
+        source = source_file.expanduser()
+        source_abs = source.resolve()
+        root_abs = source_root.expanduser().resolve()
+        try:
+            relative = source_abs.relative_to(root_abs)
+        except (OSError, RuntimeError, ValueError):
+            relative = Path(source.name)
+        destination_root = field_root.expanduser()
+        destination = destination_root / relative
+        try:
+            if destination.resolve() == source_abs:
+                return source
+        except (OSError, RuntimeError):
+            pass
+        if destination.is_file():
+            try:
+                if filecmp.cmp(source, destination, shallow=False):
+                    return destination
+            except OSError:
+                pass
+        if destination.exists():
+            stem, suffix = destination.stem, destination.suffix
+            counter = 2
+            while destination.exists():
+                destination = destination.with_name(f"{stem} ({counter}){suffix}")
+                counter += 1
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        return destination
 
-        The job remembers which folder its reference data came from - so the next import, the
-        Fieldwork Manager and every file dialog start there, and so a project opened a month
-        later still says where the stake-out list lived.
-        """
+    def _remember_field_data_file(self, source_root: Path, source_file: Path,
+                                  field_root: Path | None, stored_file: Path, *,
+                                  point_count: int):
+        """Record source/stored folder, filename, and original parsed point count."""
+        try:
+            record = FD.make_import_record(
+                source_root, source_file, field_root, stored_file, point_count=point_count)
+        except OSError as ex:
+            self.state.log(f"Could not record field-data file {source_file.name}: {ex}", "warn")
+            return
         pr = self.state.project
-        hist = [r for r in pr.settings.get("reference_imports", [])
-                if not (r.get("folder") == str(folder) and r.get("role") == role)]
-        hist.append(dict(folder=str(folder), role=role, files=int(tally.get("files", 0)),
-                         points=int(tally.get("points", 0)), when=time.strftime("%Y-%m-%d %H:%M")))
-        pr.settings["reference_imports"] = hist[-20:]
-        pr.settings["data_folder"] = str(folder)
+        records = [r for r in (pr.settings.get("field_data_imports", []) or []) if isinstance(r, dict)]
+        key = (record["source_folder"], record["source_file"], record["stored_folder"],
+               record["stored_file"], record["point_count"])
+        already_recorded = any(
+            (str(old.get("source_folder", "")).casefold(),
+             str(old.get("source_file", "")).casefold(),
+             str(old.get("stored_folder", "")).casefold(),
+             str(old.get("stored_file", "")).casefold(),
+             old.get("point_count")) == key
+            for old in records
+        )
+        if not already_recorded:
+            records.append(record)
+        pr.settings["field_data_imports"] = records
+        pr.settings["field_data_source_folder"] = str(source_root.expanduser())
+        pr.settings["data_folder"] = str(field_root or source_root)
+
+    def record_reference_folder(self, folder, role: str | None, tally: dict):
+        """Keep lightweight folder history; per-file manifests share their point-import undo."""
+        job_root = self._job_folder()
+        pr = self.state.project
+        history = [r for r in pr.settings.get("reference_imports", [])
+                   if not (r.get("folder") == str(folder) and r.get("role") == role)]
+        history.append(dict(folder=str(folder), role=role, files=int(tally.get("files", 0)),
+                            points=int(tally.get("points", 0)), when=time.strftime("%Y-%m-%d %H:%M")))
+        pr.settings["reference_imports"] = history[-20:]
+        # With a packaged field-data import, these are set atomically alongside the points in
+        # _remember_field_data_file(). Keep the legacy folder hint when no package exists.
+        if role is not None or job_root is None:
+            pr.settings["data_folder"] = str(folder)
         pr.touch()
 
     def _plugin(self, p: Path, spec) -> bool:
@@ -967,7 +1064,7 @@ def reference_folder_files(folder, recursive: bool = True) -> list[Path]:
     root = Path(folder)
     if not root.is_dir():
         return []
-    found = root.rglob("*")  # always include sub-folders (recursive default=True)
+    found = root.rglob("*") if recursive else root.iterdir()
     return sorted((p for p in found if p.is_file() and p.suffix.lower() in POINTS_EXT),
                   key=lambda p: natural_key(str(p.relative_to(root))))
 
@@ -1101,23 +1198,20 @@ class FolderPointsPreviewDialog(QDialog):
 
 
 class ReferenceFolderDialog(FormDialog):
-    """Survey > Import Points from Folder - one reference role for a whole folder of point files.
+    """Select point files from one folder for field-data or reference-point import."""
 
-    One dialog for the folder, not one dialog per file: a download folder can hold a dozen crew
-    files, and the question ("what are these?") has one answer.
-    """
-
-    def __init__(self, state, folder: Path, parent=None):
-        super().__init__(parent, "Import Points from Folder",
-                         "Every point file in the folder is read and given the reference role "
-                         "chosen here, so each role ends up on its own layer.  Files that cannot "
-                         "be read are left alone and reported - nothing is guessed silently.",
-                         "Import", 700)
+    def __init__(self, state, folder: Path, parent=None, *, field_data_only: bool = False):
+        intro = ("Choose the survey files to add to this project's Field Data folder. "
+                 "Previously imported files with the same folder, filename, and point count are greyed out; "
+                 "files with a changed point count remain selectable." if field_data_only else
+                 "Every point file is imported with the role chosen here. Files that cannot be "
+                 "read are left alone and reported - nothing is guessed silently.")
+        title = "Import Field Data Folder" if field_data_only else "Import Points from Folder"
+        super().__init__(parent, title, intro, "Import", 700)
         self.state = state
         self.folder = Path(folder)
+        self.field_data_only = bool(field_data_only)
         self.cmb_role = QComboBox()
-        # Field data first (change order, item 6): a folder of downloads is the crew's own work
-        # far more often than it is somebody else's reference list.
         self.cmb_role.addItem("This job's field data - joins the fieldwork list", None)
         for role in REF.ROLES:
             self.cmb_role.addItem(f"{REF.ROLE_LABELS[role]} - layer {REF.layer_for(role)}", role)
@@ -1125,10 +1219,15 @@ class ReferenceFolderDialog(FormDialog):
         self.chk_sub.setChecked(True)
 
         self.form.addRow("Folder:", QLabel(str(self.folder)))
-        self.form.addRow("These points are:", self.cmb_role)
+        if not self.field_data_only:
+            self.form.addRow("These points are:", self.cmb_role)
         self.form.addRow("", self.chk_sub)
 
-        # File list header with Select All / Select None / Preview Points buttons and count
+        self.lbl_manifest = QLabel("Matching folder, filename, and point count means already imported.")
+        self.lbl_manifest.setStyleSheet("color: #777; font-style: italic;")
+        self.lbl_manifest.setVisible(self.field_data_only)
+        self.form.addRow(self.lbl_manifest)
+
         file_head_widget = QWidget()
         file_head_lay = QHBoxLayout(file_head_widget)
         file_head_lay.setContentsMargins(0, 0, 0, 0)
@@ -1138,16 +1237,15 @@ class ReferenceFolderDialog(FormDialog):
         self.btn_select_all = QPushButton("Select All")
         self.btn_select_none = QPushButton("Select None")
         self.btn_preview = QPushButton("Preview Points...")
-        self.btn_preview.setToolTip("View all points and coordinates from the selected files before importing")
+        self.btn_preview.setToolTip("View all points and coordinates from selected files")
         file_head_lay.addWidget(self.btn_select_all)
         file_head_lay.addWidget(self.btn_select_none)
         file_head_lay.addWidget(self.btn_preview)
         self.form.addRow(file_head_widget)
 
-        # Table of files with checkboxes for selection
         self.chk_table = QTableWidget()
         self.chk_table.setColumnCount(4)
-        self.chk_table.setHorizontalHeaderLabels(["", "File", "Subfolder / Path", "Size"])
+        self.chk_table.setHorizontalHeaderLabels(["", "File", "Subfolder / Path", "Points"])
         self.chk_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.chk_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.chk_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
@@ -1163,7 +1261,9 @@ class ReferenceFolderDialog(FormDialog):
         self.form.addRow(self.lbl_none)
 
         self._file_paths: list[Path] = []
+        self._file_point_counts: list[int | None] = []
         self._checkboxes: list[QCheckBox] = []
+        self._imported_flags: list[bool] = []
 
         self.btn_select_all.clicked.connect(self._select_all)
         self.btn_select_none.clicked.connect(self._select_none)
@@ -1180,106 +1280,197 @@ class ReferenceFolderDialog(FormDialog):
     def role(self) -> str | None:
         return self.cmb_role.currentData()
 
+    @staticmethod
+    def _point_count_in_file(file_path: Path) -> int | None:
+        """Count the usable points using the same parser as the actual folder import."""
+        try:
+            sniffed = CSV.sniff(file_path)
+            mapping = CSV.CsvMapping(sniffed.delimiter, 1 if sniffed.has_header else 0,
+                                     list(sniffed.roles))
+            return len(CSV.read_points(file_path, mapping).points)
+        except Exception:
+            return None
+
+    def _legacy_stored_file(self, record: dict) -> Path | None:
+        """Find a pre-point-count manifest's packaged copy so its count can be migrated."""
+        stored_relative = str(record.get("stored_relative") or "").replace("\\", "/")
+        parts = PurePosixPath(stored_relative).parts
+        if len(parts) < 2:
+            return None
+
+        project_path = getattr(self.state.project, "path", None)
+        project_root = Path(project_path).expanduser().parent if project_path else None
+        roots = []
+        data_folder = str((self.state.project.settings or {}).get("data_folder") or "").strip()
+        if data_folder:
+            root = Path(data_folder).expanduser()
+            if not root.is_absolute() and project_root is not None:
+                root = project_root / root
+            roots.append(root)
+        if project_root is not None:
+            roots.append(project_root / "Field Data")
+
+        for root in roots:
+            if root.name.casefold() != parts[0].casefold():
+                continue
+            stored_file = root.joinpath(*parts[1:])
+            if stored_file.is_file():
+                return stored_file
+        return None
+
+    def _records_with_legacy_point_counts(self, records) -> list[dict]:
+        """Recover legacy counts only by parsing their preserved staged original file.
+
+        Point provenance identifies where imported points came from, but the number still in a
+        project is not proof of how many points the original file parsed to (points may have been
+        deleted or edited). If the staged source copy is gone and the manifest has no count, leave
+        that legacy record unmatched rather than guessing.
+        """
+        enriched = []
+        for record in records or ():
+            if not isinstance(record, dict):
+                continue
+            if record.get("point_count") is not None:
+                enriched.append(record)
+                continue
+            original_copy = self._legacy_stored_file(record)
+            count = self._point_count_in_file(original_copy) if original_copy else None
+            if count is None:
+                enriched.append(record)
+            else:
+                migrated = dict(record)
+                migrated["point_count"] = count
+                enriched.append(migrated)
+        return enriched
+
     def _refresh_files(self):
         files = self.files()
         self._file_paths = list(files)
+        self._file_point_counts = []
         self._checkboxes = []
+        self._imported_flags = []
         if not files:
+            self.chk_table.setRowCount(0)
             self.chk_table.setVisible(False)
+            self.lbl_none.setText("No point files (.csv, .txt, .pts, .xyz ...) found in this folder.")
             self.lbl_none.setVisible(True)
             self.btn_select_all.setEnabled(False)
             self.btn_select_none.setEnabled(False)
             self.btn_preview.setEnabled(False)
+            self.buttons.button(QDialogButtonBox.Ok).setEnabled(False)
             self.lbl_file_count.setText("No point files found.")
             return
 
+        tracking_field_data = self.field_data_only or self.role() is None
+        self.lbl_manifest.setVisible(tracking_field_data)
+        raw_records = self.state.project.settings.get("field_data_imports", []) if tracking_field_data else []
+        records = self._records_with_legacy_point_counts(raw_records) if tracking_field_data else []
+        point_counts = [self._point_count_in_file(file) for file in files]
+        self._file_point_counts = point_counts
+        imported = []
+        for file, point_count in zip(files, point_counts):
+            has_points = point_count is not None and point_count > 0
+            already_imported = (tracking_field_data and has_points and FD.imported_file_matches(
+                records, self.folder, file, point_count))
+            imported.append(already_imported)
         self.chk_table.setVisible(True)
         self.lbl_none.setVisible(False)
-        self.btn_select_all.setEnabled(True)
-        self.btn_select_none.setEnabled(True)
-        self.btn_preview.setEnabled(True)
         self.chk_table.setRowCount(len(files))
 
-        for row, f in enumerate(files):
-            # Column 0: Checkbox centered
+        for row, (file, already_imported, point_count) in enumerate(zip(files, imported, point_counts)):
             chk = QCheckBox()
-            chk.setChecked(True)
+            chk.setChecked(not already_imported)
+            chk.setEnabled(not already_imported)
+            if already_imported:
+                chk.setToolTip("Already imported: matching folder, filename, and point count")
             chk.toggled.connect(self._update_count)
             self._checkboxes.append(chk)
+            self._imported_flags.append(already_imported)
             chk_widget = QWidget()
+            chk_widget.setEnabled(not already_imported)
             chk_lay = QHBoxLayout(chk_widget)
             chk_lay.addWidget(chk)
             chk_lay.setAlignment(Qt.AlignCenter)
             chk_lay.setContentsMargins(4, 2, 4, 2)
             self.chk_table.setCellWidget(row, 0, chk_widget)
 
-            # Column 1: File name
-            item_name = QTableWidgetItem(f.name)
-            self.chk_table.setItem(row, 1, item_name)
-
-            # Column 2: Relative path or parent folder
             try:
-                rel = str(f.relative_to(self.folder).parent)
+                rel = file.relative_to(self.folder).parent.as_posix()
                 if rel == ".":
                     rel = "(root)"
             except Exception:
-                rel = str(f.parent)
-            item_rel = QTableWidgetItem(rel)
-            self.chk_table.setItem(row, 2, item_rel)
+                rel = str(file.parent)
+            points_text = f"{point_count:,}" if point_count is not None else "—"
+            items = (QTableWidgetItem(file.name), QTableWidgetItem(rel), QTableWidgetItem(points_text))
+            items[2].setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            for column, item in enumerate(items, start=1):
+                if already_imported:
+                    item.setForeground(QColor(theme.colors()["dim"]))
+                    item.setBackground(QColor(theme.colors()["alt"]))
+                    item.setToolTip("Already imported: matching folder, filename, and point count")
+                    disabled_flags = (Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                                      | Qt.ItemFlag.ItemIsEditable)
+                    item.setFlags(item.flags() & ~disabled_flags)
+                self.chk_table.setItem(row, column, item)
 
-            # Column 3: File size
-            try:
-                sz = f.stat().st_size
-                sz_str = f"{sz:,} B" if sz < 1024 else f"{sz / 1024:.1f} KB"
-            except Exception:
-                sz_str = ""
-            item_sz = QTableWidgetItem(sz_str)
-            item_sz.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            self.chk_table.setItem(row, 3, item_sz)
-
+        available = sum(1 for chk in self._checkboxes if chk.isEnabled())
+        if self.field_data_only and available == 0:
+            self.lbl_none.setText("All matching folder/file and point-count combinations have already been imported.")
+            self.lbl_none.setVisible(True)
+        else:
+            self.lbl_none.setVisible(False)
+        self.btn_select_all.setEnabled(available > 0)
+        self.btn_select_none.setEnabled(available > 0)
         self._update_count()
 
     def _cell_clicked(self, row: int, col: int):
         if col > 0 and 0 <= row < len(self._checkboxes):
             chk = self._checkboxes[row]
-            chk.setChecked(not chk.isChecked())
+            if chk.isEnabled():
+                chk.setChecked(not chk.isChecked())
 
     def _cell_double_clicked(self, row: int, col: int):
         if 0 <= row < len(self._file_paths):
-            f = self._file_paths[row]
-            dlg = FolderPointsPreviewDialog([f], self)
+            dlg = FolderPointsPreviewDialog([self._file_paths[row]], self)
             dlg.exec()
 
     def _select_all(self):
         for chk in self._checkboxes:
-            chk.setChecked(True)
+            if chk.isEnabled():
+                chk.setChecked(True)
 
     def _select_none(self):
         for chk in self._checkboxes:
-            chk.setChecked(False)
+            if chk.isEnabled():
+                chk.setChecked(False)
 
     def _preview_points(self):
-        sel = self.selected_files()
-        if not sel:
+        selected = self.selected_files()
+        if not selected:
             error_box(self, "Preview Points", "Please select at least one point file to preview.")
             return
-        dlg = FolderPointsPreviewDialog(sel, self)
-        dlg.exec()
+        FolderPointsPreviewDialog(selected, self).exec()
 
     def _update_count(self):
-        sel = sum(1 for c in self._checkboxes if c.isChecked())
-        tot = len(self._checkboxes)
-        self.lbl_file_count.setText(f"Point files found ({sel} of {tot} selected):")
-        self.btn_preview.setEnabled(sel > 0)
+        selected = sum(1 for chk in self._checkboxes if chk.isChecked())
+        total = len(self._checkboxes)
+        already = sum(1 for chk in self._checkboxes if not chk.isEnabled())
+        self.lbl_file_count.setText(
+            f"Point files found ({selected} of {total} selected" +
+            (f", {already} already imported" if already else "") + "):")
+        self.btn_preview.setEnabled(selected > 0)
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(selected > 0)
 
     def selected_files(self) -> list[Path]:
         """Return the list of files the user checked."""
-        return [p for p, chk in zip(self._file_paths, self._checkboxes) if chk.isChecked()]
+        return [file for file, chk in zip(self._file_paths, self._checkboxes) if chk.isEnabled() and chk.isChecked()]
 
     def validate(self):
         if not self.files():
             return "There are no point files in this folder."
         if not self.selected_files():
+            if self.field_data_only and self._file_paths and all(self._imported_flags):
+                return "All matching folder/file and point-count combinations have already been imported."
             return "Please select at least one file to import."
         return None
 

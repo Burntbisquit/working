@@ -1,7 +1,9 @@
 import http.server
+import json
 import math
 import socketserver
 import threading
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -273,19 +275,97 @@ def test_linework_strings_flags_and_closing():
 
 def test_project_process_linework_and_layers():
     pr = Project("t")
+    # This test exercises the opt-in generic library, not a new project's empty table.
+    pr.codes = default_codes()
     for x, y, z, d in [(0, 0, 1, "EP"), (10, 0, 1, "EP"), (20, 0, 1.5, "EP"), (3, 3, 2, "MH"), (9, 9, 2, "XYZ")]:
         pr.add_point(x, y, z, desc=d)
     res = pr.apply_codes_to_points()
     assert res["matched"] == 4 and "XYZ" in res["unknown"]
     assert pr.point_by_number("4").layer == "UTIL-MH"
+    assert not pr.linework_is_processed()
     out = pr.process_linework()
     assert out["strings"] == 1
     pl = next(pr.polylines(kinds={"breakline"}))
     assert pl.layer == "ROAD-EP" and len(pl.verts) == 3 and pl.derived == "linework"
+    assert pr.linework_is_processed()
     assert pr.process_linework()["replaced"] == 1          # regenerating replaces, never duplicates
+    assert pr.linework_is_processed()
+    assert Project.from_dict(pr.to_dict()).linework_is_processed()
+
+    pr.point_by_number("1").desc = "MH"
+    pr.touch()
+    assert not pr.linework_is_processed(), "point edits stale the processed-state marker"
+    pr.process_linework()
+    assert pr.linework_is_processed()
+
+
+def test_linework_processed_state_tracks_the_requested_order():
+    pr = Project("linework order")
+    pr.codes = default_codes()
+    pr.add_point(0, 0, 0, number="20", desc="EP")
+    pr.add_point(10, 0, 0, number="10", desc="EP")
+
+    file_signature = pr.linework_input_signature("file")
+    number_signature = pr.linework_input_signature("number")
+    assert file_signature != number_signature
+
+    pr.process_linework(order="file")
+    assert pr.linework_is_processed()
+    pr.process_linework(order="number")
+    assert pr.linework_is_processed(), "the saved processing order is checked with its own fingerprint"
+
+
+def test_manual_linework_overrides_are_part_of_the_processed_state():
+    pr = Project("manual linework")
+    pr.codes = default_codes()
+    first = pr.add_point(0, 0, 0, number="1", desc="EP")
+    second = pr.add_point(10, 0, 0, number="2", desc="EP")
+    pr.process_linework()
+    assert pr.linework_is_processed()
+
+    manual = pr.add_polyline(
+        [[0, 0, 0], [10, 1, 0]], layer="ROAD-EP", kind="breakline",
+        derived="manual-linework",
+        attrs={"manual_linework_override": True,
+               "linework_override_keys": [["EP", "1"]],
+               "linework_override_point_ids": [first.id, second.id]},
+    )
+    assert not pr.linework_is_processed(), "a new manual override changes the build inputs"
+
+    pr.process_linework()
+    assert pr.linework_is_processed()
+    manual.attrs["linework_override_point_ids"] = [first.id]
+    pr.touch()
+    assert not pr.linework_is_processed(), "editing an override must make the built state stale"
+
+
+def test_legacy_project_linework_gets_a_processed_baseline_then_goes_stale_on_import():
+    pr = Project("legacy linework")
+    pr.codes = default_codes()
+    pr.add_point(0, 0, 0, number="1", desc="EP ST")
+    pr.add_point(10, 0, 0, number="2", desc="EP END")
+    pr.process_linework()
+    data = pr.to_dict()
+    data["settings"].pop("linework_processed_signature", None)
+    data["settings"].pop("linework_processed_order", None)
+
+    restored = Project.from_dict(data)
+    assert restored.linework_is_processed()
+    restored.add_point(20, 0, 0, number="3", desc="EP")
+    assert not restored.linework_is_processed()
 
 
 # ============================================================ project
+def test_new_projects_start_with_an_empty_feature_code_table_but_legacy_files_keep_defaults():
+    pr = Project("empty")
+    assert len(pr.codes) == 0
+
+    legacy = pr.to_dict()
+    legacy.pop("codes")  # Older files without a persisted table retain the legacy starter library.
+    restored = Project.from_dict(legacy)
+    assert len(restored.codes) == len(default_codes())
+
+
 def make_site(n=15):
     pr = Project("site", C.ProjectCRS.from_epsg(2276))
     rng = np.random.default_rng(5)
@@ -501,6 +581,20 @@ def test_qa_finds_bust_duplicate_and_wrong_crs():
     assert [i.kind for i in run_checks(clean) if i.severity != "info"] == []
 
 
+def test_qa_unknown_code_check_skips_deleted_points_and_blank_descriptions():
+    project = Project("Deleted description")
+    project.codes = default_codes()
+    active = project.add_point(0, 0, 1, number="1", desc="UNKNOWNCODE")
+    project.add_point(10, 0, 1, number="2", desc="UNKNOWNCODE",
+                      attrs={"qa_deleted": True})
+    project.add_point(20, 0, 1, number="3", desc="")
+
+    issues = run_checks(project)
+    unknown = next(issue for issue in issues if issue.kind == "unknown-code")
+    assert unknown.point_ids == [active.id]
+    assert all(issue.kind != "empty-description" for issue in issues)
+
+
 # ============================================================ tile store
 class _H(http.server.BaseHTTPRequestHandler):
     hits = 0
@@ -712,6 +806,40 @@ def test_edit_discards_a_noop_but_keeps_a_rename():
     assert len(st.undo_stack) == 1, "a rename inside an edit must be undoable"
     st.undo()
     assert st.project.name == "Script target"
+
+
+def test_untitled_project_edit_rolls_back_on_cancel_and_saves_before_mutation(tmp_path):
+    pytest.importorskip("PySide6")
+    from plumbline.ui.app_state import AppState
+    from plumbline.core.project_package import create_project_package
+
+    state = AppState(Project("Untitled"))
+    calls = []
+    state._save_untitled_before_edit = lambda: calls.append("cancel") or False
+    with state.edit("Add point"):
+        state.project.add_point(1, 2, 3, desc="TOC")
+    assert not state.project.points and not state.dirty and calls == ["cancel"]
+
+    def save_package():
+        package = create_project_package(state.project, tmp_path, "Saved Before Edit")
+        state.project.restore(package.snapshot())
+        state.project.path = package.path
+        state.project._portable_paths = package._portable_paths
+        state.set_dirty(False)
+        calls.append("saved")
+        return True
+
+    state._save_untitled_before_edit = save_package
+    with state.edit("Add point"):
+        state.project.add_point(1, 2, 3, desc="TOC")
+    assert calls == ["cancel", "saved"]
+    assert len(state.project.points) == 1 and state.dirty
+    assert Path(state.project.path).is_file()
+    state.undo()
+    assert not state.project.points and state.project.path
+    state.project.save()
+    saved = json.loads(Path(state.project.path).read_text(encoding="utf-8"))
+    assert saved["package"]["relative_asset_paths"] is True
 
 
 def test_tile_cache_key_is_stable_and_filesystem_safe():

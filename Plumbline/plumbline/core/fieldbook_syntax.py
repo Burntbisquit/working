@@ -98,6 +98,52 @@ def command_meanings(commands=None) -> dict[str, str]:
     }
 
 
+def first_line_order_pair_violation(meanings: Sequence[str]) -> tuple[int, int, str] | None:
+    """Return the first of the three supported same-code command-pair inversions.
+
+    ``meanings`` must already be limited to one Field Book code section and kept in source order.
+    The checks intentionally do not validate general line completeness, repeated starts, or
+    unmatched singleton commands. They only recognize these pair inversions:
+
+    * Start Curve before Start Line;
+    * End Line before End Curve; and
+    * Close before End Curve.
+
+    The first returned index is the location to report/highlight (the later Start Line for the
+    first rule, or the earlier terminator for the other two); the second is its counterpart. A
+    new Start Line starts a fresh line segment for the End Line/Close check, while End Line/Close
+    ends the prior segment for the Start Curve/Start Line check.
+    """
+    start_curve_before_line = None
+    terminator_before_curve = None
+
+    for index, meaning in enumerate(meanings):
+        if meaning == "start_line":
+            if start_curve_before_line is not None:
+                return index, start_curve_before_line, "Start Curve appears before Start Line"
+            # A later End Curve belongs to a new segment after this Start Line, not to an
+            # End Line/Close from the preceding segment.
+            terminator_before_curve = None
+        elif meaning == "start_curve":
+            if start_curve_before_line is None:
+                start_curve_before_line = index
+        elif meaning == "end_line":
+            start_curve_before_line = None
+            if terminator_before_curve is None:
+                terminator_before_curve = index
+        elif meaning == "close":
+            start_curve_before_line = None
+            if terminator_before_curve is None:
+                terminator_before_curve = index
+        elif meaning == "end_curve" and terminator_before_curve is not None:
+            terminal = meanings[terminator_before_curve]
+            label = "End Line" if terminal == "end_line" else "Close"
+            return (terminator_before_curve, index,
+                    f"{label} appears before End Curve")
+
+    return None
+
+
 def command_token_validation_error(commands) -> str | None:
     """Describe why an edited command list is invalid, or return ``None`` when it is valid."""
     tokens = [str(token or "").strip() for token in commands or ()]
