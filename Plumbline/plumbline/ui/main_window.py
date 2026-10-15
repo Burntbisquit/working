@@ -40,6 +40,7 @@ from .dialogs import (AboutDialog, FeatureCodesDialog, HelpDialog, PluginsDialog
 from .docks import ConsoleDock, FieldBookDock, LayersDock, MessagesDock, PointsDock, PropertiesDock, SurfacesDock
 from .groups_dock import GroupsDock
 from .geometry_dock import GeometryDock
+from .performance_dock import PerformanceDock
 from .export_dialogs import export_dxf, export_gis, export_kml, export_landxml, export_points_csv
 from .f2f_dialog import ConvertFieldToFinishDialog
 from .import_export import (IMPORT_FILTER, POINTS_FILTER, ImportPlan, Importer, ReferenceFolderDialog,
@@ -256,6 +257,7 @@ class MainWindow(QMainWindow):
         self.imagery = ImageryDock(st, cv)
         self.fieldbook_dock = FieldBookDock(st)
         self.geometry = GeometryDock(st)
+        self.performance = PerformanceDock(st)
         self.props = PropertiesDock(st)
         self.points = PointsDock(st)
         self.messages = MessagesDock(st)
@@ -270,6 +272,7 @@ class MainWindow(QMainWindow):
 
         # Right dock area: Geometry, Properties, Field Book
         self.d_geometry = self._dock("Geometry", self.geometry, Qt.RightDockWidgetArea, "geometry")
+        self.d_performance = self._dock("Performance", self.performance, Qt.RightDockWidgetArea, "performance")
         self.d_props = self._dock("Properties", self.props, Qt.RightDockWidgetArea, "props")
         self.d_fieldbook = self._dock("Field Book", self.fieldbook_dock, Qt.RightDockWidgetArea, "fieldbook")
 
@@ -283,7 +286,8 @@ class MainWindow(QMainWindow):
         self.tabifyDockWidget(self.d_groups, self.d_pts)
         self.d_layers.raise_()
 
-        self.tabifyDockWidget(self.d_geometry, self.d_props)
+        self.tabifyDockWidget(self.d_geometry, self.d_performance)
+        self.tabifyDockWidget(self.d_performance, self.d_props)
         self.tabifyDockWidget(self.d_props, self.d_fieldbook)
         self.d_geometry.raise_()
 
@@ -395,6 +399,8 @@ class MainWindow(QMainWindow):
                               tip="Fix Point Errors (closeness duplicates, unknown codes, descriptions)")
         self.a_fix_linework = A("Fix &Linework...", self.open_fix_linework, icon="check_lines",
                                 tip="Fix Linework (missing start/end, curve commands, bowties, reclass/reorder)")
+        self.a_performance = A("&Performance Benchmark", self.open_performance_panel,
+                               tip="Run a non-mutating project benchmark and write a performance report")
         self.a_qa = self.a_fix_points
         self.a_codes = A("Apply &Feature Codes to All Points", self.apply_codes, icon="tag")
         self.a_linework = A("Process &Linework", self.process_linework, icon="polyline")
@@ -523,8 +529,8 @@ class MainWindow(QMainWindow):
         mtb.addAction(self.tb_survey.toggleViewAction())
         mtb.addAction(self.tb_draw_controls.toggleViewAction())
         md = add_menu("&Panels", m)
-        for d in (self.d_layers, self.d_surf, self.d_img, self.d_groups, self.d_pts, self.d_geometry, self.d_props,
-                  self.d_fieldbook, self.d_msg, self.d_con, self.d_3d, self.d_depth):
+        for d in (self.d_layers, self.d_surf, self.d_img, self.d_groups, self.d_pts, self.d_geometry,
+                  self.d_performance, self.d_props, self.d_fieldbook, self.d_msg, self.d_con, self.d_3d, self.d_depth):
             md.addAction(d.toggleViewAction())
         md.addSeparator()
         md.addMenu(self.points.col_menu)          # the point list's own columns live here too
@@ -539,8 +545,9 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addActions([self.a_crs, self.a_calc, self.a_file_crs])
         m.addSeparator()
-        m.addActions([self.a_fix_points, self.a_fix_linework, self.a_fieldbook, self.a_codes, self.a_linework,
-                      self.a_join_points, self.a_join_lines, self.a_edit_line_geometry, self.a_edit_linework_coding])
+        m.addActions([self.a_fix_points, self.a_fix_linework, self.a_performance, self.a_fieldbook, self.a_codes,
+                      self.a_linework, self.a_join_points, self.a_join_lines, self.a_edit_line_geometry,
+                      self.a_edit_linework_coding])
         m.addSeparator()
         m.addActions([self.a_cogo, self.a_transform])
         m = add_menu("S&urface")
@@ -576,7 +583,8 @@ class MainWindow(QMainWindow):
         self.tb_draw_tools.addAction(self.a_snap)
 
         self.tb_survey = tb_top("Survey", "tb_survey")
-        self.tb_survey.addActions([self.a_crs, self.a_fix_points, self.a_fix_linework, self.a_fieldbook, self.a_sf_new, self.a_sf_ctr, self.a_sf_vol, self.a_sf_prof])
+        self.tb_survey.addActions([self.a_crs, self.a_fix_points, self.a_fix_linework, self.a_performance,
+                                   self.a_fieldbook, self.a_sf_new, self.a_sf_ctr, self.a_sf_vol, self.a_sf_prof])
         self.tb_survey.addSeparator()
         self.tb_survey.addActions([self.a_img_add, self.a_gmaps])
         self.tb_survey.addSeparator()
@@ -1679,6 +1687,12 @@ class MainWindow(QMainWindow):
             return
         from .qa_workspace import FixLineworkDialog
         self._show_modal_qa_workbench(FixLineworkDialog(self.state, self))
+
+    def open_performance_panel(self):
+        """Survey > Performance Benchmark: reveal the docked local benchmark runner."""
+        self.d_performance.show()
+        self.d_performance.raise_()
+        self.performance.run_button.setFocus()
 
     def qa_dialog(self):
         self.open_fix_point_errors()
