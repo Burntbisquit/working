@@ -138,6 +138,38 @@ def _rewrite_code_part(desc: str, old_code_prefix: str = "", new_code: str | Non
     return _join_multicode(parts, semantic_tokens), True
 
 
+def set_point_line_code(desc: str, old_code_prefix: str, new_code: str, commands=None) -> str:
+    """Change one multicode section's code token without touching its line commands."""
+    new_code = str(new_code or "").strip()
+    if not new_code:
+        raise ValueError("A line code cannot be blank.")
+    updated, changed = _rewrite_code_part(desc or "", old_code_prefix, new_code=new_code,
+                                          commands=commands, clear_boundaries=False)
+    if not changed:
+        raise ValueError(f"Line code '{old_code_prefix}' was not found on this point.")
+    return updated
+
+
+def set_point_line_boundary(desc: str, code_prefix: str, boundary: str | None, commands=None) -> str:
+    """Set one code section's ST/END/X boundary while preserving other code sections.
+
+    ``boundary`` accepts semantic names or the active Field Book token.  An empty
+    value clears only start/end/close commands, retaining PC/PT and free text.
+    """
+    semantic_tokens = command_map(commands)
+    aliases = {str(token).casefold(): meaning for meaning, token in semantic_tokens.items() if token}
+    aliases.update({"st": "start_line", "end": "end_line", "x": "close", "pc": "start_curve", "pt": "end_curve"})
+    requested = str(boundary or "").strip()
+    meaning = aliases.get(requested.casefold(), requested.casefold()) if requested else None
+    if meaning is not None and meaning not in _LINE_MEANINGS:
+        raise ValueError("Use ST, END, X, PC, PT, or leave the command blank.")
+    updated, changed = _rewrite_code_part(desc or "", code_prefix, boundary=meaning,
+                                          commands=semantic_tokens, clear_boundaries=True)
+    if not changed:
+        raise ValueError(f"Line code '{code_prefix}' was not found on this point.")
+    return updated
+
+
 def _contains_meaning(desc: str, meaning: str, code_prefix: str = "", commands=None) -> bool:
     for part in _split_multicode(desc, commands):
         main, _note, _had_separator = _description_parts(part, commands)
