@@ -17,6 +17,7 @@ import sys
 from time import perf_counter_ns
 from typing import Callable, TYPE_CHECKING
 
+from .crossings import run_geometry_checks
 from .featurecodes import _parse_description_cached, build_linework
 from .geometry_segments import build_segments, segment_point_rows
 from .qa import run_checks
@@ -252,6 +253,15 @@ def benchmark_project(project: Project, profile: str = "Standard") -> Performanc
                 lambda: FB.check_linework_project(project, f2f=f2f_codes, fieldbook_path=fb_path),
                 repeats,
                 lambda result: f"{len(result.get('line_issues', ())):,} line issue(s)",
+            ))
+            metrics.append(_measure(
+                "Breakline crossing & length QA",
+                lambda: run_geometry_checks(project, segments=segments_snapshot, include_command_issues=False),
+                repeats,
+                lambda result: (
+                    f"{len(result.crossings):,} crossing(s) across {result.breakline_count:,} breakline(s); "
+                    f"{len(result.long_segments):,} long span(s) (>{result.max_segment_length:.0f})"
+                ),
             ))
         return PerformanceReport(
             created_utc=datetime.now(timezone.utc).replace(microsecond=0).isoformat(),

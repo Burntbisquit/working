@@ -577,21 +577,70 @@ def build_tin(points, breaklines=(), boundaries=(), holes=(), max_edge: float | 
     _, first = np.unique(keys, axis=0, return_index=True)
     first.sort()
     rep.n_duplicates = len(P) - len(first)
-    for x, y, z in P[first]:
+    ground_pts = P[first]
+    for x, y, z in ground_pts:
         V.add(x, y, z)
 
+    ground_tin: TIN | None = None
+    ground_tree: cKDTree | None = None
+
+    def _drape_xy(xy: np.ndarray) -> np.ndarray:
+        nonlocal ground_tin, ground_tree
+        z_out = np.full(len(xy), np.nan, dtype=float)
+        if len(ground_pts) >= 3:
+            if ground_tin is None:
+                try:
+                    ground_tin = TIN(ground_pts.copy(), Delaunay(ground_pts[:, :2]).simplices.astype(np.int64))
+                except Exception:
+                    ground_tin = None
+            if ground_tin is not None:
+                z_out = np.asarray(ground_tin.z_at(xy[:, 0], xy[:, 1]), dtype=float)
+        miss = ~np.isfinite(z_out)
+        if miss.any() and len(ground_pts) > 0:
+            if ground_tree is None:
+                ground_tree = cKDTree(ground_pts[:, :2])
+            _, nn_idx = ground_tree.query(xy[miss], k=1)
+            z_out[miss] = ground_pts[np.asarray(nn_idx, dtype=int), 2]
+        return z_out
+
     # --- breaklines
+    # Phase 2 (§2.2): 2D polylines / vertices sitting at z == 0 (or NaN) are treated as
+    # elevation-less: they still break the TIN, taking elevations from underlying survey
+    # points or draping onto the ground surface rather than cutting 0.00 cliffs.
     segs: list[tuple[int, int]] = []
     nbl = 0
     for bl in breaklines:
-        b = np.asarray(bl, float).reshape(-1, 3 if np.ndim(bl) > 1 and np.shape(bl)[1] >= 3 else 2)
-        if b.shape[1] == 2:
-            b = np.column_stack([b, np.full(len(b), np.nan)])
-        b = _fill_nan_z(b)
-        if b is None:
-            rep.warnings.append("A breakline without any elevations was skipped.")
+        b_in = np.asarray(bl, float).reshape(-1, 3 if np.ndim(bl) > 1 and np.shape(bl)[1] >= 3 else 2)
+        if len(b_in) < 2:
             continue
-        idx = [V.add(x, y, z, prefer=True) for x, y, z in b]
+        if b_in.shape[1] == 2:
+            b_in = np.column_stack([b_in, np.full(len(b_in), np.nan)])
+        else:
+            b_in = b_in[:, :3].copy()
+
+        orig_z = b_in[:, 2].copy()
+        has_own_z = np.isfinite(orig_z) & (np.abs(orig_z) > 1e-12)
+        for vi in range(len(b_in)):
+            if not has_own_z[vi]:
+                k = V.key(float(b_in[vi, 0]), float(b_in[vi, 1]))
+                existing = V.map.get(k)
+                if existing is not None and math.isfinite(V.z[existing]):
+                    b_in[vi, 2] = V.z[existing]
+                else:
+                    b_in[vi, 2] = np.nan
+
+        b = _fill_nan_z(b_in)
+        if b is None:
+            draped_z = _drape_xy(b_in[:, :2])
+            if not np.isfinite(draped_z).all():
+                rep.warnings.append("A breakline without any elevations was skipped.")
+                continue
+            b = np.column_stack([b_in[:, :2], draped_z])
+
+        idx = [
+            V.add(float(x), float(y), float(z), prefer=bool(own))
+            for (x, y, z), own in zip(b, has_own_z)
+        ]
         nbl += len(idx)
         for i, j in zip(idx[:-1], idx[1:]):
             if i != j:
@@ -775,7 +824,7 @@ def _split_crossings(segs, V: _Verts, tol, rep: BuildReport):
 # ============================================================================ project integration
 def gather_surface_inputs(project, params: dict):
     """Collect (points xyz, breaklines, boundaries, holes) for a surface definition."""
-    from .featurecodes import parse_description
+    from .featurecodes import default_codes, parse_description
     ids, xyz = project.point_arrays()
     mask = np.isfinite(xyz[:, 2]) if len(ids) else np.zeros(0, bool)
     # A group that is switched off does not feed a surface either: a fence line the drawing is
@@ -785,6 +834,7 @@ def gather_surface_inputs(project, params: dict):
     excl = set(params.get("exclude_layers") or [])
     sel = params.get("point_ids")
     ground_only = params.get("ground_only", True)
+    code_table = project.codes if len(project.codes) else default_codes()
     for k, pid in enumerate(ids):
         if not mask[k]:
             continue
@@ -798,9 +848,9 @@ def gather_surface_inputs(project, params: dict):
         elif p.layer in excl:
             mask[k] = False
         elif ground_only:
-            fc = project.codes.get(parse_description(
+            fc = code_table.get(parse_description(
                 p.desc, commands=project.settings.get("f2f_commands"),
-                known_codes=project.codes.codes).code)
+                known_codes=code_table.codes).code)
             if fc is not None and not fc.ground:
                 mask[k] = False
     pts = xyz[mask]
@@ -810,14 +860,24 @@ def gather_surface_inputs(project, params: dict):
     use_kind = params.get("use_breakline_kind", True)
     breaks = []
     for e in project.polylines():
-        if e.id in hidden:
+        if e.id in hidden or len(e.verts) < 2:
             continue
         if (use_kind and e.kind == "breakline") or e.layer in bl_layers or e.id in bl_ids:
-            if np.isfinite(e.verts[:, 2]).any():
-                v = G.flatten_polyline(e.verts, e.bulges, e.closed, max_dev=0.05)
-                if e.closed:
-                    v = np.vstack([v, v[:1]])
-                breaks.append(v)
+            verts = np.asarray(e.verts, dtype=float).copy()
+            raw_pids = (e.attrs or {}).get("point_ids")
+            if isinstance(raw_pids, (list, tuple)) and len(raw_pids) == len(verts):
+                for vi, pid in enumerate(raw_pids):
+                    if not (math.isfinite(verts[vi, 2]) and abs(float(verts[vi, 2])) > 1e-12):
+                        try:
+                            pt = project.points.get(int(pid)) if pid is not None else None
+                        except (TypeError, ValueError):
+                            pt = None
+                        if pt is not None and math.isfinite(pt.z) and abs(float(pt.z)) > 1e-12:
+                            verts[vi, 2] = float(pt.z)
+            v = G.flatten_polyline(verts, e.bulges, e.closed, max_dev=0.05)
+            if e.closed and len(v) >= 2:
+                v = np.vstack([v, v[:1]])
+            breaks.append(v)
     bounds = [project.entities[i].verts for i in params.get("boundary_ids", [])
               if i in project.entities and i not in hidden]
     holes = [project.entities[i].verts for i in params.get("hole_ids", [])

@@ -64,6 +64,7 @@ def test_standard_benchmark_includes_qa_and_line_sequence_probes():
         "Spatial index build (cold)",
         "Point QA checks",
         "Fieldwork line-sequence checks",
+        "Breakline crossing & length QA",
     ]
 
 

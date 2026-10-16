@@ -4,10 +4,12 @@ from __future__ import annotations
 import math
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QHBoxLayout, QHeaderView,
-                               QLabel, QPushButton, QTableWidget, QTableWidgetItem,
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QDoubleSpinBox, QHBoxLayout,
+                               QHeaderView, QLabel, QPushButton, QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
 
+from ..core.crossings import (GeometryCheckReport, GeometryIssue,
+                              default_max_segment_length, run_geometry_checks)
 from ..core.geometry_segments import Segment, build_segments, segment_point_rows
 from ..core.model import Polyline
 
@@ -21,6 +23,8 @@ class GeometryDock(QWidget):
         super().__init__(parent)
         self.state = state
         self._segments: list[Segment] = []
+        self._issues: list[GeometryIssue] = []
+        self.last_check_report: GeometryCheckReport | None = None
         self._updating = False
 
         lay = QVBoxLayout(self)
@@ -63,6 +67,39 @@ class GeometryDock(QWidget):
         self.points.itemChanged.connect(self._point_changed)
         lay.addWidget(self.points, 1)
 
+        qa_bar = QHBoxLayout()
+        qa_bar.addWidget(QLabel("Geometry QA — Max len:"))
+        self.max_length_spin = QDoubleSpinBox()
+        self.max_length_spin.setRange(1.0, 100000.0)
+        self.max_length_spin.setDecimals(1)
+        self.max_length_spin.setSingleStep(25.0)
+        self.max_length_spin.setValue(default_max_segment_length(self.state.project))
+        self.max_length_spin.setToolTip("Flag segment spans longer than this threshold (default 300 ft / 100 m).")
+        self.max_length_spin.valueChanged.connect(self._max_length_changed)
+        qa_bar.addWidget(self.max_length_spin)
+        self.check_btn = QPushButton("Check geometry")
+        self.check_btn.setToolTip("Detect all breakline crossings, Z-conflicts, long spans, and ST/END/PC/PT issues.")
+        self.check_btn.clicked.connect(self.run_checks)
+        qa_bar.addWidget(self.check_btn)
+        self.apply_fix_btn = QPushButton("Apply fix")
+        self.apply_fix_btn.setEnabled(False)
+        self.apply_fix_btn.setToolTip("Apply the proposed point description repair for the selected command finding.")
+        self.apply_fix_btn.clicked.connect(self.apply_selected_fix)
+        qa_bar.addWidget(self.apply_fix_btn)
+        qa_bar.addStretch(1)
+        lay.addLayout(qa_bar)
+
+        self.findings = QTableWidget(0, 5)
+        self.findings.setHorizontalHeaderLabels(["Issue", "Segments", "Points", "Detail", "Proposed Fix"])
+        self.findings.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.findings.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.findings.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.findings.verticalHeader().setVisible(False)
+        self.findings.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.findings.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.findings.itemSelectionChanged.connect(self._finding_selected)
+        lay.addWidget(self.findings, 1)
+
         self.status = QLabel("Select a segment to inspect its field points.")
         self.status.setWordWrap(True)
         lay.addWidget(self.status)
@@ -103,9 +140,98 @@ class GeometryDock(QWidget):
                         break
             if self.segments.currentRow() < 0 and self._segments:
                 self.segments.selectRow(0)
+            self.max_length_spin.blockSignals(True)
+            self.max_length_spin.setValue(default_max_segment_length(self.state.project))
+            self.max_length_spin.blockSignals(False)
             self._populate_points()
+            if self.last_check_report is not None:
+                self._run_checks_internal()
         finally:
             self._updating = False
+
+    def _max_length_changed(self, value: float):
+        if self._updating:
+            return
+        if self.state.project.settings is None:
+            self.state.project.settings = {}
+        self.state.project.settings["max_segment_length"] = float(value)
+        if self.last_check_report is not None:
+            self.run_checks()
+
+    def _run_checks_internal(self) -> GeometryCheckReport:
+        report = run_geometry_checks(
+            self.state.project,
+            segments=self._segments,
+            max_length=float(self.max_length_spin.value()),
+        )
+        self.last_check_report = report
+        self._issues = list(report.issues)
+        self._populate_findings()
+        return report
+
+    def run_checks(self) -> GeometryCheckReport:
+        self._updating = True
+        try:
+            report = self._run_checks_internal()
+        finally:
+            self._updating = False
+        n_cross = len(report.crossings)
+        n_zconf = sum(1 for c in report.crossings if c.has_z_conflict)
+        n_long = len(report.long_segments)
+        n_cmd = len(report.command_issues)
+        self.status.setText(
+            f"Geometry QA ({report.breakline_count} breakline(s), max {report.max_segment_length:.0f}): "
+            f"{n_cross} crossing(s) ({n_zconf} Z-conflict), {n_long} long span(s), {n_cmd} command issue(s)."
+        )
+        return report
+
+    def _populate_findings(self):
+        self.findings.setRowCount(len(self._issues))
+        for row, issue in enumerate(self._issues):
+            seg_text = ", ".join(issue.seg_ids) if issue.seg_ids else "—"
+            pt_text = ", ".join(issue.point_numbers) if issue.point_numbers else "—"
+            values = [issue.title, seg_text, pt_text, issue.detail, issue.proposal]
+            for col, value in enumerate(values):
+                self.findings.setItem(row, col, self._item(value, editable=False, data=row if col == 0 else None))
+        self.apply_fix_btn.setEnabled(bool(self.current_issue and self.current_issue.proposal and self.current_issue.target_point_id is not None))
+
+    @property
+    def current_issue(self) -> GeometryIssue | None:
+        row = self.findings.currentRow()
+        return self._issues[row] if 0 <= row < len(self._issues) else None
+
+    def _finding_selected(self):
+        issue = self.current_issue
+        self.apply_fix_btn.setEnabled(bool(issue and issue.proposal and issue.target_point_id is not None))
+        if self._updating or issue is None:
+            return
+        self._updating = True
+        try:
+            if issue.entity_ids:
+                primary_eid = issue.entity_ids[0]
+                for row, seg in enumerate(self._segments):
+                    if seg.entity_id == primary_eid:
+                        self.segments.selectRow(row)
+                        self._populate_points()
+                        break
+            self.state.select(points=issue.point_ids, entities=issue.entity_ids, mode="replace")
+            self.status.setText(issue.detail)
+        finally:
+            self._updating = False
+
+    def apply_selected_fix(self) -> bool:
+        issue = self.current_issue
+        if issue is None or not issue.proposal or issue.target_point_id is None:
+            return False
+        point = self.state.project.points.get(issue.target_point_id)
+        if point is None:
+            return False
+        with self.state.edit(f"Fix {issue.title} on point {point.number}"):
+            point.desc = issue.proposal
+            self.state.project.process_linework(order="number")
+        self.run_checks()
+        self.status.setText(f"Applied fix on point {point.number}: '{issue.proposal}'.")
+        return True
 
     @property
     def current_segment(self) -> Segment | None:

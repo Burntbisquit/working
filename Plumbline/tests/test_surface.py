@@ -273,3 +273,19 @@ def test_build_tin_documents_grid_snap_dedup():
     _, rep = build_tin(pts, dup_tol=tol)
     # the two near-duplicates merge (1 fewer point), nothing else does
     assert rep.n_duplicates == 1, rep.n_duplicates
+
+
+def test_z_zero_breakline_drapes_onto_point_elevations_without_cutting_zero_cliff():
+    """2D breaklines sitting at z=0 must take point/surface elevations instead of cutting 0.00 cliffs."""
+    pts = grid_points(n=11, size=100.0, fn=lambda x, y: 500.0 + 0.1 * x + 0.05 * y)
+    # 1) Breakline whose endpoints sit on existing grid points (10,10) and (90,90) but with z=0.0
+    bl_on_pts = np.array([[10.0, 10.0, 0.0], [50.0, 50.0, 0.0], [90.0, 90.0, 0.0]])
+    # 2) Free 2D breakline at z=0.0 whose vertices do not coincide with exact grid points
+    bl_free_2d = np.array([[13.3, 27.7, 0.0], [77.1, 63.4, 0.0]])
+    tin, rep = build_tin(pts, breaklines=[bl_on_pts, bl_free_2d])
+    assert rep.n_unenforced == 0
+    # No vertex in the TIN may have been pulled down to z=0.0
+    assert float(tin.pts[:, 2].min()) >= 500.0 - 1e-6
+    assert float(tin.z_at(50.0, 50.0)) == pytest.approx(500.0 + 5.0 + 2.5, abs=1e-6)
+    assert float(tin.z_at(45.2, 45.55)) == pytest.approx(500.0 + 0.1 * 45.2 + 0.05 * 45.55, abs=1e-4)
+

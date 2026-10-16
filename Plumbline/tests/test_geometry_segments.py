@@ -102,3 +102,48 @@ def test_segments_resolve_legacy_point_number_links_when_point_ids_are_absent():
     assert segments[0].point_numbers == ("10", "20")
 
 
+def test_geometry_dock_runs_checks_and_applies_command_fix():
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+    from plumbline.core.featurecodes import default_codes
+    from plumbline.ui.app_state import AppState
+    from plumbline.ui.geometry_dock import GeometryDock
+
+    _app = QApplication.instance() or QApplication([])
+    project = Project("Dock QA")
+    project.codes = default_codes()
+    p1 = project.add_point(0, 0, 100.0, number="1", desc="EP1")
+    p2 = project.add_point(400, 0, 100.0, number="2", desc="EP1 END")
+    project.add_polyline(
+        [[p1.x, p1.y, p1.z], [p2.x, p2.y, p2.z]],
+        "ROAD-PAVEMENT",
+        attrs={"code": "EP", "string": "1", "point_ids": [p1.id, p2.id]},
+        derived="linework",
+        kind="breakline",
+    )
+    project.add_polyline(
+        [[200.0, -25.0, 105.0], [200.0, 25.0, 105.0]],
+        "ROAD-SIDEWALK",
+        attrs={"code": "SW", "string": "1"},
+        kind="breakline",
+    )
+
+    state = AppState(project)
+    dock = GeometryDock(state)
+    report = dock.run_checks()
+    assert len(report.crossings) == 1
+    assert len(report.long_segments) == 1
+    assert dock.findings.rowCount() >= 3
+
+    # Select the command-sequence finding with a repair proposal and apply the fix
+    cmd_row = next(
+        idx for idx, issue in enumerate(dock._issues)
+        if issue.category == "command-sequence" and issue.proposal
+    )
+    dock.findings.selectRow(cmd_row)
+    assert dock.apply_fix_btn.isEnabled()
+    assert dock.apply_selected_fix()
+    assert "ST" in project.points[p1.id].desc.upper()
+
+
+
