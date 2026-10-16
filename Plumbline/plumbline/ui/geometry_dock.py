@@ -4,20 +4,67 @@ from __future__ import annotations
 import math
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QDoubleSpinBox, QHBoxLayout,
-                               QHeaderView, QLabel, QPushButton, QTableWidget, QTableWidgetItem,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
+                               QDialogButtonBox, QDoubleSpinBox, QFormLayout, QHBoxLayout,
+                               QHeaderView, QLabel, QLineEdit, QPushButton, QTableWidget,
+                               QTableWidgetItem, QVBoxLayout, QWidget)
 
 from ..core.crossings import (GeometryCheckReport, GeometryIssue,
                               default_max_segment_length, run_geometry_checks)
 from ..core.geometry_segments import Segment, build_segments, segment_point_rows
-from ..core.geometry_tools import (ShrinkCommandPreview, add_polyline_node,
+from ..core.geometry_tools import (AutoNudgeResult, ShrinkCommandPreview,
+                                   SquareShapeResult, add_polyline_node,
                                    apply_connect_segments, apply_shrink_line_commands,
-                                   cogo_points_from_lines, flip_past, inject_survey_point,
-                                   join_lines_average, move_line_end_to_end, nudge_point,
+                                   auto_nudge_crossings, cogo_points_from_lines,
+                                   flip_past, inject_survey_point, join_lines_average,
+                                   move_line_end_to_end, nudge_point,
                                    preview_connect_segments, preview_shrink_line_commands,
-                                   untwist_polyline)
+                                   square_shape, untwist_polyline)
 from ..core.model import Polyline
+
+
+class SquareShapeDialog(QDialog):
+    """Dialog for squaring a building/structure polyline to 90° corners (§3.6)."""
+
+    def __init__(self, parent=None, *, initial_mode: str = "average", locked_text: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Square Shape (90° Corners)")
+        form = QFormLayout(self)
+        self.mode_combo = QComboBox(self)
+        self.mode_combo.addItem("Average (mean orthogonal dimensions)", "average")
+        self.mode_combo.addItem("Small (hold smaller parallel sides)", "small")
+        self.mode_combo.addItem("Large (hold larger parallel sides)", "large")
+        self.mode_combo.addItem("Lock points (keep anchor vertices fixed)", "lock_points")
+        idx = self.mode_combo.findData(initial_mode)
+        if idx >= 0:
+            self.mode_combo.setCurrentIndex(idx)
+        form.addRow("Sizing mode:", self.mode_combo)
+
+        self.locked_edit = QLineEdit(locked_text, self)
+        self.locked_edit.setPlaceholderText("0-based vertex indices, e.g. 0, 2")
+        form.addRow("Locked vertices:", self.locked_edit)
+
+        self.propagate_chk = QCheckBox("Update linked survey point coordinates", self)
+        self.propagate_chk.setChecked(True)
+        form.addRow("", self.propagate_chk)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    @property
+    def selected_mode(self) -> str:
+        return str(self.mode_combo.currentData() or "average")
+
+    @property
+    def locked_indices(self) -> list[int]:
+        out: list[int] = []
+        for tok in self.locked_edit.text().replace(";", ",").split(","):
+            tok = tok.strip()
+            if tok.isdigit():
+                out.append(int(tok))
+        return out
 
 
 class GeometryDock(QWidget):
@@ -103,6 +150,16 @@ class GeometryDock(QWidget):
         self.shrink_btn.setToolTip("Repair missing ST/END commands and compact jumped-to line suffixes.")
         self.shrink_btn.clicked.connect(self.shrink_line_commands)
         tools_bar.addWidget(self.shrink_btn)
+
+        self.auto_nudge_btn = QPushButton("Auto-nudge")
+        self.auto_nudge_btn.setToolTip("Iteratively resolve breakline crossings using untwist, flip-past, and micro-nudge.")
+        self.auto_nudge_btn.clicked.connect(self.auto_nudge_selected)
+        tools_bar.addWidget(self.auto_nudge_btn)
+
+        self.square_btn = QPushButton("Square shape...")
+        self.square_btn.setToolTip("Snap building/structure edges to 90° angles (average / small / large / lock points).")
+        self.square_btn.clicked.connect(self.square_shape_selected)
+        tools_bar.addWidget(self.square_btn)
         tools_bar.addStretch(1)
         lay.addLayout(tools_bar)
 
@@ -471,4 +528,54 @@ class GeometryDock(QWidget):
         self.status.setText(f"Moved endpoint by ({res['dx']:.3f}, {res['dy']:.3f}).")
         self.refresh(keep_selection=True)
         return res
+
+    # ------------------------------------------------------------------ Phase 4 solvers
+    def auto_nudge_selected(self, *, max_displacement: float = 5.0) -> AutoNudgeResult:
+        with self.state.edit("Auto-nudge breakline crossings"):
+            res = auto_nudge_crossings(self.state.project, max_displacement=max_displacement)
+        self.refresh(keep_selection=True)
+        self.run_checks()
+        self.status.setText(
+            f"Auto-nudge removed {res.crossings_removed}/{res.initial_crossings} crossing(s) "
+            f"({res.points_moved} moved, total disp {res.total_displacement:.3f}, {res.remaining_crossings} residue)."
+        )
+        return res
+
+    def square_shape_selected(
+        self,
+        *,
+        mode: str | None = None,
+        locked_indices: list[int] | None = None,
+        propagate_to_points: bool = True,
+    ) -> SquareShapeResult | None:
+        segment = self.current_segment
+        if segment is None:
+            return None
+        if mode is None:
+            cur_pt = self.points.currentRow()
+            default_locked = str(cur_pt) if cur_pt >= 0 else ""
+            dlg = SquareShapeDialog(self, locked_text=default_locked)
+            if dlg.exec() != QDialog.Accepted:
+                return None
+            mode = dlg.selected_mode
+            locked_indices = dlg.locked_indices
+            propagate_to_points = dlg.propagate_chk.isChecked()
+        try:
+            with self.state.edit(f"Square shape {segment.seg_id} ({mode})"):
+                res = square_shape(
+                    self.state.project,
+                    segment.entity_id,
+                    mode=mode,
+                    locked_indices=locked_indices or (),
+                    propagate_to_points=propagate_to_points,
+                )
+            self.refresh(keep_selection=True)
+            self.status.setText(
+                f"Squared {segment.seg_id} ({res.mode}, azimuth {res.orientation_deg:.2f}°, max disp {res.max_displacement:.3f})."
+            )
+            return res
+        except ValueError as exc:
+            self.status.setText(str(exc))
+            return None
+
 

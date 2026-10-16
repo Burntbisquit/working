@@ -12,6 +12,7 @@ from plumbline.core.geometry_tools import (
     add_polyline_node,
     apply_connect_segments,
     apply_shrink_line_commands,
+    auto_nudge_crossings,
     cogo_points_from_lines,
     curve_segment,
     flip_past,
@@ -23,6 +24,7 @@ from plumbline.core.geometry_tools import (
     preview_connect_segments,
     preview_shrink_line_commands,
     recurve_segment,
+    square_shape,
     straighten_segment,
     sweep_code_family_occurrences,
     untwist_polyline,
@@ -320,3 +322,138 @@ def test_shrink_line_commands_repairs_missing_st_end_and_compacts_jumped_suffixe
 
     segs = build_segments(pr)
     assert [s.seg_id for s in segs] == ["SW1-01", "SW1-02", "SW1-03", "SW1-04", "SW2-01"]
+
+
+def test_auto_nudge_crossings_resolves_bowtie_and_near_crossing_and_reports_residue():
+    """Phase 4 (§3.6): Auto-nudge resolves fixable crossings and reports unfixable residue."""
+    pr = Project("Auto Nudge")
+    # 1) Self-crossing bowtie around (0..20, 0..20)
+    pr.add_polyline(
+        [[0.0, 0.0, 100.0], [20.0, 20.0, 100.0], [20.0, 0.0, 100.0], [0.0, 20.0, 100.0]],
+        layer="BRK",
+        kind="breakline",
+        attrs={"code": "BOW", "string": "1"},
+    )
+    # 2) Two breaklines near y=100 where one endpoint pokes 0.4 ft across the other
+    p1 = pr.add_point(100.0, 100.0, 50.0, number="10", desc="EP1 ST")
+    p2 = pr.add_point(120.0, 100.0, 50.0, number="11", desc="EP1 END")
+    p3 = pr.add_point(110.0, 99.6, 52.0, number="12", desc="SW1 ST")
+    p4 = pr.add_point(110.0, 115.0, 52.0, number="13", desc="SW1 END")
+    pr.add_polyline(
+        [[p1.x, p1.y, p1.z], [p2.x, p2.y, p2.z]],
+        layer="ROAD",
+        kind="breakline",
+        attrs={"code": "EP", "string": "1", "point_ids": [p1.id, p2.id]},
+        derived="linework",
+    )
+    pr.add_polyline(
+        [[p3.x, p3.y, p3.z], [p4.x, p4.y, p4.z]],
+        layer="WALK",
+        kind="breakline",
+        attrs={"code": "SW", "string": "1", "point_ids": [p3.id, p4.id]},
+        derived="linework",
+    )
+    # 3) Deep X-crossing requiring >25 ft move (beyond max_displacement=2.0) -> stays in residue
+    pr.add_polyline(
+        [[500.0, 500.0, 80.0], [560.0, 560.0, 80.0]],
+        layer="BRK",
+        kind="breakline",
+        attrs={"code": "DEEP", "string": "1"},
+    )
+    pr.add_polyline(
+        [[500.0, 560.0, 85.0], [560.0, 500.0, 85.0]],
+        layer="BRK",
+        kind="breakline",
+        attrs={"code": "DEEP", "string": "2"},
+    )
+
+    res = auto_nudge_crossings(pr, max_displacement=2.0)
+    assert res.initial_crossings == 3
+    assert res.crossings_removed == 2
+    assert res.remaining_crossings == 1
+    assert len(res.residue) == 1
+    assert {res.residue[0].seg_a_id, res.residue[0].seg_b_id} == {"DEEP1-01", "DEEP2-01"}
+    # Point numbers never changed
+    assert [p1.number, p2.number, p3.number, p4.number] == ["10", "11", "12", "13"]
+
+
+def _corner_angles_deg(verts: np.ndarray) -> list[float]:
+    m = len(verts)
+    angles: list[float] = []
+    for i in range(m):
+        p_prev = verts[(i - 1) % m, :2]
+        p_cur = verts[i, :2]
+        p_next = verts[(i + 1) % m, :2]
+        v1 = p_prev - p_cur
+        v2 = p_next - p_cur
+        cos_a = float(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
+        angles.append(math.degrees(math.acos(max(-1.0, min(1.0, cos_a)))))
+    return angles
+
+
+def test_square_shape_snaps_tilted_building_to_90_degrees_in_all_four_modes():
+    """Phase 4 (§3.6): Square shape snaps corners to 90° under average, small, large, and lock_points."""
+    theta = math.radians(30.0)
+    u = np.array([math.cos(theta), math.sin(theta)])
+    v = np.array([-math.sin(theta), math.cos(theta)])
+
+    def make_building_project():
+        pr = Project("Square Shape")
+        # Slightly out-of-square rectangle in (u, v) frame:
+        # bottom edge ~20.6, top edge ~19.4; left edge ~10.4, right edge ~9.6
+        local_uv = [
+            (0.0, 0.0),
+            (20.6, -0.2),
+            (20.0, 9.4),
+            (0.6, 10.4),
+        ]
+        pts = []
+        for idx, (ui, vi) in enumerate(local_uv, start=1):
+            xy = 100.0 + ui * u + vi * v
+            pts.append(pr.add_point(float(xy[0]), float(xy[1]), 50.0, number=str(idx), desc="BLDG"))
+        line = pr.add_polyline(
+            [[p.x, p.y, p.z] for p in pts],
+            closed=True,
+            layer="STRUCT-BLDG",
+            attrs={"code": "BLDG", "string": "1", "point_ids": [p.id for p in pts]},
+        )
+        return pr, line, pts
+
+    # 1) Average mode
+    pr_avg, line_avg, _pts_avg = make_building_project()
+    res_avg = square_shape(pr_avg, line_avg.id, mode="average")
+    verts_avg = pr_avg.entities[line_avg.id].verts
+    assert _corner_angles_deg(verts_avg) == pytest.approx([90.0, 90.0, 90.0, 90.0], abs=1e-4)
+    avg_w = float(np.linalg.norm(verts_avg[1, :2] - verts_avg[0, :2]))
+    avg_h = float(np.linalg.norm(verts_avg[2, :2] - verts_avg[1, :2]))
+
+    # 2) Small mode holds smaller dimensions
+    pr_sm, line_sm, _pts_sm = make_building_project()
+    square_shape(pr_sm, line_sm.id, mode="small")
+    verts_sm = pr_sm.entities[line_sm.id].verts
+    assert _corner_angles_deg(verts_sm) == pytest.approx([90.0, 90.0, 90.0, 90.0], abs=1e-4)
+    sm_w = float(np.linalg.norm(verts_sm[1, :2] - verts_sm[0, :2]))
+    sm_h = float(np.linalg.norm(verts_sm[2, :2] - verts_sm[1, :2]))
+
+    # 3) Large mode holds larger dimensions
+    pr_lg, line_lg, _pts_lg = make_building_project()
+    square_shape(pr_lg, line_lg.id, mode="large")
+    verts_lg = pr_lg.entities[line_lg.id].verts
+    assert _corner_angles_deg(verts_lg) == pytest.approx([90.0, 90.0, 90.0, 90.0], abs=1e-4)
+    lg_w = float(np.linalg.norm(verts_lg[1, :2] - verts_lg[0, :2]))
+    lg_h = float(np.linalg.norm(verts_lg[2, :2] - verts_lg[1, :2]))
+
+    assert sm_w < avg_w < lg_w
+    assert sm_h < avg_h < lg_h
+    assert res_avg.orientation_deg == pytest.approx(30.0, abs=1.5)
+
+    # 4) Lock points mode keeps vertex 0 at its exact original coordinate
+    pr_lk, line_lk, pts_lk = make_building_project()
+    orig_p0 = (pts_lk[0].x, pts_lk[0].y)
+    square_shape(pr_lk, line_lk.id, mode="lock_points", locked_indices=[0])
+    verts_lk = pr_lk.entities[line_lk.id].verts
+    assert _corner_angles_deg(verts_lk) == pytest.approx([90.0, 90.0, 90.0, 90.0], abs=1e-4)
+    assert (pts_lk[0].x, pts_lk[0].y) == pytest.approx(orig_p0, abs=1e-9)
+    assert (verts_lk[0, 0], verts_lk[0, 1]) == pytest.approx(orig_p0, abs=1e-9)
+    assert [p.number for p in pts_lk] == ["1", "2", "3", "4"]
+

@@ -1529,3 +1529,555 @@ def apply_shrink_line_commands(
     elif preview.changes:
         project.touch()
     return preview
+
+
+# =============================================================================
+# 11. Auto-nudge crossing solver (Phase 4 — §3.6 & §6)
+# =============================================================================
+@dataclass
+class AutoNudgeStep:
+    """One accepted crossing-resolution move chosen by :func:`auto_nudge_crossings`."""
+
+    method: str                        # "untwist" | "flip-past" | "micro-nudge"
+    description: str
+    entity_ids: list[int]
+    point_ids: list[int]
+    crossings_before: int
+    crossings_after: int
+    points_moved: int
+    displacement: float
+
+
+@dataclass
+class AutoNudgeResult:
+    """Summary and unfixable residue from :func:`auto_nudge_crossings`."""
+
+    initial_crossings: int
+    remaining_crossings: int
+    crossings_removed: int
+    points_moved: int
+    total_displacement: float
+    steps: list[AutoNudgeStep] = field(default_factory=list)
+    residue: list = field(default_factory=list)  # list[CrossingFinding]
+
+    @property
+    def resolved_all(self) -> bool:
+        return self.remaining_crossings == 0
+
+
+def _capture_entities_and_points(project: "Project", entity_ids: Sequence[int]) -> dict:
+    ent_snap = {}
+    pt_ids: set[int] = set()
+    for eid in set(int(x) for x in entity_ids):
+        ent = project.entities.get(eid)
+        if isinstance(ent, Polyline):
+            ent_snap[eid] = (
+                ent.verts.copy(),
+                None if ent.bulges is None else ent.bulges.copy(),
+                copy.deepcopy(ent.attrs),
+                str(ent.derived or ""),
+            )
+            for pid in (ent.attrs or {}).get("point_ids") or ():
+                if pid is not None:
+                    try:
+                        pt_ids.add(int(pid))
+                    except (TypeError, ValueError):
+                        pass
+    pt_snap = {
+        pid: (float(project.points[pid].x), float(project.points[pid].y), float(project.points[pid].z))
+        for pid in pt_ids
+        if pid in project.points
+    }
+    return {"entities": ent_snap, "points": pt_snap}
+
+
+def _restore_entities_and_points(project: "Project", snap: dict) -> None:
+    for eid, (verts, bulges, attrs, derived) in snap["entities"].items():
+        ent = project.entities.get(eid)
+        if isinstance(ent, Polyline):
+            ent.verts = verts.copy()
+            ent.bulges = None if bulges is None else bulges.copy()
+            ent.attrs = copy.deepcopy(attrs)
+            ent.derived = derived
+    for pid, (x, y, z) in snap["points"].items():
+        pt = project.points.get(pid)
+        if pt is not None:
+            pt.x, pt.y, pt.z = x, y, z
+            _sync_point_to_polylines(project, pid)
+
+
+def _move_vertex_xy(project: "Project", entity: Polyline, v_idx: int, nx: float, ny: float) -> list[int]:
+    pids = _ensure_point_ids_attr(project, entity)
+    pid = pids[v_idx] if v_idx < len(pids) else None
+    entity.verts[v_idx, 0] = float(nx)
+    entity.verts[v_idx, 1] = float(ny)
+    if pid is not None and pid in project.points:
+        pt = project.points[pid]
+        pt.x = float(nx)
+        pt.y = float(ny)
+        _sync_point_to_polylines(project, pid)
+        return [int(pid)]
+    _mark_manual_override_if_derived(project, entity, pids)
+    return []
+
+
+def auto_nudge_crossings(
+    project: "Project",
+    *,
+    max_iterations: int = 25,
+    max_displacement: float = 5.0,
+    step_sizes: Sequence[float] = (0.05, 0.15, 0.35, 0.75, 1.5, 3.0, 5.0),
+) -> AutoNudgeResult:
+    """Iteratively resolve breakline crossings using untwist, flip-past, and micro-nudge (§3.6).
+
+    Candidates are scored lexicographically by:
+    1. **Most crossings removed** (``crossings_before - crossings_after``)
+    2. **Fewest points/vertices moved**
+    3. **Least total 2D displacement**
+
+    Iterates until zero crossings remain or no candidate within ``max_displacement``
+    can reduce the crossing count; any remaining crossings are returned in ``residue``.
+    Point numbers are never changed.
+    """
+    from .crossings import detect_breakline_crossings
+
+    initial_list = detect_breakline_crossings(project)
+    initial_count = len(initial_list)
+    if initial_count == 0:
+        return AutoNudgeResult(
+            initial_crossings=0,
+            remaining_crossings=0,
+            crossings_removed=0,
+            points_moved=0,
+            total_displacement=0.0,
+        )
+
+    steps: list[AutoNudgeStep] = []
+    moved_point_tracker: set[int] = set()
+    moved_vertex_tracker: set[tuple[int, int]] = set()
+    total_disp = 0.0
+    allowed_steps = [float(s) for s in step_sizes if 0.0 < float(s) <= float(max_displacement)]
+    if float(max_displacement) not in allowed_steps:
+        allowed_steps.append(float(max_displacement))
+    allowed_steps.sort()
+
+    for _iteration in range(max(1, int(max_iterations))):
+        cur_crossings = detect_breakline_crossings(project)
+        cur_count = len(cur_crossings)
+        if cur_count == 0:
+            break
+
+        # Prioritise self-crossings first, then two-line crossings
+        ordered_targets = sorted(cur_crossings, key=lambda c: (0 if c.is_self_crossing else 1, c.seg_a_id, c.seg_b_id))
+        accepted_step: AutoNudgeStep | None = None
+
+        for target in ordered_targets:
+            eids = [target.entity_a_id] if target.is_self_crossing else [target.entity_a_id, target.entity_b_id]
+            base_snap = _capture_entities_and_points(project, eids)
+            best_score: tuple[int, int, float] | None = None
+            best_after_snap: dict | None = None
+            best_meta: tuple[str, str, list[int], int, float] | None = None
+
+            def evaluate_trial(method: str, desc: str, moved_pids: list[int], n_moved: int, disp: float):
+                nonlocal best_score, best_after_snap, best_meta
+                if disp > float(max_displacement) + 1e-6 and method != "untwist":
+                    return
+                after_crossings = detect_breakline_crossings(project)
+                after_count = len(after_crossings)
+                removed = cur_count - after_count
+                if removed <= 0:
+                    return
+                score = (-removed, int(n_moved), round(float(disp), 6))
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_after_snap = _capture_entities_and_points(project, eids)
+                    best_meta = (method, desc, list(moved_pids), after_count, float(disp))
+
+            # Candidate 1: Untwist bowtie (for self-crossings)
+            if target.is_self_crossing:
+                for swap_pts in (False, True):
+                    _restore_entities_and_points(project, base_snap)
+                    try:
+                        res = untwist_polyline(
+                            project,
+                            target.entity_a_id,
+                            target.span_a,
+                            target.span_b,
+                            swap_point_coordinates=swap_pts,
+                        )
+                        rev_idx = res["reversed_indices"]
+                        evaluate_trial(
+                            "untwist",
+                            f"Untwist bowtie on {target.seg_a_id} (spans {target.span_a + 1} & {target.span_b + 1})",
+                            [],
+                            len(rev_idx),
+                            0.0,
+                        )
+                    except ValueError:
+                        pass
+
+            # Candidate 2: Flip-past interior vertex
+            ent_a = project.entities.get(target.entity_a_id)
+            ent_b = project.entities.get(target.entity_b_id)
+            if isinstance(ent_a, Polyline) and isinstance(ent_b, Polyline):
+                for ent_obj, span_idx, seg_label in (
+                    (ent_a, target.span_a, target.seg_a_id),
+                    (ent_b, target.span_b, target.seg_b_id),
+                ):
+                    n_v = len(ent_obj.verts)
+                    for vi in (span_idx, (span_idx + 1) % n_v):
+                        if not ent_obj.closed and vi in (0, n_v - 1):
+                            continue
+                        _restore_entities_and_points(project, base_snap)
+                        orig_xy = ent_obj.verts[vi, :2].copy()
+                        try:
+                            flip_past(project, ent_obj.id, [vi])
+                            new_xy = ent_obj.verts[vi, :2]
+                            disp = float(math.hypot(new_xy[0] - orig_xy[0], new_xy[1] - orig_xy[1]))
+                            pids = _ensure_point_ids_attr(project, ent_obj)
+                            mpid = [int(pids[vi])] if vi < len(pids) and pids[vi] is not None else []
+                            evaluate_trial(
+                                "flip-past",
+                                f"Flip vertex {vi + 1} on {seg_label}",
+                                mpid,
+                                1,
+                                disp,
+                            )
+                        except ValueError:
+                            pass
+
+            # Candidate 3: Per-point micro-nudge along crossing normal / endpoint clearance
+            _restore_entities_and_points(project, base_snap)
+            ent_a = project.entities.get(target.entity_a_id)
+            ent_b = project.entities.get(target.entity_b_id)
+            if isinstance(ent_a, Polyline) and isinstance(ent_b, Polyline):
+                na, nb = len(ent_a.verts), len(ent_b.verts)
+                ia0, ia1 = target.span_a, (target.span_a + 1) % na
+                ib0, ib1 = target.span_b, (target.span_b + 1) % nb
+
+                span_pairs = [
+                    (ent_a, target.seg_a_id, ia0, ia1, ent_b, ib0, ib1),
+                    (ent_b, target.seg_b_id, ib0, ib1, ent_a, ia0, ia1),
+                ]
+                for mover_ent, mover_label, m0, m1, other_ent, o0, o1 in span_pairs:
+                    q0 = other_ent.verts[o0, :2].copy()
+                    q1 = other_ent.verts[o1, :2].copy()
+                    odx, ody = float(q1[0] - q0[0]), float(q1[1] - q0[1])
+                    olen = math.hypot(odx, ody)
+                    if olen <= 1e-12:
+                        continue
+                    # Unit normal and unit tangent of the other crossing segment
+                    ux, uy = odx / olen, ody / olen
+                    nx, ny = -uy, ux
+
+                    for m_vi in (m0, m1):
+                        p_orig = mover_ent.verts[m_vi, :2].copy()
+                        # Signed perpendicular distance from p_orig to line q0 -> q1
+                        signed_d = (float(p_orig[0] - q0[0]) * nx) + (float(p_orig[1] - q0[1]) * ny)
+                        # Exact normal clearance distance to cross to the opposite side of q0->q1
+                        exact_clear = abs(signed_d) + 0.02
+                        cand_dists = sorted({d for d in (*allowed_steps, exact_clear) if 0.0 < d <= float(max_displacement)})
+
+                        # Directions to test: across normal (-sign(signed_d)), +normal, and past nearer endpoint of q0->q1
+                        dir_sign = -1.0 if signed_d >= 0.0 else 1.0
+                        dirs = [
+                            (dir_sign * nx, dir_sign * ny),
+                            (-dir_sign * nx, -dir_sign * ny),
+                            (-ux, -uy),
+                            (ux, uy),
+                        ]
+                        for d_step in cand_dists:
+                            for dx_u, dy_u in dirs:
+                                _restore_entities_and_points(project, base_snap)
+                                moved_pids = _move_vertex_xy(
+                                    project,
+                                    mover_ent,
+                                    m_vi,
+                                    float(p_orig[0] + d_step * dx_u),
+                                    float(p_orig[1] + d_step * dy_u),
+                                )
+                                evaluate_trial(
+                                    "micro-nudge",
+                                    f"Nudge vertex {m_vi + 1} on {mover_label} by {d_step:.3f}",
+                                    moved_pids,
+                                    1,
+                                    d_step,
+                                )
+
+            if best_after_snap is not None and best_meta is not None and best_score is not None:
+                _restore_entities_and_points(project, best_after_snap)
+                method, desc, moved_pids, after_count, disp = best_meta
+                n_moved = int(best_score[1])
+                for pid in moved_pids:
+                    moved_point_tracker.add(int(pid))
+                if not moved_pids:
+                    moved_vertex_tracker.add((target.entity_a_id, target.span_a))
+                total_disp += disp
+                accepted_step = AutoNudgeStep(
+                    method=method,
+                    description=desc,
+                    entity_ids=eids,
+                    point_ids=moved_pids,
+                    crossings_before=cur_count,
+                    crossings_after=after_count,
+                    points_moved=n_moved,
+                    displacement=disp,
+                )
+                steps.append(accepted_step)
+                break
+            else:
+                _restore_entities_and_points(project, base_snap)
+
+        if accepted_step is None:
+            break
+
+    if steps:
+        project.touch()
+    remaining = detect_breakline_crossings(project)
+    total_moved = len(moved_point_tracker) + len(moved_vertex_tracker)
+    return AutoNudgeResult(
+        initial_crossings=initial_count,
+        remaining_crossings=len(remaining),
+        crossings_removed=max(0, initial_count - len(remaining)),
+        points_moved=total_moved,
+        total_displacement=total_disp,
+        steps=steps,
+        residue=remaining,
+    )
+
+
+# =============================================================================
+# 12. Square-shape orthogonal solver (Phase 4 — §3.6 & §6)
+# =============================================================================
+SQUARE_SHAPE_MODES = ("average", "small", "large", "lock_points")
+
+
+@dataclass
+class SquareShapeResult:
+    """Result of squaring a building / structure polyline to 90° corners."""
+
+    entity_id: int
+    mode: str
+    orientation_deg: float             # dominant azimuth (degrees CCW from +X, mod 90)
+    old_verts: np.ndarray
+    new_verts: np.ndarray
+    max_displacement: float
+    locked_indices: list[int] = field(default_factory=list)
+    updated_point_ids: list[int] = field(default_factory=list)
+
+
+def square_shape(
+    project: "Project",
+    entity_id: int,
+    *,
+    mode: str = "average",
+    locked_indices: Sequence[int] = (),
+    propagate_to_points: bool = True,
+) -> SquareShapeResult:
+    """Orthogonalize a polyline/polygon so all corners snap to 90° angles (§3.6).
+
+    Modes:
+    - ``"average"``: hold mean dimensions along dominant orthogonal axes.
+    - ``"small"``: hold smaller parallel edge dimensions.
+    - ``"large"``: hold larger parallel edge dimensions.
+    - ``"lock_points"`` (or ``"lock"``): keep anchor vertices in ``locked_indices``
+      fixed and solve 90° corners around them.
+
+    Point numbers and descriptions are never changed.
+    """
+    ent = project.entities.get(int(entity_id))
+    if not isinstance(ent, Polyline) or len(ent.verts) < 3:
+        raise ValueError("Square shape requires a polyline or polygon with at least 3 vertices.")
+
+    norm_mode = str(mode or "average").strip().lower().replace("-", "_").replace(" ", "_")
+    if norm_mode == "lock":
+        norm_mode = "lock_points"
+    if norm_mode not in SQUARE_SHAPE_MODES:
+        raise ValueError(f"Unknown square_shape mode '{mode}'. Choose from: {', '.join(SQUARE_SHAPE_MODES)}.")
+
+    old_verts = ent.verts.copy()
+    n_raw = len(old_verts)
+    has_dup_close = (
+        n_raw >= 4
+        and math.hypot(float(old_verts[-1, 0] - old_verts[0, 0]), float(old_verts[-1, 1] - old_verts[0, 1])) <= 1e-6
+    )
+    is_closed = bool(ent.closed or has_dup_close)
+    m = n_raw - 1 if has_dup_close else n_raw
+    if m < 3:
+        raise ValueError("Square shape requires at least 3 distinct vertices.")
+
+    xy = old_verts[:m, :2].astype(float).copy()
+    n_edges = m if is_closed else m - 1
+
+    # Step 1: Dominant orientation mod 90° (pi/2) via 4*theta circular mean weighted by edge length
+    sin4 = 0.0
+    cos4 = 0.0
+    edges: list[tuple[int, int, float, float, float]] = []
+    for k in range(n_edges):
+        i = k
+        j = (k + 1) % m
+        dx = float(xy[j, 0] - xy[i, 0])
+        dy = float(xy[j, 1] - xy[i, 1])
+        length = math.hypot(dx, dy)
+        if length <= 1e-9:
+            continue
+        ang = math.atan2(dy, dx)
+        sin4 += length * math.sin(4.0 * ang)
+        cos4 += length * math.cos(4.0 * ang)
+        edges.append((i, j, dx, dy, length))
+
+    if not edges:
+        raise ValueError("Polyline has no non-zero length edges to square.")
+
+    theta0 = 0.25 * math.atan2(sin4, cos4)
+    if theta0 < 0.0:
+        theta0 += 0.5 * math.pi
+    u_axis = np.array([math.cos(theta0), math.sin(theta0)], dtype=float)
+    v_axis = np.array([-math.sin(theta0), math.cos(theta0)], dtype=float)
+
+    locked_set = {int(idx) % m for idx in locked_indices if 0 <= int(idx) < n_raw}
+    centroid = xy.mean(axis=0)
+    rel = xy - centroid
+    u_coords = rel @ u_axis
+    v_coords = rel @ v_axis
+
+    # Step 2: Classify edges onto u-axis (axis 0 -> v is constant) or v-axis (axis 1 -> u is constant)
+    # and group vertices sharing constant-u or constant-v lines via union-find.
+    parent_u = list(range(m))
+    parent_v = list(range(m))
+
+    def find_u(x: int) -> int:
+        while parent_u[x] != x:
+            parent_u[x] = parent_u[parent_u[x]]
+            x = parent_u[x]
+        return x
+
+    def union_u(a: int, b: int) -> None:
+        ra, rb = find_u(a), find_u(b)
+        if ra != rb:
+            parent_u[rb] = ra
+
+    def find_v(x: int) -> int:
+        while parent_v[x] != x:
+            parent_v[x] = parent_v[parent_v[x]]
+            x = parent_v[x]
+        return x
+
+    def union_v(a: int, b: int) -> None:
+        ra, rb = find_v(a), find_v(b)
+        if ra != rb:
+            parent_v[rb] = ra
+
+    u_edge_lengths: list[float] = []
+    v_edge_lengths: list[float] = []
+    for i, j, dx, dy, length in edges:
+        du = dx * u_axis[0] + dy * u_axis[1]
+        dv = dx * v_axis[0] + dy * v_axis[1]
+        if abs(du) >= abs(dv):
+            # Edge runs along u-axis -> vertices i and j share the same v coordinate
+            union_v(i, j)
+            u_edge_lengths.append(length)
+        else:
+            # Edge runs along v-axis -> vertices i and j share the same u coordinate
+            union_u(i, j)
+            v_edge_lengths.append(length)
+
+    u_groups: dict[int, list[int]] = {}
+    v_groups: dict[int, list[int]] = {}
+    for vi in range(m):
+        u_groups.setdefault(find_u(vi), []).append(vi)
+        v_groups.setdefault(find_v(vi), []).append(vi)
+
+    u_solved = np.zeros(m, dtype=float)
+    v_solved = np.zeros(m, dtype=float)
+
+    for members in u_groups.values():
+        locked_members = [vi for vi in members if vi in locked_set]
+        if norm_mode == "lock_points" and locked_members:
+            val = float(np.mean([u_coords[vi] for vi in locked_members]))
+        else:
+            val = float(np.mean([u_coords[vi] for vi in members]))
+        for vi in members:
+            u_solved[vi] = val
+
+    for members in v_groups.values():
+        locked_members = [vi for vi in members if vi in locked_set]
+        if norm_mode == "lock_points" and locked_members:
+            val = float(np.mean([v_coords[vi] for vi in locked_members]))
+        else:
+            val = float(np.mean([v_coords[vi] for vi in members]))
+        for vi in members:
+            v_solved[vi] = val
+
+    # Step 3: Adjust overall dimensions for average / small / large modes
+    if norm_mode in ("average", "small", "large"):
+        cur_u_span = float(np.ptp(u_solved))
+        cur_v_span = float(np.ptp(v_solved))
+        if u_edge_lengths and cur_u_span > 1e-9:
+            if norm_mode == "small":
+                target_u = float(min(u_edge_lengths))
+            elif norm_mode == "large":
+                target_u = float(max(u_edge_lengths))
+            else:
+                target_u = float(np.mean(u_edge_lengths)) if len(u_groups) == 2 else cur_u_span
+            u_mid = 0.5 * (float(u_solved.min()) + float(u_solved.max()))
+            u_solved = u_mid + (u_solved - u_mid) * (target_u / cur_u_span)
+
+        if v_edge_lengths and cur_v_span > 1e-9:
+            if norm_mode == "small":
+                target_v = float(min(v_edge_lengths))
+            elif norm_mode == "large":
+                target_v = float(max(v_edge_lengths))
+            else:
+                target_v = float(np.mean(v_edge_lengths)) if len(v_groups) == 2 else cur_v_span
+            v_mid = 0.5 * (float(v_solved.min()) + float(v_solved.max()))
+            v_solved = v_mid + (v_solved - v_mid) * (target_v / cur_v_span)
+
+    if norm_mode == "lock_points" and locked_set:
+        for vi in locked_set:
+            u_solved[vi] = u_coords[vi]
+            v_solved[vi] = v_coords[vi]
+
+    new_xy = centroid + np.outer(u_solved, u_axis) + np.outer(v_solved, v_axis)
+    new_verts = old_verts.copy()
+    new_verts[:m, :2] = new_xy
+    if has_dup_close:
+        new_verts[-1, :2] = new_xy[0]
+
+    disps = np.hypot(new_verts[:m, 0] - old_verts[:m, 0], new_verts[:m, 1] - old_verts[:m, 1])
+    max_disp = float(disps.max()) if len(disps) else 0.0
+
+    ent.verts = new_verts.copy()
+    if ent.bulges is not None:
+        ent.bulges = None
+
+    pids = _ensure_point_ids_attr(project, ent)
+    updated_pids: list[int] = []
+    if propagate_to_points:
+        for vi in range(n_raw):
+            if (vi % m) in locked_set and norm_mode == "lock_points":
+                continue
+            pid = pids[vi] if vi < len(pids) else None
+            if pid is not None and pid in project.points:
+                pt = project.points[pid]
+                pt.x = float(new_verts[vi, 0])
+                pt.y = float(new_verts[vi, 1])
+                _sync_point_to_polylines(project, pid)
+                if int(pid) not in updated_pids:
+                    updated_pids.append(int(pid))
+
+    if not updated_pids:
+        _mark_manual_override_if_derived(project, ent, pids)
+    project.touch()
+
+    return SquareShapeResult(
+        entity_id=int(entity_id),
+        mode=norm_mode,
+        orientation_deg=float(math.degrees(theta0)),
+        old_verts=old_verts,
+        new_verts=new_verts,
+        max_displacement=max_disp,
+        locked_indices=sorted(locked_set),
+        updated_point_ids=updated_pids,
+    )
+
