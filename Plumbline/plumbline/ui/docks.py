@@ -287,27 +287,29 @@ class LayersDock(QWidget):
         counts = self._counts()
         names = sorted(pr.layers, key=lambda n: (n != "0", n))
         self.tbl.blockSignals(True)
-        self.tbl.setRowCount(len(names))
-        for r, n in enumerate(names):
-            lay = pr.layers[n]
-            eye = QTableWidgetItem()
-            eye.setIcon(icon("eye" if lay.visible else "eye_off"))
-            lk = QTableWidgetItem()
-            lk.setIcon(icon("lock" if lay.locked else "unlock"))
-            sw = QTableWidgetItem()
-            sw.setBackground(QColor(*theme.display_color(lay.color)))
-            nm = QTableWidgetItem(n)
-            f = nm.font()
-            f.setBold(n == self.current)
-            nm.setFont(f)
-            if not lay.visible:
-                nm.setForeground(QColor(theme.colors()["dim"]))
-            ct = QTableWidgetItem(str(counts.get(n, 0)))
-            ct.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            for c, it in enumerate((eye, lk, sw, nm, ct)):
-                it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                self.tbl.setItem(r, c, it)
-        self.tbl.blockSignals(False)
+        try:
+            self.tbl.setRowCount(len(names))
+            for r, n in enumerate(names):
+                lay = pr.layers[n]
+                eye = QTableWidgetItem()
+                eye.setIcon(icon("eye" if lay.visible else "eye_off"))
+                lk = QTableWidgetItem()
+                lk.setIcon(icon("lock" if lay.locked else "unlock"))
+                sw = QTableWidgetItem()
+                sw.setBackground(QColor(*theme.display_color(lay.color)))
+                nm = QTableWidgetItem(n)
+                f = nm.font()
+                f.setBold(n == self.current)
+                nm.setFont(f)
+                if not lay.visible:
+                    nm.setForeground(QColor(theme.colors()["dim"]))
+                ct = QTableWidgetItem(str(counts.get(n, 0)))
+                ct.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                for c, it in enumerate((eye, lk, sw, nm, ct)):
+                    it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                    self.tbl.setItem(r, c, it)
+        finally:
+            self.tbl.blockSignals(False)
 
     def _name(self, row):
         item = self.tbl.item(row, 3)
@@ -413,11 +415,10 @@ class FieldBookDock(QWidget):
         self.tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
         h = self.tbl.horizontalHeader()
-        h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(QHeaderView.Interactive)
         h.setSectionResizeMode(1, QHeaderView.Stretch)
-        h.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        for col, width in ((0, 75), (2, 65), (3, 115), (4, 75)):
+            self.tbl.setColumnWidth(col, width)
         lay.addWidget(self.tbl, 1)
 
         # Bottom info row
@@ -454,15 +455,17 @@ class FieldBookDock(QWidget):
             filtered.append((code, fc))
 
         self.tbl.blockSignals(True)
-        self.tbl.setRowCount(len(filtered))
-        for r, (code, fc) in enumerate(filtered):
-            kind_str = "Point" if fc.kind == "point" else "Line" if fc.kind == "line" else "Polygon"
-            self.tbl.setItem(r, 0, QTableWidgetItem(str(code)))
-            self.tbl.setItem(r, 1, QTableWidgetItem(str(getattr(fc, "name", ""))))
-            self.tbl.setItem(r, 2, QTableWidgetItem(kind_str))
-            self.tbl.setItem(r, 3, QTableWidgetItem(str(getattr(fc, "layer", ""))))
-            self.tbl.setItem(r, 4, QTableWidgetItem(str(getattr(fc, "symbol", ""))))
-        self.tbl.blockSignals(False)
+        try:
+            self.tbl.setRowCount(len(filtered))
+            for r, (code, fc) in enumerate(filtered):
+                kind_str = "Point" if fc.kind == "point" else "Line" if fc.kind == "line" else "Polygon"
+                self.tbl.setItem(r, 0, QTableWidgetItem(str(code)))
+                self.tbl.setItem(r, 1, QTableWidgetItem(str(getattr(fc, "name", ""))))
+                self.tbl.setItem(r, 2, QTableWidgetItem(kind_str))
+                self.tbl.setItem(r, 3, QTableWidgetItem(str(getattr(fc, "layer", ""))))
+                self.tbl.setItem(r, 4, QTableWidgetItem(str(getattr(fc, "symbol", ""))))
+        finally:
+            self.tbl.blockSignals(False)
         self.lbl_count.setText(f"{len(filtered):,} of {len(codes_items):,} codes")
 
 
@@ -495,6 +498,8 @@ class PointsModel(QAbstractTableModel):
         self.ids: list[int] = []
         self.ne = True
         self.extra: list[str] = []                          # provenance column keys, in order
+        self._sort_col: int = 0
+        self._sort_order = Qt.AscendingOrder
 
     def headers(self):
         fixed = ["Pt", "Northing" if self.ne else "Easting", "Easting" if self.ne else "Northing", "Elev", "Description", "Layer"]
@@ -513,10 +518,57 @@ class PointsModel(QAbstractTableModel):
         self.extra = keys
         self.endResetModel()
 
+    def _col_value(self, p, c: int):
+        if c == 0:
+            return p.number
+        if c == 1:
+            return p.y if self.ne else p.x
+        if c == 2:
+            return p.x if self.ne else p.y
+        if c == 3:
+            return p.z
+        if c == 4:
+            return p.desc
+        if c == 5:
+            return p.layer
+        return PROV.value(p, self.extra[c - len(self.FIXED)])
+
+    def _sort_key_for_point(self, p, c: int):
+        if p is None:
+            return (2, 0.0, "")
+        v = self._col_value(p, c)
+        if c >= len(self.FIXED):
+            return str(v).lower()
+        if c == 0:
+            s = str(v)
+            try:
+                return (0, float(s), s)
+            except ValueError:
+                return (1, 0.0, s)
+        if c in (1, 2, 3):
+            return -1e300 if (isinstance(v, float) and math.isnan(v)) else float(v)
+        return str(v).lower()
+
+    def _apply_sort(self):
+        if len(self.ids) > 1 and 0 <= self._sort_col < self.columnCount():
+            pts = self.state.project.points
+            col = self._sort_col
+            self.ids.sort(
+                key=lambda pid: self._sort_key_for_point(pts.get(pid), col),
+                reverse=(self._sort_order == Qt.DescendingOrder),
+            )
+
+    def set_sort(self, column: int, order=Qt.AscendingOrder):
+        if column < 0:
+            return
+        self._sort_col = int(column)
+        self._sort_order = order
+
     def reload(self):
         self.beginResetModel()
         self.ne = settings().get("coord_order") == "NE"
         self.ids = list(self.state.project.points.keys())
+        self._apply_sort()
         self.endResetModel()
 
     def rowCount(self, parent=QModelIndex()):
@@ -537,12 +589,21 @@ class PointsModel(QAbstractTableModel):
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
             return None
+        c = index.column()
+        if role == Qt.TextAlignmentRole:
+            return int(Qt.AlignRight | Qt.AlignVCenter) if c in (1, 2, 3) else None
+        if role == Qt.UserRole + 1:
+            row = index.row()
+            return self.ids[row] if 0 <= row < len(self.ids) else None
+        if role not in (Qt.DisplayRole, Qt.EditRole, Qt.UserRole, Qt.ToolTipRole):
+            return None
         p = self.state.project.points.get(self.ids[index.row()])
         if p is None:
             return None
-        c = index.column()
-        v = self._cols(p)[c]
         text = c >= len(self.FIXED)                          # a provenance column: text, read-only
+        if role == Qt.ToolTipRole:
+            return (PROV.describe(p) or None) if text else None
+        v = self._col_value(p, c)
         if role == Qt.DisplayRole:
             if text:
                 return str(v)
@@ -557,23 +618,8 @@ class PointsModel(QAbstractTableModel):
             if c in (1, 2, 3):
                 return "" if (isinstance(v, float) and math.isnan(v)) else f"{v:.6f}".rstrip("0").rstrip(".")
             return v
-        if role == Qt.TextAlignmentRole and c in (1, 2, 3):
-            return int(Qt.AlignRight | Qt.AlignVCenter)
         if role == Qt.UserRole:                            # sort key - never a string sort for numbers
-            if text:
-                return str(v).lower()
-            if c == 0:
-                try:
-                    return (0, float(v), v)
-                except ValueError:
-                    return (1, 0.0, v)
-            if c in (1, 2, 3):
-                return -1e300 if (isinstance(v, float) and math.isnan(v)) else v
-            return str(v).lower()
-        if role == Qt.UserRole + 1:
-            return p.id
-        if role == Qt.ToolTipRole and text:
-            return PROV.describe(p) or None
+            return self._sort_key_for_point(p, c)
         return None
 
     def flags(self, index):
@@ -619,8 +665,7 @@ class PointsModel(QAbstractTableModel):
 
 
 class _Proxy(QSortFilterProxyModel):
-    def lessThan(self, a, b):
-        return (a.data(Qt.UserRole) or 0) < (b.data(Qt.UserRole) or 0)
+    pass
 
 
 class PointsDock(QWidget):
@@ -639,6 +684,7 @@ class PointsDock(QWidget):
         super().__init__(parent)
         self.state = state
         self._sync = False
+        self._last_col_count = 0
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
         row = QHBoxLayout()
@@ -652,13 +698,17 @@ class PointsDock(QWidget):
         self.model = PointsModel(state)
         self.model.set_columns(settings().get("point_columns") or list(PROV.DEFAULT_COLUMNS))
         self.proxy = _Proxy()
+        self.proxy.setDynamicSortFilter(False)
         self.proxy.setSourceModel(self.model)
         self.proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
         self.proxy.setFilterKeyColumn(-1)
         self.view = QTableView()
         self.view.setModel(self.proxy)
-        self.view.setSortingEnabled(True)
-        self.view.sortByColumn(0, Qt.AscendingOrder)
+        hdr = self.view.horizontalHeader()
+        hdr.setSectionsClickable(True)
+        hdr.setSortIndicatorShown(True)
+        hdr.setSortIndicator(0, Qt.AscendingOrder)
+        hdr.sortIndicatorChanged.connect(self._on_sort_changed)
         self.view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.view.setAlternatingRowColors(True)
@@ -692,6 +742,10 @@ class PointsDock(QWidget):
         self._timer.timeout.connect(self.reload)
         self.reload()
 
+    def _on_sort_changed(self, col: int, order):
+        self.model.set_sort(col, order)
+        self.reload()
+
     def _changed(self, kinds):
         self._timer.start(30)
 
@@ -712,7 +766,17 @@ class PointsDock(QWidget):
         self._sync = True
         self.model.reload()
         self._sync = False
-        self.view.resizeColumnsToContents()
+        col_count = self.model.columnCount()
+        if col_count != self._last_col_count:
+            self._last_col_count = col_count
+            if len(self.model.ids) <= 250:
+                self.view.resizeColumnsToContents()
+            else:
+                for col, width in enumerate((65, 95, 95, 75, 160, 100)):
+                    if col < col_count:
+                        self.view.setColumnWidth(col, width)
+                for col in range(6, col_count):
+                    self.view.setColumnWidth(col, 120)
         self.view.horizontalHeader().setStretchLastSection(True)
         self.lbl.setText(f"{len(self.model.ids):,} points")
         self._state_selection()

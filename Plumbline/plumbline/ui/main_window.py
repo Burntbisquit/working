@@ -270,11 +270,17 @@ class MainWindow(QMainWindow):
         self.d_groups = self._dock("Groups", self.groups, Qt.LeftDockWidgetArea, "groups")
         self.d_pts = self._dock("Points", self.points, Qt.LeftDockWidgetArea, "points")
 
-        # Right dock area: Geometry, Properties, Field Book
+        # Right dock area: Geometry, Performance, Properties, Field Book (right-dock panel host)
         self.d_geometry = self._dock("Geometry", self.geometry, Qt.RightDockWidgetArea, "geometry")
         self.d_performance = self._dock("Performance", self.performance, Qt.RightDockWidgetArea, "performance")
         self.d_props = self._dock("Properties", self.props, Qt.RightDockWidgetArea, "props")
         self.d_fieldbook = self._dock("Field Book", self.fieldbook_dock, Qt.RightDockWidgetArea, "fieldbook")
+        self._right_panels: dict[str, QDockWidget] = {
+            "geometry": self.d_geometry,
+            "performance": self.d_performance,
+            "props": self.d_props,
+            "fieldbook": self.d_fieldbook,
+        }
 
         # Bottom dock area: Messages, Python Console
         self.d_msg = self._dock("Messages", self.messages, Qt.BottomDockWidgetArea, "messages")
@@ -399,6 +405,8 @@ class MainWindow(QMainWindow):
                               tip="Fix Point Errors (closeness duplicates, unknown codes, descriptions)")
         self.a_fix_linework = A("Fix &Linework...", self.open_fix_linework, icon="check_lines",
                                 tip="Fix Linework (missing start/end, curve commands, bowties, reclass/reorder)")
+        self.a_geometry_panel = A("&Geometry Panel", self.open_geometry_panel, icon="polyline",
+                                  tip="Open the right-dock Geometry panel for segments, QA, and line tools")
         self.a_performance = A("&Performance Benchmark", self.open_performance_panel,
                                tip="Run a non-mutating project benchmark and write a performance report")
         self.a_qa = self.a_fix_points
@@ -545,7 +553,7 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addActions([self.a_crs, self.a_calc, self.a_file_crs])
         m.addSeparator()
-        m.addActions([self.a_fix_points, self.a_fix_linework, self.a_performance, self.a_fieldbook, self.a_codes,
+        m.addActions([self.a_fix_points, self.a_fix_linework, self.a_geometry_panel, self.a_performance, self.a_fieldbook, self.a_codes,
                       self.a_linework, self.a_join_points, self.a_join_lines, self.a_edit_line_geometry,
                       self.a_edit_linework_coding])
         m.addSeparator()
@@ -1688,10 +1696,37 @@ class MainWindow(QMainWindow):
         from .qa_workspace import FixLineworkDialog
         self._show_modal_qa_workbench(FixLineworkDialog(self.state, self))
 
+    def register_right_panel(self, key: str, title: str, widget: QWidget) -> QDockWidget:
+        """Register or replace a panel in the right-dock stack and tabify it behind Geometry."""
+        norm_key = str(key).strip().lower()
+        existing = self._right_panels.get(norm_key)
+        if existing is not None:
+            existing.setWidget(widget)
+            existing.setWindowTitle(title)
+            return existing
+        dock = self._dock(title, widget, Qt.RightDockWidgetArea, norm_key)
+        anchor = self._right_panels.get("fieldbook") or self.d_geometry
+        self.tabifyDockWidget(anchor, dock)
+        self._right_panels[norm_key] = dock
+        return dock
+
+    def open_right_panel(self, key: str) -> QDockWidget | None:
+        """Show and raise a panel registered in the right-dock stack."""
+        dock = self._right_panels.get(str(key).strip().lower())
+        if dock is None:
+            return None
+        dock.show()
+        dock.raise_()
+        return dock
+
+    def open_geometry_panel(self):
+        """Survey > Geometry Panel: reveal the docked Geometry segment & QA panel."""
+        self.open_right_panel("geometry")
+        self.geometry.segments.setFocus()
+
     def open_performance_panel(self):
         """Survey > Performance Benchmark: reveal the docked local benchmark runner."""
-        self.d_performance.show()
-        self.d_performance.raise_()
+        self.open_right_panel("performance")
         self.performance.run_button.setFocus()
 
     def qa_dialog(self):

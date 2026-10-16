@@ -369,25 +369,33 @@ class Project:
             [point.id, str(point.number), point.x, point.y, point.z, str(point.desc or "")]
             for point in ordered_points
         ]
-        codes = sorted(self.codes.to_list(),
-                       key=lambda item: (str(item.get("code", "")).casefold(),
-                                         str(item.get("code", ""))))
+        if hasattr(self.codes, "sorted_codes_json"):
+            codes_json = self.codes.sorted_codes_json()
+        else:
+            codes = sorted(self.codes.to_list(),
+                           key=lambda item: (str(item.get("code", "")).casefold(),
+                                             str(item.get("code", ""))))
+            codes_json = json.dumps(codes, sort_keys=True, separators=(",", ":"),
+                                    ensure_ascii=False, default=str, allow_nan=True)
         manual_overrides = [
             [entity.id, entity.attrs or {}]
             for entity in sorted(self.entities.values(), key=lambda item: item.id)
             if isinstance(entity, Polyline)
             and (entity.attrs or {}).get("manual_linework_override")
         ]
-        payload = {
-            "version": "linework-build-v1",
-            "order": str(order),
-            "points": points,
-            "codes": codes,
-            "commands": (self.settings or {}).get("f2f_commands"),
-            "manual_overrides": manual_overrides,
-        }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"),
-                             ensure_ascii=False, default=str, allow_nan=True).encode("utf-8")
+        commands_json = json.dumps((self.settings or {}).get("f2f_commands"),
+                                   sort_keys=True, separators=(",", ":"),
+                                   ensure_ascii=False, default=str, allow_nan=True)
+        overrides_json = json.dumps(manual_overrides, sort_keys=True, separators=(",", ":"),
+                                    ensure_ascii=False, default=str, allow_nan=True)
+        order_json = json.dumps(str(order), ensure_ascii=False)
+        points_json = json.dumps(points, separators=(",", ":"),
+                                 ensure_ascii=False, default=str, allow_nan=True)
+        encoded = (
+            f'{{"codes":{codes_json},"commands":{commands_json},'
+            f'"manual_overrides":{overrides_json},"order":{order_json},'
+            f'"points":{points_json},"version":"linework-build-v1"}}'
+        ).encode("utf-8")
         return hashlib.blake2b(encoded, digest_size=24).hexdigest()
 
     def linework_is_processed(self) -> bool:
@@ -521,7 +529,11 @@ class Project:
         for e in self.entities.values():
             if isinstance(e, Polyline) and len(e.verts):
                 v = e.verts
-                boxes.append((np.nanmin(v[:, 0]), np.nanmin(v[:, 1]), np.nanmax(v[:, 0]), np.nanmax(v[:, 1])))
+                vx, vy = v[:, 0], v[:, 1]
+                x0, y0, x1, y1 = float(vx.min()), float(vy.min()), float(vx.max()), float(vy.max())
+                if math.isnan(x0) or math.isnan(y0) or math.isnan(x1) or math.isnan(y1):
+                    x0, y0, x1, y1 = float(np.nanmin(vx)), float(np.nanmin(vy)), float(np.nanmax(vx)), float(np.nanmax(vy))
+                boxes.append((x0, y0, x1, y1))
             elif isinstance(e, TextEntity):
                 boxes.append((e.x, e.y, e.x, e.y))
         for s in self.surfaces.values():

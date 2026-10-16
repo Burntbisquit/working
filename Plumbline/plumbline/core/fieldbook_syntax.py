@@ -7,6 +7,8 @@ special-character checks throughout the parser and UI.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import functools
+import re
 
 
 COMMAND_MEANINGS = (
@@ -61,9 +63,14 @@ def command_map(commands=None) -> dict[str, str]:
     separator definitions inherit the Carlson defaults.  An explicitly empty cell in a full-length
     list stays empty, so disabling one meaning cannot shift every later row to a different meaning.
     """
-    result = dict(DEFAULT_COMMAND_MAP)
     if commands is None:
-        return result
+        return dict(DEFAULT_COMMAND_MAP)
+
+    if isinstance(commands, dict) and commands.keys() == DEFAULT_COMMAND_MAP.keys():
+        if all(isinstance(v, str) and v == v.strip().upper() for v in commands.values()):
+            return dict(commands)
+
+    result = dict(DEFAULT_COMMAND_MAP)
 
     if isinstance(commands, Mapping):
         semantic_values = {}
@@ -196,10 +203,9 @@ def command_joiner(*, spaced: bool | None = None) -> str:
     return " " if spaced else ""
 
 
+@functools.lru_cache(maxsize=64)
 def separator_pattern(token: str) -> str:
     """Regex for a separator, requiring word boundaries for alphanumeric command tokens."""
-    import re
-
     if not token:
         return r"(?!)"
     left = r"(?<![A-Za-z0-9_])" if token[0].isalnum() else ""
@@ -207,24 +213,29 @@ def separator_pattern(token: str) -> str:
     return left + re.escape(token) + right
 
 
+@functools.lru_cache(maxsize=64)
+def _separator_regex(token: str) -> re.Pattern[str]:
+    return re.compile(separator_pattern(token), flags=re.IGNORECASE)
+
+
+@functools.lru_cache(maxsize=64)
+def _split_separator_regex(token: str) -> re.Pattern[str]:
+    return re.compile(rf"\s*{separator_pattern(token)}\s*", flags=re.IGNORECASE)
+
+
 def find_separator(value: str, token: str) -> int:
     """Find the first separator, case-insensitively, or return -1 when disabled/absent."""
-    import re
-
     if not token:
         return -1
-    match = re.search(separator_pattern(token), value, flags=re.IGNORECASE)
+    match = _separator_regex(token).search(value)
     return match.start() if match else -1
 
 
 def split_at_separator(value: str, token: str, maxsplit: int = 1) -> list[str]:
     """Split on a command token, allowing any amount of surrounding whitespace."""
-    import re
-
     if not token:
         return [value]
-    return re.split(rf"\s*{separator_pattern(token)}\s*", value,
-                    maxsplit=maxsplit, flags=re.IGNORECASE)
+    return _split_separator_regex(token).split(value, maxsplit=maxsplit)
 
 
 def separator_spacing_is_valid(value: str, start: int, token: str, *, spaced: bool) -> bool:

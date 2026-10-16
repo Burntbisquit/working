@@ -47,6 +47,25 @@ def arc_to_bulge(cx, cy, x0, y0, x1, y1, ccw: bool) -> float:
     return math.tan(sweep / 4.0)
 
 
+def bulge_from_three_points(p0, p_mid, p1) -> float:
+    """Return the DXF bulge (tan(theta/4), + = CCW) for the circular arc through p0 -> p_mid -> p1."""
+    x0, y0 = float(p0[0]), float(p0[1])
+    xm, ym = float(p_mid[0]), float(p_mid[1])
+    x1, y1 = float(p1[0]), float(p1[1])
+    ux, uy = xm - x0, ym - y0
+    vx, vy = x1 - xm, y1 - ym
+    lu = math.hypot(ux, uy)
+    lv = math.hypot(vx, vy)
+    if lu <= 1e-12 or lv <= 1e-12:
+        return 0.0
+    cross = ux * vy - uy * vx
+    dot = ux * vx + uy * vy
+    denom = lu * lv + dot
+    if abs(denom) <= 1e-12:
+        return 0.0
+    return float(cross / denom)
+
+
 def _arc_samples(x0, y0, z0, x1, y1, z1, bulge, max_dev, max_step):
     arc = bulge_to_arc(x0, y0, x1, y1, bulge)
     if arc is None:

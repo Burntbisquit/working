@@ -67,7 +67,11 @@ class SpatialIndex:
                     flags = np.concatenate([flags, [False]])
                 k = len(ent_ids)
                 ent_ids.append(e.id)
-                ent_bbox.append((np.nanmin(v[:, 0]), np.nanmin(v[:, 1]), np.nanmax(v[:, 0]), np.nanmax(v[:, 1])))
+                vx, vy = v[:, 0], v[:, 1]
+                x0, y0, x1, y1 = float(vx.min()), float(vy.min()), float(vx.max()), float(vy.max())
+                if np.isnan(x0) or np.isnan(y0) or np.isnan(x1) or np.isnan(y1):
+                    x0, y0, x1, y1 = float(np.nanmin(vx)), float(np.nanmin(vy)), float(np.nanmax(vx)), float(np.nanmax(vy))
+                ent_bbox.append((x0, y0, x1, y1))
                 orig = e.verts
                 vtx_xy.append(orig[:, :2]); vtx_owner.append(np.full(len(orig), k))
                 oi = np.cumsum(flags) - 1

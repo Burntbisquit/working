@@ -277,7 +277,7 @@ def crew_of_point(point_number) -> int | None:
     if F.CONTROL_RANGE[0] <= n <= F.CONTROL_RANGE[1]:
         return None                                      # control: shared, no crew
     for crew in range(1, 10):
-        if F.is_in_crew_block(str(n), crew):
+        if F.is_in_crew_block(n, crew):
             return crew
     return None
 
@@ -392,6 +392,11 @@ def _point_is_deleted(point) -> bool:
 def describe_flags(rows, f2f=None, fieldbook_path=None) -> dict[int, dict]:
     """Parse active descriptions and report the ones with flags, keyed by row OID."""
     out = {}
+    commands = F.get_command_map(fieldbook_path) if fieldbook_path else None
+    command_set = F.get_command_set(fieldbook_path, commands) if fieldbook_path else None
+    rules = F.get_correction_rules(fieldbook_path) if fieldbook_path else []
+    f2f_codes = f2f or set()
+    parsed_by_raw: dict[str, dict] = {}
     for r in rows:
         if not row_is_usable(r) or _row_is_removed(r):
             continue
@@ -400,9 +405,16 @@ def describe_flags(rows, f2f=None, fieldbook_path=None) -> dict[int, dict]:
         # classify non-empty text as UnknownCode, but still surface genuinely blank rows.
         if not f2f and raw_description.strip():
             continue
-        parsed = P.parse_desc_field(raw_description, f2f or set(), fieldbook_path=fieldbook_path)
+        parsed = parsed_by_raw.get(raw_description)
+        if parsed is None:
+            parsed = P.parse_desc_field(
+                raw_description, f2f_codes, fieldbook_path=fieldbook_path,
+                command_set=command_set, rules=rules, commands=commands,
+            )
+            parsed_by_raw[raw_description] = parsed
         if parsed.get("flags"):
-            out[int(r[OID]) if str(r[OID]).strip().isdigit() else r[OID]] = parsed
+            oid_key = int(r[OID]) if str(r[OID]).strip().isdigit() else r[OID]
+            out[oid_key] = {**parsed, "flags": list(parsed["flags"])}
     return out
 
 
@@ -1097,8 +1109,10 @@ def _check_cached(project, *, scope: str, check_function, f2f=None, fieldbook_pa
             check_kwargs["elev_tol"] = elev_tol
         if control_file is not None:
             check_kwargs["control_file"] = control_file
-    check_kwargs["_prepared_rows"] = prepared
-    result = check_function(project, **check_kwargs)
+    try:
+        result = check_function(project, _prepared_rows=prepared, **check_kwargs)
+    except TypeError:
+        result = check_function(project, **check_kwargs)
     cached_result = copy.deepcopy(result)
     with _CHECK_PROJECT_CACHE_LOCK:
         entries = _CHECK_PROJECT_CACHE.setdefault(project, {})

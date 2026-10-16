@@ -350,6 +350,11 @@ class SelectTool(Tool):
             entity = self.state.project.entities.get(eid)
             linked_ids = (entity.attrs or {}).get("point_ids", []) if isinstance(entity, Polyline) else []
             linked_point_id = linked_ids[i] if isinstance(linked_ids, (list, tuple)) and i < len(linked_ids) else None
+            if linked_point_id is None and isinstance(entity, Polyline):
+                legacy_nums = (entity.attrs or {}).get("points", [])
+                if isinstance(legacy_nums, (list, tuple)) and i < len(legacy_nums) and legacy_nums[i] not in (None, ""):
+                    pt = self.state.project.point_by_number(str(legacy_nums[i]))
+                    linked_point_id = pt.id if pt is not None else None
             is_linked_linework = bool(isinstance(entity, Polyline) and entity.derived == "linework" and linked_point_id is not None)
             if is_linked_linework and not self.linked_edit_mode:
                 self.say("Point-driven linework is locked. Enable Edit linked linework in the Geometry panel.")

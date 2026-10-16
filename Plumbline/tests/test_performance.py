@@ -26,7 +26,12 @@ def test_quick_benchmark_is_non_mutating_and_has_drilldown_rows():
     assert project.snapshot() == before
     assert report.profile == "Quick"
     assert [metric.operation for metric in report.measurements] == [
-        "Project extents", "Linework input fingerprint", "Geometry segment inventory", "Spatial index build (cold)",
+        "Project extents",
+        "Linework input fingerprint",
+        "Linework build (number order)",
+        "Geometry segment inventory",
+        "Geometry segment point rows",
+        "Spatial index build (cold)",
     ]
     assert all(metric.mean_ms >= 0 for metric in report.measurements)
     assert "Plumbline Performance Report" in report.to_markdown()
@@ -41,4 +46,25 @@ def test_benchmark_writes_markdown_and_json_reports(tmp_path):
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert payload["profile"] == report.profile == "Quick"
     assert payload["project"]["name"] == "Potato comparison"
-    assert payload["measurements"][2]["operation"] == "Geometry segment inventory"
+    assert payload["measurements"][3]["operation"] == "Geometry segment inventory"
+
+
+def test_standard_benchmark_includes_qa_and_line_sequence_probes():
+    project = _project()
+    before = project.snapshot()
+    report = benchmark_project(project, "Standard")
+
+    assert project.snapshot() == before
+    assert [metric.operation for metric in report.measurements] == [
+        "Project extents",
+        "Linework input fingerprint",
+        "Linework build (number order)",
+        "Geometry segment inventory",
+        "Geometry segment point rows",
+        "Spatial index build (cold)",
+        "Point QA checks",
+        "Fieldwork line-sequence checks",
+        "Breakline crossing & length QA",
+    ]
+
+

@@ -2193,7 +2193,7 @@ class BaseQAWorkbenchWindow(QMainWindow):
 
         if self._has_unapplied_issue_edits():
             if getattr(self, "stack_action_combos", {}):
-                applied = self._action_apply_staged_stack_actions()
+                applied = self._action_apply_staged_stack_actions(return_to_summary=return_to_summary)
             else:
                 applied = self._apply_pending_issue_edits(return_to_summary=return_to_summary)
         elif return_to_summary and self.stack.currentIndex() == 1:
@@ -2783,6 +2783,7 @@ class BaseQAWorkbenchWindow(QMainWindow):
         ignored_points: list[int] | None = None,
         project_changed: bool = True,
         include_unchanged_points: set[int] | None = None,
+        rebuild_editor: bool = True,
     ):
         pr = self.state.project
         cur_finding = self.current_edit_finding
@@ -2876,7 +2877,8 @@ class BaseQAWorkbenchWindow(QMainWindow):
             self._sync_view_flags()
 
         if stay_on_edit_page and cur_finding:
-            self._open_inline_editor(cur_finding, start_session=False)
+            if rebuild_editor:
+                self._open_inline_editor(cur_finding, start_session=False)
         else:
             self._show_summary_page(recheck=False, refresh=False)
 
@@ -3528,7 +3530,7 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
             return "<i style='color: #888;'>No description</i>"
         raw_s = str(orig_desc)
         f2f_set = self.code_set or set()
-        parsed = parse_desc_field(raw_s, f2f_set)
+        parsed = parse_desc_field(raw_s, f2f_set, fieldbook_path=self.fieldbook_path or None)
         bad_tokens = set()
         for item in parsed.get("code_classified", []):
             if item.get("error") == "UnknownCode" or item.get("status") == "unknown":
@@ -3583,7 +3585,7 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
         if not s:
             return False, "Empty description"
         f_set = f2f_set if f2f_set is not None else (self.code_set or set())
-        parsed = parse_desc_field(s, f_set)
+        parsed = parse_desc_field(s, f_set, fieldbook_path=self.fieldbook_path or None)
         bad_tokens = []
         for item in parsed.get("code_classified", []):
             if item.get("error") == "UnknownCode" or item.get("status") == "unknown":
@@ -3598,6 +3600,14 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
     def _load_fieldbook_lookup_rows(self) -> list[tuple[str, str, str]]:
         """Return list of (code, description, category) tuples for Fieldbook lookup."""
         pr = self.state.project
+        cache_key = (
+            self.fieldbook_path,
+            len(self.code_set or ()),
+            len(getattr(pr, "codes", ()) or ()),
+            (pr.settings or {}).get("fieldbook_file") if hasattr(pr, "settings") else None,
+        )
+        if getattr(self, "_fb_lookup_cache_key", None) == cache_key and hasattr(self, "_fb_lookup_cache_rows"):
+            return list(self._fb_lookup_cache_rows)
         rows: list[tuple[str, str, str]] = []
         seen = set()
 
@@ -3669,7 +3679,10 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
                 rows.append((c_str.upper(), "", "General"))
                 seen.add(c_str.casefold())
 
-        return sorted(rows, key=lambda x: (x[2].casefold(), x[0].casefold()))
+        sorted_rows = sorted(rows, key=lambda x: (x[2].casefold(), x[0].casefold()))
+        self._fb_lookup_cache_key = cache_key
+        self._fb_lookup_cache_rows = list(sorted_rows)
+        return sorted_rows
 
     def _fb_apply_filter(self):
         if not hasattr(self, "fb_table") or not hasattr(self, "fb_all_rows"):
@@ -3685,17 +3698,21 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
                 continue
             filtered.append((c, d, k))
 
-        self.fb_table.setRowCount(len(filtered))
-        for r, (c, d, k) in enumerate(filtered):
-            it_c = QTableWidgetItem(c)
-            it_c.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            it_d = QTableWidgetItem(d)
-            it_d.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            it_k = QTableWidgetItem(k)
-            it_k.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            self.fb_table.setItem(r, 0, it_c)
-            self.fb_table.setItem(r, 1, it_d)
-            self.fb_table.setItem(r, 2, it_k)
+        self.fb_table.blockSignals(True)
+        try:
+            self.fb_table.setRowCount(len(filtered))
+            for r, (c, d, k) in enumerate(filtered):
+                it_c = QTableWidgetItem(c)
+                it_c.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                it_d = QTableWidgetItem(d)
+                it_d.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                it_k = QTableWidgetItem(k)
+                it_k.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                self.fb_table.setItem(r, 0, it_c)
+                self.fb_table.setItem(r, 1, it_d)
+                self.fb_table.setItem(r, 2, it_k)
+        finally:
+            self.fb_table.blockSignals(False)
 
         total = len(self.fb_all_rows)
         self.fb_count_lbl.setText(f"Showing {len(filtered)} of {total} codes")
@@ -3720,7 +3737,7 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
                 target_ed.setText(code_to_insert)
             else:
                 from ..fieldwork.parse import parse_desc_field
-                parsed = parse_desc_field(cur_txt, self.code_set or set())
+                parsed = parse_desc_field(cur_txt, self.code_set or set(), fieldbook_path=self.fieldbook_path or None)
                 bad_tokens = []
                 for item in parsed.get("code_classified", []):
                     if item.get("error") == "UnknownCode" or item.get("status") == "unknown":
@@ -3807,7 +3824,7 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
         self._on_stack_action_changed(key, combo)
         return True
 
-    def _action_apply_staged_stack_actions(self) -> bool:
+    def _action_apply_staged_stack_actions(self, *, return_to_summary: bool = False) -> bool:
         """Apply every staged stack action as one undoable, minimally logged batch."""
         finding = self.current_edit_finding
         if finding is None:
@@ -4008,7 +4025,7 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
             resolution_desc,
             do_it,
             resolved_points=list(dict.fromkeys(resolved_ids)),
-            stay_on_edit_page=True,
+            stay_on_edit_page=not return_to_summary,
             ignored_points=list(dict.fromkeys(ignored_ids)),
             project_changed=project_changed,
             include_unchanged_points=audit_unchanged_ids,
@@ -4319,6 +4336,7 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
             stay_on_edit_page=not return_to_summary,
             ignored_points=[p.id for p in to_ignore],
             project_changed=any((p.desc or "") != txt for p, txt in to_correct),
+            rebuild_editor=not bool(to_skip),
         )
 
         if return_to_summary:

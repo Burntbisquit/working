@@ -9,6 +9,11 @@ from . import __version__
 
 
 def _gui(path: str | None) -> int:
+    import faulthandler
+    try:
+        faulthandler.enable()
+    except Exception:
+        pass
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QApplication
 
