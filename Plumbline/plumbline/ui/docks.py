@@ -286,7 +286,6 @@ class LayersDock(QWidget):
         pr = self.state.project
         counts = self._counts()
         names = sorted(pr.layers, key=lambda n: (n != "0", n))
-        self.tbl.setUpdatesEnabled(False)
         self.tbl.blockSignals(True)
         try:
             self.tbl.setRowCount(len(names))
@@ -311,7 +310,6 @@ class LayersDock(QWidget):
                     self.tbl.setItem(r, c, it)
         finally:
             self.tbl.blockSignals(False)
-            self.tbl.setUpdatesEnabled(True)
 
     def _name(self, row):
         item = self.tbl.item(row, 3)
@@ -456,7 +454,6 @@ class FieldBookDock(QWidget):
                     continue
             filtered.append((code, fc))
 
-        self.tbl.setUpdatesEnabled(False)
         self.tbl.blockSignals(True)
         try:
             self.tbl.setRowCount(len(filtered))
@@ -469,7 +466,6 @@ class FieldBookDock(QWidget):
                 self.tbl.setItem(r, 4, QTableWidgetItem(str(getattr(fc, "symbol", ""))))
         finally:
             self.tbl.blockSignals(False)
-            self.tbl.setUpdatesEnabled(True)
         self.lbl_count.setText(f"{len(filtered):,} of {len(codes_items):,} codes")
 
 
@@ -562,14 +558,11 @@ class PointsModel(QAbstractTableModel):
                 reverse=(self._sort_order == Qt.DescendingOrder),
             )
 
-    def sort(self, column: int, order=Qt.AscendingOrder):
+    def set_sort(self, column: int, order=Qt.AscendingOrder):
         if column < 0:
             return
-        self.layoutAboutToBeChanged.emit()
         self._sort_col = int(column)
         self._sort_order = order
-        self._apply_sort()
-        self.layoutChanged.emit()
 
     def reload(self):
         self.beginResetModel()
@@ -672,13 +665,7 @@ class PointsModel(QAbstractTableModel):
 
 
 class _Proxy(QSortFilterProxyModel):
-    def sort(self, column: int, order=Qt.AscendingOrder):
-        src = self.sourceModel()
-        if src is not None and hasattr(src, "sort"):
-            src.sort(column, order)
-            self.invalidate()
-        else:
-            super().sort(column, order)
+    pass
 
 
 class PointsDock(QWidget):
@@ -711,13 +698,17 @@ class PointsDock(QWidget):
         self.model = PointsModel(state)
         self.model.set_columns(settings().get("point_columns") or list(PROV.DEFAULT_COLUMNS))
         self.proxy = _Proxy()
+        self.proxy.setDynamicSortFilter(False)
         self.proxy.setSourceModel(self.model)
         self.proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
         self.proxy.setFilterKeyColumn(-1)
         self.view = QTableView()
         self.view.setModel(self.proxy)
-        self.view.setSortingEnabled(True)
-        self.view.sortByColumn(0, Qt.AscendingOrder)
+        hdr = self.view.horizontalHeader()
+        hdr.setSectionsClickable(True)
+        hdr.setSortIndicatorShown(True)
+        hdr.setSortIndicator(0, Qt.AscendingOrder)
+        hdr.sortIndicatorChanged.connect(self._on_sort_changed)
         self.view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.view.setAlternatingRowColors(True)
@@ -749,6 +740,10 @@ class PointsDock(QWidget):
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.reload)
+        self.reload()
+
+    def _on_sort_changed(self, col: int, order):
+        self.model.set_sort(col, order)
         self.reload()
 
     def _changed(self, kinds):

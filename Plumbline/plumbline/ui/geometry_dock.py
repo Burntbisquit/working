@@ -225,7 +225,6 @@ class GeometryDock(QWidget):
         selected_id = self.current_segment.entity_id if keep_selection and self.current_segment else None
         selected_seg_id = self.current_segment.seg_id if keep_selection and self.current_segment else None
         self._updating = True
-        self.segments.setUpdatesEnabled(False)
         self.segments.blockSignals(True)
         try:
             self._segments = build_segments(self.state.project)
@@ -253,7 +252,6 @@ class GeometryDock(QWidget):
             self._populate_points()
         finally:
             self.segments.blockSignals(False)
-            self.segments.setUpdatesEnabled(True)
             self._updating = False
 
     def _max_length_changed(self, value: float):
@@ -293,7 +291,6 @@ class GeometryDock(QWidget):
         return report
 
     def _populate_findings(self):
-        self.findings.setUpdatesEnabled(False)
         self.findings.blockSignals(True)
         try:
             self.findings.setRowCount(len(self._issues))
@@ -305,7 +302,6 @@ class GeometryDock(QWidget):
                     self.findings.setItem(row, col, self._item(value, editable=False, data=row if col == 0 else None))
         finally:
             self.findings.blockSignals(False)
-            self.findings.setUpdatesEnabled(True)
         self.apply_fix_btn.setEnabled(bool(self.current_issue and self.current_issue.proposal and self.current_issue.target_point_id is not None))
 
     @property
@@ -373,7 +369,6 @@ class GeometryDock(QWidget):
     def _populate_points(self):
         segment = self.current_segment
         rows = segment_point_rows(self.state.project, segment) if segment else []
-        self.points.setUpdatesEnabled(False)
         self.points.blockSignals(True)
         try:
             self.points.setRowCount(len(rows))
@@ -391,7 +386,6 @@ class GeometryDock(QWidget):
                     self.points.setItem(row, col, self._item(value, can_edit, pid if col == 0 else None))
         finally:
             self.points.blockSignals(False)
-            self.points.setUpdatesEnabled(True)
 
     def _point_selected(self):
         if self._updating:
