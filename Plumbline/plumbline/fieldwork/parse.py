@@ -15,18 +15,20 @@ from ..core.fieldbook_syntax import (
 )
 from .io_carlson import read_fwb_file  # avoid circular: io does not import parse
 
+_TRAILING_DIGITS_RE = re.compile(r'^(.*?)(\d+)$')
+_LEADING_DIGITS_RE = re.compile(r'^(\d+)(.*)$')
+
+
 def _strip_trailing_digits(token: str):
     """Return (base, number_str) where base is token without trailing digits. If no trailing digits, number_str=''."""
-    import re
-    m = re.match(r'^(.*?)(\d+)$', token)
+    m = _TRAILING_DIGITS_RE.match(token)
     if m:
         return m.group(1), m.group(2)
     return token, ""
 
 def _strip_leading_digits(token: str):
     """Return (number_str, base) where base is token without leading digits. If no leading digits, number_str=''."""
-    import re
-    m = re.match(r'^(\d+)(.*)$', token)
+    m = _LEADING_DIGITS_RE.match(token)
     if m:
         return m.group(1), m.group(2)
     return "", token
@@ -119,19 +121,21 @@ def _extract_semantic_tokens(text: str, f2f_set, command_set, commands=None) -> 
     """Extract codes and commands while respecting active separators and compact code-command pairs."""
     from .config import get_command_map
 
-    meanings = command_meanings(commands)
     semantic_tokens = get_command_map(commands=commands)
+    meanings = command_meanings(semantic_tokens)
     multicode = semantic_tokens.get("multicode", "")
     segments = split_at_separator(text, multicode, maxsplit=0) if multicode else [text]
-    line_commands = {
-        token for token, meaning in meanings.items()
-        if meaning in COMMAND_MEANINGS[:5] and token in command_set
-    }
+    line_commands = sorted(
+        (token for token, meaning in meanings.items()
+         if meaning in COMMAND_MEANINGS[:5] and token in command_set),
+        key=len,
+        reverse=True,
+    )
     def split_compact(token, depth=0):
         low = token.casefold()
         if low in command_set or _is_known_code(token, f2f_set) or depth >= 8:
             return [token]
-        for command in sorted(line_commands, key=len, reverse=True):
+        for command in line_commands:
             if low.endswith(command) and len(token) > len(command):
                 prefix = token[:-len(command)]
                 split_prefix = split_compact(prefix, depth + 1)
@@ -471,13 +475,18 @@ def _validate_line_command_order(working_rows, f2f_set, settings=None, fieldbook
     oid_details = defaultdict(list)
     _validate_line_command_order.details = oid_details
     line_meanings = {"start_line", "start_curve", "end_curve", "end_line", "close"}
+    parsed_by_raw: dict[str, dict] = {}
 
     for idx, working_row in enumerate(working_rows):
         oid = working_row[0] if len(working_row) > 0 else str(idx)
         raw_desc = working_row[5] if len(working_row) > 5 else ""
-        parsed = parse_desc_field(
-            raw_desc, f2f_set, fieldbook_path=fieldbook_path, command_set=command_set,
-            rules=rules, commands=semantic_tokens)
+        raw_key = str(raw_desc or "")
+        parsed = parsed_by_raw.get(raw_key)
+        if parsed is None:
+            parsed = parse_desc_field(
+                raw_desc, f2f_set, fieldbook_path=fieldbook_path, command_set=command_set,
+                rules=rules, commands=semantic_tokens)
+            parsed_by_raw[raw_key] = parsed
         classified = parsed["code_classified"]
         commands_by_code_index = defaultdict(list)
         code_raw_by_index = {}

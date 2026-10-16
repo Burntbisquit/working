@@ -119,9 +119,15 @@ def detect_line_errors(working_rows, fieldbook_path=None, f2f_set=None, command_
     # multicode description. The second key component links corresponding occurrences across
     # points without merging two separate sections on the same point.
     segments_by_line: dict[tuple[str, int], list] = {}
+    parsed_by_raw: dict[str, dict] = {}
+    raw_by_oid: dict[str, str] = {}
     for oid, raw, _working_row in oid_list:
-        parsed = parse_desc_field(raw, f2f, fieldbook_path=fieldbook_path,
-                                  command_set=cs, rules=rules, commands=semantic_tokens)
+        raw_by_oid.setdefault(oid, raw)
+        parsed = parsed_by_raw.get(raw)
+        if parsed is None:
+            parsed = parse_desc_field(raw, f2f, fieldbook_path=fieldbook_path,
+                                      command_set=cs, rules=rules, commands=semantic_tokens)
+            parsed_by_raw[raw] = parsed
         classified = parsed.get("code_classified", [])
         commands_by_code_index: dict[int, list] = {}
         line_key_by_code_index: dict[int, tuple[str, int]] = {}
@@ -156,7 +162,7 @@ def detect_line_errors(working_rows, fieldbook_path=None, f2f_set=None, command_
     errors: list[dict] = []
 
     def raw_of(oid):
-        return next((raw for current_oid, raw, _row in oid_list if current_oid == str(oid)), "")
+        return raw_by_oid.get(str(oid), "")
 
     def issues_for(line_key, points):
         line_id = line_key[0]
@@ -169,12 +175,14 @@ def detect_line_errors(working_rows, fieldbook_path=None, f2f_set=None, command_
         def add(issue_type, oid, detail, suggestion):
             if issue_type not in selected_issue_types:
                 return
+            raw_desc = raw_of(oid)
             out.append({
                 "issue_type": issue_type, "oid": oid, "line_id": line_id,
                 "detail": detail, "fix_suggestion": suggestion, "seg_id": len(segments) + 1,
-                "proposal": propose_fix(issue_type, raw_of(oid), line_id,
+                "proposal": propose_fix(issue_type, raw_desc, line_id,
                                          command_set=cs, commands=semantic_tokens,
-                                         f2f_set=f2f, fieldbook_path=fieldbook_path),
+                                         f2f_set=f2f, fieldbook_path=fieldbook_path,
+                                         _parsed=parsed_by_raw.get(raw_desc)),
             })
 
         def add_order_issue():
@@ -290,7 +298,7 @@ def detect_line_errors(working_rows, fieldbook_path=None, f2f_set=None, command_
 
 # --------------------------------------------------------------------------------- the tools
 def propose_fix(issue_type: str, current_desc: str, line_id: str = "", command_set=None,
-                commands=None, f2f_set=None, fieldbook_path=None) -> str:
+                commands=None, f2f_set=None, fieldbook_path=None, *, _parsed=None) -> str:
     """Place the missing semantic command in its Field Book-defined, correctly ordered position."""
     if not (current_desc or "").strip():
         return ""
@@ -301,8 +309,8 @@ def propose_fix(issue_type: str, current_desc: str, line_id: str = "", command_s
     token_meanings = command_meanings(semantic_tokens)
     cs = _command_set(command_set, semantic_tokens)
     meanings_ordered = list(RANK)
-    parsed = None
-    if f2f_set:
+    parsed = _parsed
+    if parsed is None and f2f_set:
         parsed = parse_desc_field(current_desc, f2f_set, fieldbook_path=fieldbook_path,
                                   command_set=cs, commands=semantic_tokens)
 

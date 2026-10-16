@@ -529,7 +529,11 @@ class Project:
         for e in self.entities.values():
             if isinstance(e, Polyline) and len(e.verts):
                 v = e.verts
-                boxes.append((np.nanmin(v[:, 0]), np.nanmin(v[:, 1]), np.nanmax(v[:, 0]), np.nanmax(v[:, 1])))
+                vx, vy = v[:, 0], v[:, 1]
+                x0, y0, x1, y1 = float(vx.min()), float(vy.min()), float(vx.max()), float(vy.max())
+                if math.isnan(x0) or math.isnan(y0) or math.isnan(x1) or math.isnan(y1):
+                    x0, y0, x1, y1 = float(np.nanmin(vx)), float(np.nanmin(vy)), float(np.nanmax(vx)), float(np.nanmax(vy))
+                boxes.append((x0, y0, x1, y1))
             elif isinstance(e, TextEntity):
                 boxes.append((e.x, e.y, e.x, e.y))
         for s in self.surfaces.values():

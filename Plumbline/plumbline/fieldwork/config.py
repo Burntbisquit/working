@@ -16,6 +16,7 @@ Key rulings (locked):
 """
 
 # config.py — constants, headers, tolerances
+import functools
 import re
 from pathlib import Path
 
@@ -150,6 +151,7 @@ GENERAL_START = 10000
 # Used for renumbering; locked behind cleaned descriptions (all flags Skipped/Fixed)
 DEFAULT_CREW_NUMBER = 3
 
+@functools.lru_cache(maxsize=16)
 def crew_blocks(crew: int) -> list[tuple[int, int]]:
     """Return list of (start, end) inclusive for crew blocks across magnitudes.
     Crew must be 1-9. Blocks are crew * 10^k  to crew*10^k + 10^k -1 for k=2..6 (3-digit up to 7-digit).
@@ -164,11 +166,14 @@ def crew_blocks(crew: int) -> list[tuple[int, int]]:
         blocks.append((start, end))
     return blocks
 
-def is_in_crew_block(pt_num: str, crew: int) -> bool:
-    try:
-        n = int(str(pt_num).strip())
-    except:
-        return False
+def is_in_crew_block(pt_num: str | int, crew: int) -> bool:
+    if isinstance(pt_num, int):
+        n = pt_num
+    else:
+        try:
+            n = int(str(pt_num).strip())
+        except Exception:
+            return False
     for s, e in crew_blocks(crew):
         if s <= n <= e:
             return True
