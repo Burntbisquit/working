@@ -1109,8 +1109,10 @@ def _check_cached(project, *, scope: str, check_function, f2f=None, fieldbook_pa
             check_kwargs["elev_tol"] = elev_tol
         if control_file is not None:
             check_kwargs["control_file"] = control_file
-    check_kwargs["_prepared_rows"] = prepared
-    result = check_function(project, **check_kwargs)
+    try:
+        result = check_function(project, _prepared_rows=prepared, **check_kwargs)
+    except TypeError:
+        result = check_function(project, **check_kwargs)
     cached_result = copy.deepcopy(result)
     with _CHECK_PROJECT_CACHE_LOCK:
         entries = _CHECK_PROJECT_CACHE.setdefault(project, {})

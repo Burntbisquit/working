@@ -27,12 +27,12 @@ class SceneProvider(QObject):
     """One snapshot of the project for both the 3D and the depth view, rebuilt only when somebody asks after a change."""
     changed = Signal()
 
-    def __init__(self, state):
-        super().__init__()
+    def __init__(self, state, parent=None):
+        super().__init__(parent)
         self.state = state
         self._scene: S.Scene | None = None
         self._key = None
-        state.changed.connect(lambda kinds: self.invalidate())
+        state.changed.connect(self.invalidate)
         state.project_replaced.connect(self.invalidate)
 
     def invalidate(self, *_):

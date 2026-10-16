@@ -103,8 +103,11 @@ class GeometryDock(QWidget):
         self.segments.setSelectionMode(QAbstractItemView.SingleSelection)
         self.segments.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.segments.verticalHeader().setVisible(False)
-        self.segments.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self.segments.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        seg_hdr = self.segments.horizontalHeader()
+        seg_hdr.setSectionResizeMode(QHeaderView.Interactive)
+        seg_hdr.setSectionResizeMode(4, QHeaderView.Stretch)
+        for col, width in ((0, 90), (1, 65), (2, 55), (3, 75), (5, 75), (6, 60)):
+            self.segments.setColumnWidth(col, width)
         self.segments.itemSelectionChanged.connect(self._segment_selected)
         lay.addWidget(self.segments, 1)
 
@@ -114,8 +117,11 @@ class GeometryDock(QWidget):
         self.points.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.points.setSelectionMode(QAbstractItemView.SingleSelection)
         self.points.verticalHeader().setVisible(False)
-        self.points.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self.points.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        pt_hdr = self.points.horizontalHeader()
+        pt_hdr.setSectionResizeMode(QHeaderView.Interactive)
+        pt_hdr.setSectionResizeMode(3, QHeaderView.Stretch)
+        for col, width in ((0, 60), (1, 65), (2, 75), (4, 95), (5, 95), (6, 75), (7, 75), (8, 55)):
+            self.points.setColumnWidth(col, width)
         self.points.itemSelectionChanged.connect(self._point_selected)
         self.points.itemChanged.connect(self._point_changed)
         lay.addWidget(self.points, 1)
@@ -191,8 +197,11 @@ class GeometryDock(QWidget):
         self.findings.setSelectionMode(QAbstractItemView.SingleSelection)
         self.findings.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.findings.verticalHeader().setVisible(False)
-        self.findings.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self.findings.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        find_hdr = self.findings.horizontalHeader()
+        find_hdr.setSectionResizeMode(QHeaderView.Interactive)
+        find_hdr.setSectionResizeMode(3, QHeaderView.Stretch)
+        for col, width in ((0, 120), (1, 100), (2, 90), (4, 130)):
+            self.findings.setColumnWidth(col, width)
         self.findings.itemSelectionChanged.connect(self._finding_selected)
         lay.addWidget(self.findings, 1)
 
@@ -216,6 +225,8 @@ class GeometryDock(QWidget):
         selected_id = self.current_segment.entity_id if keep_selection and self.current_segment else None
         selected_seg_id = self.current_segment.seg_id if keep_selection and self.current_segment else None
         self._updating = True
+        self.segments.setUpdatesEnabled(False)
+        self.segments.blockSignals(True)
         try:
             self._segments = build_segments(self.state.project)
             self.segments.setRowCount(len(self._segments))
@@ -240,9 +251,9 @@ class GeometryDock(QWidget):
             self.max_length_spin.setValue(default_max_segment_length(self.state.project))
             self.max_length_spin.blockSignals(False)
             self._populate_points()
-            if self.last_check_report is not None:
-                self._run_checks_internal()
         finally:
+            self.segments.blockSignals(False)
+            self.segments.setUpdatesEnabled(True)
             self._updating = False
 
     def _max_length_changed(self, value: float):
@@ -282,13 +293,19 @@ class GeometryDock(QWidget):
         return report
 
     def _populate_findings(self):
-        self.findings.setRowCount(len(self._issues))
-        for row, issue in enumerate(self._issues):
-            seg_text = ", ".join(issue.seg_ids) if issue.seg_ids else "—"
-            pt_text = ", ".join(issue.point_numbers) if issue.point_numbers else "—"
-            values = [issue.title, seg_text, pt_text, issue.detail, issue.proposal]
-            for col, value in enumerate(values):
-                self.findings.setItem(row, col, self._item(value, editable=False, data=row if col == 0 else None))
+        self.findings.setUpdatesEnabled(False)
+        self.findings.blockSignals(True)
+        try:
+            self.findings.setRowCount(len(self._issues))
+            for row, issue in enumerate(self._issues):
+                seg_text = ", ".join(issue.seg_ids) if issue.seg_ids else "—"
+                pt_text = ", ".join(issue.point_numbers) if issue.point_numbers else "—"
+                values = [issue.title, seg_text, pt_text, issue.detail, issue.proposal]
+                for col, value in enumerate(values):
+                    self.findings.setItem(row, col, self._item(value, editable=False, data=row if col == 0 else None))
+        finally:
+            self.findings.blockSignals(False)
+            self.findings.setUpdatesEnabled(True)
         self.apply_fix_btn.setEnabled(bool(self.current_issue and self.current_issue.proposal and self.current_issue.target_point_id is not None))
 
     @property
@@ -356,19 +373,25 @@ class GeometryDock(QWidget):
     def _populate_points(self):
         segment = self.current_segment
         rows = segment_point_rows(self.state.project, segment) if segment else []
-        self.points.setRowCount(len(rows))
-        for row, point in enumerate(rows):
-            pid = point["point_id"]
-            editable = bool(point["linked"])
-            z_text = "" if not math.isfinite(point["z"]) else f"{point['z']:.4f}"
-            code_prefix = f"{segment.code}{segment.string}" if segment else ""
-            values = [point["number"], code_prefix, self._command_text(point["desc"]), point["desc"],
-                      f"{point['x']:.4f}", f"{point['y']:.4f}", z_text,
-                      "" if point["to_next"] is None else f"{point['to_next']:.3f}",
-                      "Point" if editable else "Node"]
-            for col, value in enumerate(values):
-                can_edit = editable and col in (1, 2, 3, 4, 5, 6)
-                self.points.setItem(row, col, self._item(value, can_edit, pid if col == 0 else None))
+        self.points.setUpdatesEnabled(False)
+        self.points.blockSignals(True)
+        try:
+            self.points.setRowCount(len(rows))
+            for row, point in enumerate(rows):
+                pid = point["point_id"]
+                editable = bool(point["linked"])
+                z_text = "" if not math.isfinite(point["z"]) else f"{point['z']:.4f}"
+                code_prefix = f"{segment.code}{segment.string}" if segment else ""
+                values = [point["number"], code_prefix, self._command_text(point["desc"]), point["desc"],
+                          f"{point['x']:.4f}", f"{point['y']:.4f}", z_text,
+                          "" if point["to_next"] is None else f"{point['to_next']:.3f}",
+                          "Point" if editable else "Node"]
+                for col, value in enumerate(values):
+                    can_edit = editable and col in (1, 2, 3, 4, 5, 6)
+                    self.points.setItem(row, col, self._item(value, can_edit, pid if col == 0 else None))
+        finally:
+            self.points.blockSignals(False)
+            self.points.setUpdatesEnabled(True)
 
     def _point_selected(self):
         if self._updating:

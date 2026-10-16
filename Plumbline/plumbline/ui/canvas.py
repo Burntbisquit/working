@@ -33,7 +33,7 @@ class CanvasView(QWidget):
         self.state = state
         self.view = View(0, 0, 1.0, 800, 600)
         self.opts = DisplayOptions()
-        self.imagery = ImageryManager(state)
+        self.imagery = ImageryManager(state, self)
         self.renderer = SceneRenderer(state, self.imagery)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)

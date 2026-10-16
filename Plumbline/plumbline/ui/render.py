@@ -321,8 +321,8 @@ class ImageryManager(QObject):
 
     MAX_PIX = 420
 
-    def __init__(self, state):
-        super().__init__()
+    def __init__(self, state, parent=None):
+        super().__init__(parent)
         self.state = state
         self._pix: OrderedDict = OrderedDict()
         self._geo: dict = {}

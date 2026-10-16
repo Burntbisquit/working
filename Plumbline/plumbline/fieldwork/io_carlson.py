@@ -207,14 +207,24 @@ def write_fwb_extra(file_path: Path, rules=None, commands=None):
                           extra_fields=extras)
 
 
+_FWB_FILE_CACHE: dict[tuple, tuple[list[str], list[list[str]]]] = {}
+
+
 def read_fwb_file(file_path: Path):
     """Read a headered .fwb file. Returns (headers, rows) or (None, None) on fail.
 
     Rows beyond 6 columns are truncated; short rows are padded. Header row
     is consumed (not returned as data). Blank rows and #EXTRA_JSON comment lines are skipped.
     """
+    p = Path(file_path)
+    sig = _stat_sig(p)
+    cache_key = (str(p), sig)
+    if sig is not None:
+        cached = _FWB_FILE_CACHE.get(cache_key)
+        if cached is not None:
+            return list(cached[0]), [list(r) for r in cached[1]]
     try:
-        with open(file_path, "r", encoding="utf-8-sig", errors="ignore", newline="") as f:
+        with open(p, "r", encoding="utf-8-sig", errors="ignore", newline="") as f:
             # Pre-filter comment lines before csv parsing to keep simple
             lines = []
             for line in f:
@@ -247,6 +257,10 @@ def read_fwb_file(file_path: Path):
                 if len(row) < 6:
                     row.extend([""] * (6 - len(row)))
                 rows.append(row[:6])
+            if sig is not None:
+                if len(_FWB_FILE_CACHE) >= 64:
+                    _FWB_FILE_CACHE.clear()
+                _FWB_FILE_CACHE[cache_key] = (list(headers), [list(r) for r in rows])
             return headers, rows
     except (OSError, csv.Error) as e:
         print(f"Read .fwb failed {file_path}: {e}")

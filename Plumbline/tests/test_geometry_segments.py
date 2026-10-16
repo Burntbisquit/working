@@ -146,4 +146,57 @@ def test_geometry_dock_runs_checks_and_applies_command_fix():
     assert "ST" in project.points[p1.id].desc.upper()
 
 
+def test_fix_point_errors_save_edits_keeps_docks_responsive():
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication, QHeaderView
+    from plumbline.core.featurecodes import default_codes
+    from plumbline.ui.app_state import AppState
+    from plumbline.ui.main_window import MainWindow
+    from plumbline.ui.qa_workspace import FixPointErrorsDialog
+
+    app = QApplication.instance() or QApplication([])
+    project = Project("Responsive Save Edits")
+    project.codes = default_codes()
+    p1 = project.add_point(0.0, 0.0, 100.0, number="101", desc="EP1 ST")
+    p2 = project.add_point(50.0, 0.0, 100.0, number="102", desc="EP1 END")
+    p_bad = project.add_point(10.0, 10.0, 100.0, number="103", desc="EP1/NOTE")
+    project.add_polyline(
+        [[p1.x, p1.y, p1.z], [p2.x, p2.y, p2.z]],
+        "ROAD-PAVEMENT",
+        attrs={"code": "EP", "string": "1", "point_ids": [p1.id, p2.id]},
+        derived="linework",
+        kind="breakline",
+    )
+
+    state = AppState(project)
+    win = MainWindow(state)
+    win.show()
+    app.processEvents()
+
+    for table in (win.geometry.segments, win.geometry.points, win.geometry.findings, win.fieldbook_dock.tbl):
+        for col in range(table.columnCount()):
+            assert table.horizontalHeader().sectionResizeMode(col) != QHeaderView.ResizeToContents
+
+    dlg = FixPointErrorsDialog(state, win)
+    win._show_modal_qa_workbench(dlg)
+    app.processEvents()
+
+    sep_finding = next(
+        (f for f in dlg.active_findings if not f.get("zero_check") and p_bad.id in f.get("pids", [])),
+        None,
+    )
+    if sep_finding is not None:
+        dlg._open_inline_editor(sep_finding)
+        if getattr(dlg, "sep_corrections", None):
+            dlg.sep_corrections[0][3].setCurrentText("Correct")
+            assert dlg._action_save_issue()
+            assert dlg.stack.currentIndex() == 0
+
+    assert dlg._save_and_exit()
+    app.processEvents()
+    win.close()
+    app.processEvents()
+
+
+
 

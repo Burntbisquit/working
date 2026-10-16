@@ -897,7 +897,7 @@ class BaseQAWorkbenchWindow(QMainWindow):
         self.split_views.addWidget(self.canvas)
 
         # 3D Elevation / Terrain Canvas
-        self.scene_provider = SceneProvider(self.state)
+        self.scene_provider = SceneProvider(self.state, self)
         self.view3d = View3D(
             self.state, self.scene_provider, parent=self,
             auto_fit_vexag=not self.enable_flag_navigation,
@@ -1658,107 +1658,119 @@ class BaseQAWorkbenchWindow(QMainWindow):
         self.error_point_ids = err_pids
 
         # Populate findings plus zero-count check rows; those rows open read-only review pages.
-        self.tbl_active.setRowCount(len(summary_findings))
-        dark = theme.current() == "dark"
-        c_resolved_bg = QColor(24, 48, 32, 180) if dark else QColor(235, 247, 238)
-        brush_resolved = QBrush(c_resolved_bg)
+        self.tbl_active.setUpdatesEnabled(False)
+        self.tbl_active.blockSignals(True)
+        try:
+            self.tbl_active.setRowCount(len(summary_findings))
+            dark = theme.current() == "dark"
+            c_resolved_bg = QColor(24, 48, 32, 180) if dark else QColor(235, 247, 238)
+            brush_resolved = QBrush(c_resolved_bg)
 
-        for r, item in enumerate(summary_findings):
-            st = item.get("status", "active")
-            is_res = st == "resolved"
-            is_part = st == "partial"
-            is_zero = bool(item.get("zero_check"))
-            is_clear = is_zero and st == "clear"
-            is_not_run = is_zero and st == "not_run"
+            for r, item in enumerate(summary_findings):
+                st = item.get("status", "active")
+                is_res = st == "resolved"
+                is_part = st == "partial"
+                is_zero = bool(item.get("zero_check"))
+                is_clear = is_zero and st == "clear"
+                is_not_run = is_zero and st == "not_run"
 
-            # Col 0: Edit / Review button
-            btn_edit = QPushButton("Review" if is_res or is_zero else "Edit")
-            btn_edit.setProperty("accent", not (is_res or is_zero))
-            btn_edit.setToolTip(
-                "Open the check results page" if is_zero else
-                "Review resolutions for this issue" if is_res else
-                "Open issue resolution screen")
-            btn_edit.clicked.connect(lambda _, it=item: self._open_inline_editor(it))
-            self.tbl_active.setCellWidget(r, 0, btn_edit)
+                # Col 0: Edit / Review button
+                btn_edit = QPushButton("Review" if is_res or is_zero else "Edit")
+                btn_edit.setProperty("accent", not (is_res or is_zero))
+                btn_edit.setToolTip(
+                    "Open the check results page" if is_zero else
+                    "Review resolutions for this issue" if is_res else
+                    "Open issue resolution screen")
+                btn_edit.clicked.connect(lambda _, it=item: self._open_inline_editor(it))
+                self.tbl_active.setCellWidget(r, 0, btn_edit)
 
-            # Col 1: Status / Level
-            if is_clear or is_res:
-                status_text = "CLEAR" if is_clear else "RESOLVED"
-                item_lvl = QTableWidgetItem(status_text)
-                item_lvl.setForeground(QColor("#27ae60"))
-                fnt = item_lvl.font()
-                fnt.setBold(True)
-                item_lvl.setFont(fnt)
-                item_lvl.setBackground(brush_resolved)
-            elif is_not_run:
-                item_lvl = QTableWidgetItem("NOT RUN")
-                item_lvl.setForeground(QColor("#3498db"))
-                fnt = item_lvl.font()
-                fnt.setBold(True)
-                item_lvl.setFont(fnt)
-            elif is_part:
-                item_lvl = QTableWidgetItem("PARTIAL")
-                item_lvl.setForeground(QColor("#f39c12"))
-                fnt = item_lvl.font()
-                fnt.setBold(True)
-                item_lvl.setFont(fnt)
-            else:
-                lvl = item.get("level", "warn")
-                item_lvl = QTableWidgetItem(lvl.upper())
-                if lvl == "error":
-                    item_lvl.setForeground(QColor("#e74c3c"))
-                elif lvl == "warn":
-                    item_lvl.setForeground(QColor("#f39c12"))
-                else:
+                # Col 1: Status / Level
+                if is_clear or is_res:
+                    status_text = "CLEAR" if is_clear else "RESOLVED"
+                    item_lvl = QTableWidgetItem(status_text)
+                    item_lvl.setForeground(QColor("#27ae60"))
+                    fnt = item_lvl.font()
+                    fnt.setBold(True)
+                    item_lvl.setFont(fnt)
+                    item_lvl.setBackground(brush_resolved)
+                elif is_not_run:
+                    item_lvl = QTableWidgetItem("NOT RUN")
                     item_lvl.setForeground(QColor("#3498db"))
-                fnt = item_lvl.font()
-                fnt.setBold(True)
-                item_lvl.setFont(fnt)
-            self.tbl_active.setItem(r, 1, item_lvl)
+                    fnt = item_lvl.font()
+                    fnt.setBold(True)
+                    item_lvl.setFont(fnt)
+                elif is_part:
+                    item_lvl = QTableWidgetItem("PARTIAL")
+                    item_lvl.setForeground(QColor("#f39c12"))
+                    fnt = item_lvl.font()
+                    fnt.setBold(True)
+                    item_lvl.setFont(fnt)
+                else:
+                    lvl = item.get("level", "warn")
+                    item_lvl = QTableWidgetItem(lvl.upper())
+                    if lvl == "error":
+                        item_lvl.setForeground(QColor("#e74c3c"))
+                    elif lvl == "warn":
+                        item_lvl.setForeground(QColor("#f39c12"))
+                    else:
+                        item_lvl.setForeground(QColor("#3498db"))
+                    fnt = item_lvl.font()
+                    fnt.setBold(True)
+                    item_lvl.setFont(fnt)
+                self.tbl_active.setItem(r, 1, item_lvl)
 
-            # Col 2: Check Name
-            it_chk = QTableWidgetItem(_finding_display_name(item))
-            if is_clear or is_res:
-                it_chk.setBackground(brush_resolved)
-            self.tbl_active.setItem(r, 2, it_chk)
+                # Col 2: Check Name
+                it_chk = QTableWidgetItem(_finding_display_name(item))
+                if is_clear or is_res:
+                    it_chk.setBackground(brush_resolved)
+                self.tbl_active.setItem(r, 2, it_chk)
 
-            # Col 3: Resolution Summary / Details
-            if is_res:
-                res_texts = item.get("resolutions") or ["Resolved"]
-                it_det = QTableWidgetItem("✓ " + " | ".join(res_texts))
-                it_det.setForeground(QColor("#27ae60"))
-                it_det.setBackground(brush_resolved)
-            elif is_part:
-                res_texts = item.get("resolutions") or ["Partial"]
-                rem_cnt = len(item.get("pids", []))
-                it_det = QTableWidgetItem("✓ " + " | ".join(res_texts) + f" ({rem_cnt} remaining)")
-                it_det.setForeground(QColor("#f39c12"))
-            else:
-                detail = item.get("detail") or item.get("message") or ""
-                it_det = QTableWidgetItem(detail)
-            self.tbl_active.setItem(r, 3, it_det)
+                # Col 3: Resolution Summary / Details
+                if is_res:
+                    res_texts = item.get("resolutions") or ["Resolved"]
+                    it_det = QTableWidgetItem("✓ " + " | ".join(res_texts))
+                    it_det.setForeground(QColor("#27ae60"))
+                    it_det.setBackground(brush_resolved)
+                elif is_part:
+                    res_texts = item.get("resolutions") or ["Partial"]
+                    rem_cnt = len(item.get("pids", []))
+                    it_det = QTableWidgetItem("✓ " + " | ".join(res_texts) + f" ({rem_cnt} remaining)")
+                    it_det.setForeground(QColor("#f39c12"))
+                else:
+                    detail = item.get("detail") or item.get("message") or ""
+                    it_det = QTableWidgetItem(detail)
+                self.tbl_active.setItem(r, 3, it_det)
 
-            # Col 4 shows affected numbers for findings, and the finding count for clear checks.
-            if is_zero:
-                point_text = "0"
-            else:
-                p_nums = item.get("points") or [
-                    str(pr.points[pid].number) for pid in item.get("pids", []) if pid in pr.points]
-                point_text = ", ".join(str(point) for point in p_nums)
-            it_pts = QTableWidgetItem(point_text)
-            if is_clear or is_res:
-                it_pts.setBackground(brush_resolved)
-            self.tbl_active.setItem(r, 4, it_pts)
+                # Col 4 shows affected numbers for findings, and the finding count for clear checks.
+                if is_zero:
+                    point_text = "0"
+                else:
+                    p_nums = item.get("points") or [
+                        str(pr.points[pid].number) for pid in item.get("pids", []) if pid in pr.points]
+                    point_text = ", ".join(str(point) for point in p_nums)
+                it_pts = QTableWidgetItem(point_text)
+                if is_clear or is_res:
+                    it_pts.setBackground(brush_resolved)
+                self.tbl_active.setItem(r, 4, it_pts)
+        finally:
+            self.tbl_active.blockSignals(False)
+            self.tbl_active.setUpdatesEnabled(True)
 
         # Populate Resolved Table (History / Reference)
-        self.tbl_resolved.setRowCount(len(self.resolved_findings))
-        for r, item in enumerate(self.resolved_findings):
-            item_lvl = QTableWidgetItem("RESOLVED")
-            item_lvl.setForeground(QColor("#52c41a"))
-            self.tbl_resolved.setItem(r, 0, item_lvl)
-            self.tbl_resolved.setItem(r, 1, QTableWidgetItem(_finding_display_name(item)))
-            self.tbl_resolved.setItem(r, 2, QTableWidgetItem(item.get("resolution", "Resolved")))
-            self.tbl_resolved.setItem(r, 3, QTableWidgetItem(", ".join(str(p) for p in item.get("points", []))))
+        self.tbl_resolved.setUpdatesEnabled(False)
+        self.tbl_resolved.blockSignals(True)
+        try:
+            self.tbl_resolved.setRowCount(len(self.resolved_findings))
+            for r, item in enumerate(self.resolved_findings):
+                item_lvl = QTableWidgetItem("RESOLVED")
+                item_lvl.setForeground(QColor("#52c41a"))
+                self.tbl_resolved.setItem(r, 0, item_lvl)
+                self.tbl_resolved.setItem(r, 1, QTableWidgetItem(_finding_display_name(item)))
+                self.tbl_resolved.setItem(r, 2, QTableWidgetItem(item.get("resolution", "Resolved")))
+                self.tbl_resolved.setItem(r, 3, QTableWidgetItem(", ".join(str(p) for p in item.get("points", []))))
+        finally:
+            self.tbl_resolved.blockSignals(False)
+            self.tbl_resolved.setUpdatesEnabled(True)
 
         resolved_count = sum(1 for f in visible_tracked if f.get("status") == "resolved")
         active_count = len(visible_tracked) - resolved_count
@@ -2193,7 +2205,7 @@ class BaseQAWorkbenchWindow(QMainWindow):
 
         if self._has_unapplied_issue_edits():
             if getattr(self, "stack_action_combos", {}):
-                applied = self._action_apply_staged_stack_actions()
+                applied = self._action_apply_staged_stack_actions(return_to_summary=return_to_summary)
             else:
                 applied = self._apply_pending_issue_edits(return_to_summary=return_to_summary)
         elif return_to_summary and self.stack.currentIndex() == 1:
@@ -2783,6 +2795,7 @@ class BaseQAWorkbenchWindow(QMainWindow):
         ignored_points: list[int] | None = None,
         project_changed: bool = True,
         include_unchanged_points: set[int] | None = None,
+        rebuild_editor: bool = True,
     ):
         pr = self.state.project
         cur_finding = self.current_edit_finding
@@ -2876,7 +2889,8 @@ class BaseQAWorkbenchWindow(QMainWindow):
             self._sync_view_flags()
 
         if stay_on_edit_page and cur_finding:
-            self._open_inline_editor(cur_finding, start_session=False)
+            if rebuild_editor:
+                self._open_inline_editor(cur_finding, start_session=False)
         else:
             self._show_summary_page(recheck=False, refresh=False)
 
@@ -2944,6 +2958,26 @@ class BaseQAWorkbenchWindow(QMainWindow):
         self._restore_before_exit()
         self.close()
 
+    def _disconnect_state_signals(self):
+        """Disconnect this workbench's views from shared AppState signals upon closing."""
+        state = getattr(self, "state", None)
+        if state is None:
+            return
+        for sig, slot in (
+            (state.changed, getattr(self.canvas, "_on_changed", None)),
+            (state.selection_changed, getattr(self.canvas, "update", None)),
+            (state.project_replaced, getattr(self.canvas, "_on_project_replaced", None)),
+            (state.view_request, getattr(self.canvas, "handle_view_request", None)),
+            (state.changed, getattr(self.scene_provider, "invalidate", None)),
+            (state.project_replaced, getattr(self.scene_provider, "invalidate", None)),
+            (state.selection_changed, getattr(self.view3d, "invalidate", None)),
+        ):
+            if slot is not None:
+                try:
+                    sig.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+
     def closeEvent(self, event):
         if self.dirty or self._has_unapplied_issue_edits():
             mb = QMessageBox(self)
@@ -2968,6 +3002,13 @@ class BaseQAWorkbenchWindow(QMainWindow):
                 event.ignore()
         else:
             event.accept()
+        if event.isAccepted():
+            self._disconnect_state_signals()
+            self.setWindowModality(Qt.NonModal)
+            super().closeEvent(event)
+            parent = self.parentWidget()
+            if parent is not None and parent.isVisible():
+                QTimer.singleShot(0, parent.activateWindow)
 
 
 # ============================================================================
@@ -3528,7 +3569,7 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
             return "<i style='color: #888;'>No description</i>"
         raw_s = str(orig_desc)
         f2f_set = self.code_set or set()
-        parsed = parse_desc_field(raw_s, f2f_set)
+        parsed = parse_desc_field(raw_s, f2f_set, fieldbook_path=self.fieldbook_path or None)
         bad_tokens = set()
         for item in parsed.get("code_classified", []):
             if item.get("error") == "UnknownCode" or item.get("status") == "unknown":
@@ -3583,7 +3624,7 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
         if not s:
             return False, "Empty description"
         f_set = f2f_set if f2f_set is not None else (self.code_set or set())
-        parsed = parse_desc_field(s, f_set)
+        parsed = parse_desc_field(s, f_set, fieldbook_path=self.fieldbook_path or None)
         bad_tokens = []
         for item in parsed.get("code_classified", []):
             if item.get("error") == "UnknownCode" or item.get("status") == "unknown":
@@ -3598,6 +3639,14 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
     def _load_fieldbook_lookup_rows(self) -> list[tuple[str, str, str]]:
         """Return list of (code, description, category) tuples for Fieldbook lookup."""
         pr = self.state.project
+        cache_key = (
+            self.fieldbook_path,
+            len(self.code_set or ()),
+            len(getattr(pr, "codes", ()) or ()),
+            (pr.settings or {}).get("fieldbook_file") if hasattr(pr, "settings") else None,
+        )
+        if getattr(self, "_fb_lookup_cache_key", None) == cache_key and hasattr(self, "_fb_lookup_cache_rows"):
+            return list(self._fb_lookup_cache_rows)
         rows: list[tuple[str, str, str]] = []
         seen = set()
 
@@ -3669,7 +3718,10 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
                 rows.append((c_str.upper(), "", "General"))
                 seen.add(c_str.casefold())
 
-        return sorted(rows, key=lambda x: (x[2].casefold(), x[0].casefold()))
+        sorted_rows = sorted(rows, key=lambda x: (x[2].casefold(), x[0].casefold()))
+        self._fb_lookup_cache_key = cache_key
+        self._fb_lookup_cache_rows = list(sorted_rows)
+        return sorted_rows
 
     def _fb_apply_filter(self):
         if not hasattr(self, "fb_table") or not hasattr(self, "fb_all_rows"):
@@ -3685,17 +3737,23 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
                 continue
             filtered.append((c, d, k))
 
-        self.fb_table.setRowCount(len(filtered))
-        for r, (c, d, k) in enumerate(filtered):
-            it_c = QTableWidgetItem(c)
-            it_c.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            it_d = QTableWidgetItem(d)
-            it_d.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            it_k = QTableWidgetItem(k)
-            it_k.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            self.fb_table.setItem(r, 0, it_c)
-            self.fb_table.setItem(r, 1, it_d)
-            self.fb_table.setItem(r, 2, it_k)
+        self.fb_table.setUpdatesEnabled(False)
+        self.fb_table.blockSignals(True)
+        try:
+            self.fb_table.setRowCount(len(filtered))
+            for r, (c, d, k) in enumerate(filtered):
+                it_c = QTableWidgetItem(c)
+                it_c.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                it_d = QTableWidgetItem(d)
+                it_d.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                it_k = QTableWidgetItem(k)
+                it_k.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                self.fb_table.setItem(r, 0, it_c)
+                self.fb_table.setItem(r, 1, it_d)
+                self.fb_table.setItem(r, 2, it_k)
+        finally:
+            self.fb_table.blockSignals(False)
+            self.fb_table.setUpdatesEnabled(True)
 
         total = len(self.fb_all_rows)
         self.fb_count_lbl.setText(f"Showing {len(filtered)} of {total} codes")
@@ -3720,7 +3778,7 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
                 target_ed.setText(code_to_insert)
             else:
                 from ..fieldwork.parse import parse_desc_field
-                parsed = parse_desc_field(cur_txt, self.code_set or set())
+                parsed = parse_desc_field(cur_txt, self.code_set or set(), fieldbook_path=self.fieldbook_path or None)
                 bad_tokens = []
                 for item in parsed.get("code_classified", []):
                     if item.get("error") == "UnknownCode" or item.get("status") == "unknown":
@@ -3807,7 +3865,7 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
         self._on_stack_action_changed(key, combo)
         return True
 
-    def _action_apply_staged_stack_actions(self) -> bool:
+    def _action_apply_staged_stack_actions(self, *, return_to_summary: bool = False) -> bool:
         """Apply every staged stack action as one undoable, minimally logged batch."""
         finding = self.current_edit_finding
         if finding is None:
@@ -4008,7 +4066,7 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
             resolution_desc,
             do_it,
             resolved_points=list(dict.fromkeys(resolved_ids)),
-            stay_on_edit_page=True,
+            stay_on_edit_page=not return_to_summary,
             ignored_points=list(dict.fromkeys(ignored_ids)),
             project_changed=project_changed,
             include_unchanged_points=audit_unchanged_ids,
@@ -4319,6 +4377,7 @@ class FixPointErrorsDialog(BaseQAWorkbenchWindow):
             stay_on_edit_page=not return_to_summary,
             ignored_points=[p.id for p in to_ignore],
             project_changed=any((p.desc or "") != txt for p, txt in to_correct),
+            rebuild_editor=not bool(to_skip),
         )
 
         if return_to_summary:
