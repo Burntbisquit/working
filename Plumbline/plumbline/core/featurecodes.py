@@ -444,24 +444,43 @@ def build_linework(points, table: FeatureCodeTable, order: str = "file", command
             return bool(parsed.flags & CLOSE_FLAGS)
         return False
 
+    desc_sep = semantic_tokens.get("description", "")
+    multi_sep = semantic_tokens.get("multicode", "")
+    multi_token = multi_sep.strip() if multi_sep else ""
+
     for point in pts:
-        parsed = parse_description(point.desc, commands=semantic_tokens, known_codes=table.codes)
-        feature_code = table.codes.get(parsed.code) if parsed.code else None
-        string_id = parsed.string
-        if feature_code is None or feature_code.kind == "point":
-            continue
-        key = (feature_code.code, string_id)
-        if has_meaning(parsed, "start_line"):
-            flush(key)
-        line = open_.get(key)
-        if line is None:
-            line = open_[key] = LineString(feature_code.code, string_id)
-            line.closed = feature_code.kind == "polygon"
-        line.ids.append(point.id)
-        if has_meaning(parsed, "close"):
-            flush(key, closed=True)
-        elif has_meaning(parsed, "end_line"):
-            flush(key)
+        raw_desc = point.desc or ""
+        if multi_token and multi_token in raw_desc:
+            code_part = raw_desc
+            if desc_sep:
+                desc_idx = find_separator(code_part, desc_sep)
+                if desc_idx >= 0:
+                    code_part = code_part[:desc_idx]
+            sections = [s.strip() for s in split_at_separator(code_part, multi_sep, maxsplit=0) if s.strip()]
+            parsed_sections = [
+                parse_description(sec, commands=semantic_tokens, known_codes=table.codes)
+                for sec in sections
+            ]
+        else:
+            parsed_sections = [parse_description(raw_desc, commands=semantic_tokens, known_codes=table.codes)]
+
+        for parsed in parsed_sections:
+            feature_code = table.codes.get(parsed.code) if parsed.code else None
+            string_id = parsed.string
+            if feature_code is None or feature_code.kind == "point":
+                continue
+            key = (feature_code.code, string_id)
+            if has_meaning(parsed, "start_line"):
+                flush(key)
+            line = open_.get(key)
+            if line is None:
+                line = open_[key] = LineString(feature_code.code, string_id)
+                line.closed = feature_code.kind == "polygon"
+            line.ids.append(point.id)
+            if has_meaning(parsed, "close"):
+                flush(key, closed=True)
+            elif has_meaning(parsed, "end_line"):
+                flush(key)
     for key in list(open_):
         flush(key)
     return out

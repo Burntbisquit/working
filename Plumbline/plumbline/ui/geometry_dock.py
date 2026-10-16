@@ -11,6 +11,12 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QDoubleSpinBox, QHB
 from ..core.crossings import (GeometryCheckReport, GeometryIssue,
                               default_max_segment_length, run_geometry_checks)
 from ..core.geometry_segments import Segment, build_segments, segment_point_rows
+from ..core.geometry_tools import (ShrinkCommandPreview, add_polyline_node,
+                                   apply_connect_segments, apply_shrink_line_commands,
+                                   cogo_points_from_lines, flip_past, inject_survey_point,
+                                   join_lines_average, move_line_end_to_end, nudge_point,
+                                   preview_connect_segments, preview_shrink_line_commands,
+                                   untwist_polyline)
 from ..core.model import Polyline
 
 
@@ -66,6 +72,39 @@ class GeometryDock(QWidget):
         self.points.itemSelectionChanged.connect(self._point_selected)
         self.points.itemChanged.connect(self._point_changed)
         lay.addWidget(self.points, 1)
+
+        tools_bar = QHBoxLayout()
+        self.untwist_btn = QPushButton("Untwist")
+        self.untwist_btn.setToolTip("Uncross a self-crossing bowtie on the selected segment.")
+        self.untwist_btn.clicked.connect(self.untwist_selected)
+        tools_bar.addWidget(self.untwist_btn)
+
+        self.flip_btn = QPushButton("Flip past")
+        self.flip_btn.setToolTip("Reflect the selected interior vertex across its adjacent chord.")
+        self.flip_btn.clicked.connect(self.flip_past_selected)
+        tools_bar.addWidget(self.flip_btn)
+
+        self.add_node_btn = QPushButton("Add node")
+        self.add_node_btn.setToolTip("Insert a pure geometry node (no survey point) after the selected vertex.")
+        self.add_node_btn.clicked.connect(self.add_node_selected)
+        tools_bar.addWidget(self.add_node_btn)
+
+        self.inject_pt_btn = QPushButton("Inject point")
+        self.inject_pt_btn.setToolTip("Insert a numbered survey point after the selected vertex.")
+        self.inject_pt_btn.clicked.connect(self.inject_point_selected)
+        tools_bar.addWidget(self.inject_pt_btn)
+
+        self.cogo_btn = QPushButton("COGO from lines")
+        self.cogo_btn.setToolTip("Create deduplicated survey points at endpoints of the selected polyline.")
+        self.cogo_btn.clicked.connect(self.cogo_from_selected)
+        tools_bar.addWidget(self.cogo_btn)
+
+        self.shrink_btn = QPushButton("Shrink Line Commands")
+        self.shrink_btn.setToolTip("Repair missing ST/END commands and compact jumped-to line suffixes.")
+        self.shrink_btn.clicked.connect(self.shrink_line_commands)
+        tools_bar.addWidget(self.shrink_btn)
+        tools_bar.addStretch(1)
+        lay.addLayout(tools_bar)
 
         qa_bar = QHBoxLayout()
         qa_bar.addWidget(QLabel("Geometry QA — Max len:"))
@@ -315,3 +354,121 @@ class GeometryDock(QWidget):
         except ValueError as exc:
             self.status.setText(str(exc) or "Coordinates must be valid numbers. The prior value was kept.")
         self.refresh(keep_selection=True)
+
+    # ------------------------------------------------------------------ Phase 3 tools
+    def untwist_selected(self) -> bool:
+        segment = self.current_segment
+        if segment is None:
+            return False
+        try:
+            with self.state.edit(f"Untwist {segment.seg_id}"):
+                untwist_polyline(self.state.project, segment.entity_id)
+            self.status.setText(f"Untwisted bowtie on {segment.seg_id}.")
+            self.refresh(keep_selection=True)
+            return True
+        except ValueError as exc:
+            self.status.setText(str(exc))
+            return False
+
+    def flip_past_selected(self) -> bool:
+        segment = self.current_segment
+        row = self.points.currentRow()
+        if segment is None or row < 0:
+            return False
+        try:
+            with self.state.edit(f"Flip vertex on {segment.seg_id}"):
+                flip_past(self.state.project, segment.entity_id, [row])
+            self.status.setText(f"Flipped vertex {row + 1} on {segment.seg_id}.")
+            self.refresh(keep_selection=True)
+            return True
+        except ValueError as exc:
+            self.status.setText(str(exc))
+            return False
+
+    def add_node_selected(self) -> bool:
+        segment = self.current_segment
+        if segment is None:
+            return False
+        span_idx = max(0, min(self.points.currentRow(), max(0, len(segment.point_ids) - 2)))
+        try:
+            with self.state.edit(f"Add node on {segment.seg_id}"):
+                add_polyline_node(self.state.project, segment.entity_id, span_idx)
+            self.status.setText(f"Added pure geometry node on span {span_idx + 1} of {segment.seg_id}.")
+            self.refresh(keep_selection=True)
+            return True
+        except ValueError as exc:
+            self.status.setText(str(exc))
+            return False
+
+    def inject_point_selected(self):
+        segment = self.current_segment
+        if segment is None:
+            return None
+        span_idx = max(0, min(self.points.currentRow(), max(0, len(segment.point_ids) - 2)))
+        try:
+            with self.state.edit(f"Inject point on {segment.seg_id}"):
+                pt = inject_survey_point(self.state.project, segment.entity_id, span_idx)
+            self.status.setText(f"Injected survey point #{pt.number} on span {span_idx + 1} of {segment.seg_id}.")
+            self.refresh(keep_selection=True)
+            return pt
+        except ValueError as exc:
+            self.status.setText(str(exc))
+            return None
+
+    def cogo_from_selected(self) -> list:
+        segment = self.current_segment
+        target_ids = [segment.entity_id] if segment is not None else None
+        with self.state.edit("Create COGO points from lines"):
+            created = cogo_points_from_lines(self.state.project, target_ids)
+        self.status.setText(f"Created {len(created)} new COGO survey point(s) (shared endpoints deduplicated).")
+        self.refresh(keep_selection=True)
+        return created
+
+    def shrink_line_commands(self) -> ShrinkCommandPreview:
+        preview = preview_shrink_line_commands(self.state.project)
+        if not preview.changes:
+            self.status.setText("Shrink Line Commands: no missing ST/END or compactable suffixes found.")
+            return preview
+        with self.state.edit("Shrink line commands"):
+            apply_shrink_line_commands(self.state.project, preview, rebuild_linework=True)
+        self.status.setText(
+            f"Shrink Line Commands updated {len(preview.changes)} point(s) and compacted {len(preview.compactions)} occurrence(s)."
+        )
+        self.refresh(keep_selection=True)
+        return preview
+
+    def nudge_selected_point(self, dx: float, dy: float, dz: float = 0.0) -> bool:
+        row = self.points.currentRow()
+        item = self.points.item(row, 0) if row >= 0 else None
+        pid = item.data(Qt.UserRole) if item else None
+        if pid is None:
+            return False
+        with self.state.edit("Nudge point"):
+            nudge_point(self.state.project, int(pid), dx, dy, dz)
+        self.refresh(keep_selection=True)
+        return True
+
+    def connect_points(self, point_a_id: int, point_b_id: int, *, base_code: str | None = None, snap_tolerance: float = 0.0):
+        preview = preview_connect_segments(
+            self.state.project, point_a_id, point_b_id, base_code=base_code, snap_tolerance=snap_tolerance
+        )
+        with self.state.edit(f"Connect lines ({preview.chosen_label})"):
+            apply_connect_segments(self.state.project, preview, rebuild_linework=True)
+        self.status.setText(f"Connected {len(preview.routed_point_ids)} point(s) as {preview.chosen_label}.")
+        self.refresh(keep_selection=True)
+        return preview
+
+    def join_average_segments(self, entity_a_id: int, end_a: str, entity_b_id: int, end_b: str) -> dict:
+        with self.state.edit("Join lines (average endpoints)"):
+            res = join_lines_average(self.state.project, entity_a_id, end_a, entity_b_id, end_b)
+        self.status.setText(f"Averaged endpoints at ({res['x']:.3f}, {res['y']:.3f}); both point numbers preserved.")
+        self.refresh(keep_selection=True)
+        return res
+
+    def move_end_to_end_segments(self, mover_entity_id: int, mover_end: str, target_entity_id: int, target_end: str, *, whole_line: bool = False) -> dict:
+        with self.state.edit("Move line end to end"):
+            res = move_line_end_to_end(self.state.project, mover_entity_id, mover_end, target_entity_id, target_end, whole_line=whole_line)
+        self.status.setText(f"Moved endpoint by ({res['dx']:.3f}, {res['dy']:.3f}).")
+        self.refresh(keep_selection=True)
+        return res
+
